@@ -1,0 +1,4 @@
+[toolchain]
+# gpui-pre 0.3.12 (pinned by gpui-kit 0.9.1) needs APIs stabilized after Rust 1.96.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

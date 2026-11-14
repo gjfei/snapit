@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.gif
+*.png
+!docs/**/*.png
+
+# OCR models are downloaded separately (see README).
+/models
+*.rten
+*.onnx
+
+# Packaging output (Windows setup.exe and macOS DMG/zip → dist/; macOS .app is under target/macos/ or dist/)
+/dist/
+*.app
+*.iconset
+.history/
+
+# Agent workspace data
+.workbuddy/

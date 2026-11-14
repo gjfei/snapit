@@ -1,0 +1,219 @@
+name: Release
+
+# Push a tag matching [workspace.package] version, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+# workflow_dispatch rebuilds an existing tag. Shape follows SwitchHostsLite: prepare → 4-target
+# matrix → latest.json + GitHub Release. macOS zip/DMG: ditto + hdiutil ULMO with an
+# /Applications symlink. Windows: NSIS all-users setup.exe (scripts/windows/snapit.nsi).
+# Developer ID / notarytool / stapler run when those secrets are set; otherwise ad-hoc, do not fail.
+# Do not float the rust-toolchain.toml pin (1.99.1).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  prepare:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: Tag matches Cargo.toml
+        id: version
+        run: |
+          version="$(python3 - <<'PY'
+          from pathlib import Path
+          text = Path("Cargo.toml").read_text()
+          in_pkg = False
+          for line in text.splitlines():
+              if line.strip() == "[workspace.package]":
+                  in_pkg = True
+                  continue
+              if in_pkg and line.startswith("["):
+                  break
+              if in_pkg and line.startswith("version"):
+                  print(line.split("=", 1)[1].strip().strip('"'))
+                  raise SystemExit(0)
+          raise SystemExit("workspace.package version not found in Cargo.toml")
+          PY
+          )"
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "::error::Tag $TAG does not match the Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.key }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest, the same label as SwitchHostsLite. Intel is cross-compiled
+          # because Intel runners are retired.
+          - key: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - key: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - key: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Cross-compiled on x64: gpui's shaders are compiled by the host's fxc.
+          - key: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NAME: SnapIt-${{ needs.prepare.outputs.version }}-${{ matrix.key }}
+      # The updater checks the releases of the repository it was built from.
+      SNAPIT_UPDATE_REPO: ${{ github.repository }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      # Install the pin in rust-toolchain.toml (currently 1.99.1). Never `stable`.
+      - name: Toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)"
+          echo "rust-toolchain.toml channel=$channel"
+          rustup toolchain install "$channel"
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p snapit
+
+      # ---- macOS ---------------------------------------------------------
+      - name: Bundle app
+        if: runner.os == 'macOS'
+        run: scripts/bundle-macos.sh --target ${{ matrix.target }} --out dist
+
+      # Same secret names as SwitchHostsLite. Empty on forks / unset repos → ad-hoc DMG.
+      # SwitchHostsLite keeps this block commented in YAML; SnapIt runs it from
+      # package-macos.sh so missing secrets skip signing instead of failing.
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: scripts/package-macos.sh --app dist/SnapIt.app --out out --name "$NAME"
+
+      # ---- Windows -------------------------------------------------------
+      # The windows-latest image no longer ships NSIS; Chocolatey's makensis is
+      # installed before the bundler looks for it.
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        run: choco install nsis -y --no-progress
+
+      # Optional: Authenticode signing so SmartScreen warns less. Needs
+      # WINDOWS_CERTIFICATE (base64 .pfx) and WINDOWS_CERTIFICATE_PASSWORD.
+      # - name: Sign exe
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   env:
+      #     WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      #     WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      #   run: |
+      #     $pfx = "$env:RUNNER_TEMP\cert.pfx"
+      #     [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+      #     $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+      #     & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "target\${{ matrix.target }}\release\snapit.exe"
+
+      # Stages dist/windows/SnapIt/SnapIt.exe and writes
+      # out/SnapIt-<version>-windows-<arch>-setup.exe.
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: |
+          scripts/bundle-windows.sh \
+            --bin "target/${{ matrix.target }}/release/snapit.exe" \
+            --target "${{ matrix.target }}" \
+            --out dist/windows --setup-out out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.key }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      # Keep build artifacts out of the checked-out `assets/` directory: that
+      # directory holds the app icons, and `files: assets/*` would publish them
+      # as release downloads. `dist/` exists only in this job.
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release notes
+        run: |
+          gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md
+          cat notes.md
+
+      - name: latest.json and SHA256SUMS.txt
+        run: |
+          python3 scripts/release-manifest.py --dir dist --version "$VERSION" --tag "$TAG" \
+            --repo "${{ github.repository }}" --notes-file notes.md
+          cat dist/latest.json dist/SHA256SUMS.txt
+          ls -l dist
+
+      # The updater reads releases/latest, which skips pre-releases (tags
+      # with a `-`, e.g. v1.0.0-beta.1), so those never reach users' apps.
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: SnapIt ${{ env.VERSION }}
+          body_path: notes.md
+          prerelease: ${{ contains(env.TAG, '-') }}
+          files: dist/*
+          fail_on_unmatched_files: true

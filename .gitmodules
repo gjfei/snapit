@@ -1,0 +1,3 @@
+[submodule "vendor/xcap"]
+	path = vendor/xcap
+	url = https://github.com/gjfei/xcap.git

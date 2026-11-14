@@ -1,0 +1,34 @@
+[package]
+name = "snapit-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["ocrs"]
+ocrs = ["dep:ocrs", "dep:rten"]
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+log.workspace = true
+ocrs = { version = "0.14", optional = true, default-features = false, features = ["rten"] }
+rten = { version = "0.28", optional = true, default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSObject"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+] }
