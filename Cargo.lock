@@ -6789,6 +6789,7 @@ name = "snapit-recorder"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "color_quant",
  "gif 0.13.3",
  "image",
  "log",
