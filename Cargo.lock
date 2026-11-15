@@ -6725,7 +6725,7 @@ dependencies = [
 
 [[package]]
 name = "snapit"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "auto-launch",
@@ -6758,7 +6758,7 @@ dependencies = [
 
 [[package]]
 name = "snapit-capture"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "image",
@@ -6771,7 +6771,7 @@ dependencies = [
 
 [[package]]
 name = "snapit-ocr"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "image",
@@ -6786,7 +6786,7 @@ dependencies = [
 
 [[package]]
 name = "snapit-recorder"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "color_quant",
@@ -6805,7 +6805,7 @@ dependencies = [
 
 [[package]]
 name = "snapit-store"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chrono",

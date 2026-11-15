@@ -129,7 +129,7 @@ for line in text.splitlines():
     if in_pkg and line.startswith("version"):
         print(line.split("=", 1)[1].strip().strip('"'))
         raise SystemExit(0)
-print("0.0.1")
+print("0.0.2")
 PY
 }
 
