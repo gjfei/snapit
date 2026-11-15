@@ -707,7 +707,12 @@ impl OverlayView {
         }
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The magnifier follows every move, even while a range is being dragged.
         self.pointer = Some(event.position);
         if let Some(mut drag) = self.toolbar_drag {

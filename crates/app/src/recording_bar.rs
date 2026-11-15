@@ -1,10 +1,13 @@
-//! Small topmost window shown next to the region while a GIF is recording.
+//! Small topmost control window shown next to the region while a GIF / MP4 is
+//! recording: timer, pause / resume, cancel (discard) and stop (save).
 
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, button::Button, h_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
 };
 use gpui_kit::{
     Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
@@ -13,10 +16,14 @@ use gpui_kit::{
 
 use crate::controller::Controller;
 
-actions!(recording_bar, [StopRecording]);
+actions!(
+    recording_bar,
+    [StopRecording, CancelRecording, TogglePauseRecording]
+);
 
 /// Window size in logical px; a platform window boundary, not UI layout.
-pub const BAR_SIZE: (f32, f32) = (280., 48.);
+/// Just wide enough for the timer and three icon-only buttons side by side.
+pub const BAR_SIZE: (f32, f32) = (312., 44.);
 
 const CONTEXT: &str = "RecordingBar";
 
@@ -55,9 +62,19 @@ pub(crate) fn exclude_from_capture(window: &mut Window) {
 }
 
 impl RecordingBar {
-    pub fn new(controller: Entity<Controller>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        controller: Entity<Controller>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         exclude_from_capture(window);
-        cx.bind_keys([KeyBinding::new("escape", StopRecording, Some(CONTEXT))]);
+        cx.bind_keys([
+            // Esc throws the recording away; stopping is an explicit action
+            // (the button, Enter, or a global hotkey) and always saves.
+            KeyBinding::new("escape", CancelRecording, Some(CONTEXT)),
+            KeyBinding::new("enter", StopRecording, Some(CONTEXT)),
+            KeyBinding::new("space", TogglePauseRecording, Some(CONTEXT)),
+        ]);
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let subscription = cx.observe(&controller, |_, _, cx| cx.notify());
@@ -71,6 +88,16 @@ impl RecordingBar {
     fn stop(&mut self, cx: &mut Context<Self>) {
         self.controller
             .update(cx, |controller, cx| controller.stop_recording(cx));
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.controller
+            .update(cx, |controller, cx| controller.cancel_recording(cx));
+    }
+
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        self.controller
+            .update(cx, |controller, cx| controller.toggle_recording_pause(cx));
     }
 
     /// Move the window with the system drag loop.
@@ -89,9 +116,7 @@ impl RecordingBar {
 fn native_drag(window: &mut Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};
 
     let Ok(handle) = HasWindowHandle::window_handle(&*window) else {
         return;
@@ -182,8 +207,15 @@ pub(crate) fn make_recording_window(window: &mut Window) {
 impl Render for RecordingBar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let controller = self.controller.read(cx);
+        // The session is gone; the controller defers this window's removal to
+        // the end of the effect cycle. Paint nothing in the meantime so a
+        // stale "Finishing…" card can never be left on screen.
+        if !controller.has_recording() {
+            return div().id("recording-bar").size_full();
+        }
         let encoding = controller.is_encoding_recording();
         let starting = controller.is_starting_recording();
+        let paused = controller.is_recording_paused();
         let progress = controller.recording_progress();
         let label = if encoding {
             let format = controller
@@ -193,6 +225,9 @@ impl Render for RecordingBar {
             t!("recording.encoding", format = format).to_string()
         } else if starting {
             t!("recording.starting").to_string()
+        } else if paused {
+            let elapsed = format_duration(progress.map(|(elapsed, _)| elapsed).unwrap_or_default());
+            t!("recording.paused", elapsed = elapsed).to_string()
         } else {
             progress
                 .map(|(elapsed, max)| {
@@ -211,8 +246,22 @@ impl Render for RecordingBar {
                 .unwrap_or_else(|| t!("recording.finishing").to_string())
         };
         let theme = cx.theme();
-        // Stopping while the recorder warms up cancels the start.
-        let can_stop = !encoding;
+        // Stopping/cancelling while the recorder warms up cancels the start;
+        // once encoding owns the file the bar only reports progress.
+        let can_act = !encoding;
+        let can_pause = controller.can_pause_recording();
+        let pause_hint = if paused {
+            t!("recording.resume").to_string()
+        } else {
+            t!("recording.pause").to_string()
+        };
+        let cancel_hint = t!("recording.cancel").to_string();
+        let stop_hint = if encoding {
+            t!("recording.busy").to_string()
+        } else {
+            t!("recording.stop_hint").to_string()
+        };
+        let stop_label = t!("recording.stop").to_string();
 
         div()
             .id("recording-bar")
@@ -224,44 +273,77 @@ impl Render for RecordingBar {
                     this.stop(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &CancelRecording, _, cx| {
+                if !this.controller.read(cx).is_encoding_recording() {
+                    this.cancel(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePauseRecording, _, cx| {
+                if this.controller.read(cx).can_pause_recording() {
+                    this.toggle_pause(cx);
+                }
+            }))
             .child(
                 h_flex()
                     .size_full()
-                    .px_3()
+                    .px_2()
                     .gap_2()
                     .justify_between()
                     .rounded(theme.radius)
                     .bg(theme.popover)
                     .text_color(theme.popover_foreground)
                     .text_sm()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                        this.drag(window, cx)
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.drag(window, cx)),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().size_2().rounded_full().bg(if encoding {
+                            .child(div().size_2().rounded_full().bg(if encoding || paused {
                                 theme.warning
                             } else {
                                 theme.danger
                             }))
                             .child(label),
                     )
-                    // The stop button keeps its click: the press must not start
+                    // The buttons keep their clicks: the press must not start
                     // a window drag.
                     .child(
-                        div()
+                        h_flex()
+                            .gap_1()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("pause-recording")
+                                    .small()
+                                    .ghost()
+                                    .icon(if paused {
+                                        LucideIcon::Play
+                                    } else {
+                                        LucideIcon::Pause
+                                    })
+                                    .tooltip(pause_hint.clone())
+                                    .accessibility_label(pause_hint)
+                                    .disabled(!can_pause)
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))),
+                            )
+                            .child(
+                                Button::new("cancel-recording")
+                                    .small()
+                                    .ghost()
+                                    .icon(LucideIcon::CircleX)
+                                    .tooltip(cancel_hint.clone())
+                                    .accessibility_label(cancel_hint)
+                                    .disabled(!can_act)
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                            )
                             .child(
                                 Button::new("stop-recording")
                                     .small()
                                     .icon(LucideIcon::CircleStop)
-                                    .label(if encoding {
-                                        t!("recording.busy").to_string()
-                                    } else {
-                                        t!("recording.stop").to_string()
-                                    })
-                                    .disabled(!can_stop)
+                                    .tooltip(stop_hint)
+                                    .accessibility_label(stop_label)
+                                    .disabled(!can_act)
                                     .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                             ),
                     ),

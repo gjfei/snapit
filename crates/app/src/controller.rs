@@ -233,6 +233,13 @@ impl Controller {
         matches!(self.busy, Some(Busy::Encoding))
     }
 
+    /// True while a recording session owns the control bar. The bar uses this
+    /// to stop painting once its session is gone but its window removal is
+    /// still pending (see `finish_recording_ui`).
+    pub fn has_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
     /// Container the running (or finishing) recording is being written to.
     pub fn recording_format(&self) -> Option<RecordFormat> {
         self.recording.as_ref().map(|active| active.format)
@@ -252,6 +259,20 @@ impl Controller {
         self.recording
             .as_ref()
             .is_some_and(|active| !active.started)
+    }
+
+    /// Pausing is only possible once the platform recorder is producing frames.
+    pub fn is_recording_paused(&self) -> bool {
+        self.recording
+            .as_ref()
+            .and_then(|active| active.recorder.as_ref())
+            .is_some_and(|recorder| recorder.is_paused())
+    }
+
+    pub fn can_pause_recording(&self) -> bool {
+        self.recording
+            .as_ref()
+            .is_some_and(|active| active.started && active.recorder.is_some())
     }
 
     /// Hotkey entry point: start a capture, or stop an ongoing recording.
@@ -1127,6 +1148,54 @@ impl Controller {
         .detach();
     }
 
+    /// Throw the current recording away. Nothing is saved, added to history or
+    /// copied to the clipboard — the opposite of `stop_recording`.
+    ///
+    /// Esc and the bar's cancel button land here. A recorder that has not
+    /// produced its first frame yet is discarded by `spawn_recorder` once it
+    /// notices the session is gone; a running one is stopped on a worker
+    /// thread, since joining the sinks of a long GIF can take seconds.
+    pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.recording.as_mut() else {
+            return;
+        };
+        // The encoder already owns the file and is about to publish it; there
+        // is nothing left to cancel at that point.
+        if matches!(self.busy, Some(Busy::Encoding)) {
+            return;
+        }
+        if let Some(recorder) = active.recorder.take() {
+            let discard = std::thread::Builder::new()
+                .name("snapit-record-discard".into())
+                .spawn(move || {
+                    if let Err(err) = recorder.discard() {
+                        log::warn!("failed to discard recording: {err:#}");
+                    }
+                });
+            if let Err(err) = discard {
+                log::warn!("failed to start the discard thread: {err:#}");
+            }
+        }
+        self.busy = None;
+        self.finish_recording_ui(cx);
+        log::info!("recording discarded");
+        self.resume_queued_capture(cx);
+    }
+
+    /// Pause/resume the running recorder. Frames captured while paused are
+    /// drained but never encoded, and the paused time is left out of the file.
+    pub fn toggle_recording_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(recorder) = self
+            .recording
+            .as_mut()
+            .and_then(|active| active.recorder.as_ref())
+        else {
+            return;
+        };
+        recorder.set_paused(!recorder.is_paused());
+        cx.notify();
+    }
+
     pub fn stop_recording(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self.recording.as_mut() else {
             return;
@@ -1298,13 +1367,26 @@ impl Controller {
 
     /// Close the recording bar and clear encoding busy after stop finishes.
     fn finish_recording_ui(&mut self, cx: &mut Context<Self>) {
-        if let Some(active) = self.recording.take() {
-            if let Some(bar) = active.bar {
-                bar.update(cx, |_, window, _| window.remove_window()).ok();
-            }
-            if let Some(frame) = active.frame {
-                frame.update(cx, |_, window, _| window.remove_window()).ok();
-            }
+        // Esc / Enter / button clicks are dispatched *inside* the bar window's
+        // update stack. GPUI takes a window out of `App::windows` while it is
+        // being updated, so `handle.update(...)` on that same window returns
+        // "window not found" and `remove_window()` is silently lost — the bar
+        // then sits on screen forever showing its "Finishing…" fallback.
+        // Defer the removals until the stack has unwound. The handles belong to
+        // this closure, so a recording started in the meantime keeps its own
+        // windows.
+        let windows = self
+            .recording
+            .take()
+            .map(|active| (active.bar, active.frame));
+        if let Some((bar, frame)) = windows {
+            cx.defer(move |cx| {
+                for handle in [bar, frame].into_iter().flatten() {
+                    handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            });
         }
         if matches!(self.busy, Some(Busy::Encoding)) {
             self.busy = None;
