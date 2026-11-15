@@ -135,9 +135,7 @@ impl Mp4Sink {
         })
     }
 
-    fn append(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
-        let scaled = prepare(frame, self.max_width);
-        let frame = scaled.as_ref();
+    fn append_scaled(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
         let (width, height) = frame.dimensions();
         if width as usize != self.width || height as usize != self.height {
             bail!(
@@ -154,18 +152,20 @@ impl Mp4Sink {
         let base = CVPixelBufferGetBaseAddress(&buffer) as *mut u8;
         let stride = CVPixelBufferGetBytesPerRow(&buffer);
         if !base.is_null() {
-            // RGBA in, BGRA out: the encoder's native layout.
+            // RGBA in, BGRA out: the encoder's native layout. Writing whole
+            // pixels at once lets the compiler emit one 32-bit store instead of
+            // four byte stores with a bounds check each.
             unsafe {
                 for y in 0..height as usize {
-                    let row = base.add(y * stride);
-                    let src = &frame.as_raw()[y * width as usize * 4..];
-                    for x in 0..width as usize {
-                        let pixel = row.add(x * 4);
-                        let from = &src[x * 4..x * 4 + 4];
-                        *pixel = from[2];
-                        *pixel.add(1) = from[1];
-                        *pixel.add(2) = from[0];
-                        *pixel.add(3) = from[3];
+                    let (src, _) = frame.as_raw()
+                        [y * width as usize * 4..(y + 1) * width as usize * 4]
+                        .as_chunks::<4>();
+                    let dst = std::slice::from_raw_parts_mut(
+                        base.add(y * stride) as *mut [u8; 4],
+                        width as usize,
+                    );
+                    for (into, from) in dst.iter_mut().zip(src) {
+                        *into = [from[2], from[1], from[0], from[3]];
                     }
                 }
             }
@@ -201,8 +201,13 @@ unsafe impl Send for Mp4Sink {}
 
 impl FrameSink for Mp4Sink {
     fn push(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
-        self.last = Some((frame.clone(), at));
-        self.append(frame, at)
+        // Keep the scaled frame, not the full-resolution capture: finish()
+        // needs one more sample, and cloning the capture (or scaling it again)
+        // would mean another pass over four times as many pixels.
+        let scaled = prepare(frame, self.max_width).into_owned();
+        self.append_scaled(&scaled, at)?;
+        self.last = Some((scaled, at));
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -211,8 +216,14 @@ impl FrameSink for Mp4Sink {
         if let Some((frame, at)) = self.last.take()
             && end > at
         {
-            let hold = end.saturating_sub(Duration::from_millis(1));
-            self.append(&frame, hold.max(at))?;
+            // CMTime quantizes seconds to 1/600 s, so a one-millisecond nudge
+            // can land on the same tick as the last sample. A duplicate
+            // presentation time makes AVAssetWriter fail at finishWriting on
+            // very short recordings.
+            let hold = end
+                .saturating_sub(Duration::from_millis(1))
+                .max(at + Duration::from_millis(2));
+            self.append_scaled(&frame, hold)?;
         }
         unsafe { self.input.markAsFinished() };
         // The completion-handler variant needs a block and a semaphore for the

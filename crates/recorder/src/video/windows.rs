@@ -99,9 +99,7 @@ impl Mp4Sink {
         })
     }
 
-    fn append(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
-        let scaled = prepare(frame, self.max_width);
-        let frame = scaled.as_ref();
+    fn append_scaled(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
         let (width, height) = frame.dimensions();
         if width != self.width || height != self.height {
             bail!(
@@ -123,14 +121,10 @@ impl Mp4Sink {
             unsafe {
                 for y in 0..height as usize {
                     let row = raw.add((height as usize - 1 - y) * stride);
-                    let src = &frame.as_raw()[y * stride..(y + 1) * stride];
-                    for x in 0..width as usize {
-                        let pixel = row.add(x * 4);
-                        let from = &src[x * 4..x * 4 + 4];
-                        *pixel = from[2];
-                        *pixel.add(1) = from[1];
-                        *pixel.add(2) = from[0];
-                        *pixel.add(3) = from[3];
+                    let (src, _) = frame.as_raw()[y * stride..(y + 1) * stride].as_chunks::<4>();
+                    let dst = std::slice::from_raw_parts_mut(row as *mut [u8; 4], width as usize);
+                    for (into, from) in dst.iter_mut().zip(src) {
+                        *into = [from[2], from[1], from[0], from[3]];
                     }
                 }
             }
@@ -155,8 +149,13 @@ impl FrameSink for Mp4Sink {
         // The capture thread has to be in the MTA as well; the call is a no-op
         // when it already is.
         ensure_com()?;
-        self.last = Some((frame.clone(), at));
-        self.append(frame, at)
+        // Keep the scaled frame: finish() needs one more sample, and cloning
+        // the full-resolution capture (or scaling it again) would mean another
+        // pass over four times as many pixels.
+        let scaled = prepare(frame, self.max_width).into_owned();
+        self.append_scaled(&scaled, at)?;
+        self.last = Some((scaled, at));
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -165,8 +164,12 @@ impl FrameSink for Mp4Sink {
         if let Some((frame, at)) = self.last.take()
             && end > at
         {
-            let hold = end.saturating_sub(Duration::from_millis(1));
-            self.append(&frame, hold.max(at))?;
+            // Sample times must strictly increase, or the sink can reject the
+            // closing sample on a very short recording.
+            let hold = end
+                .saturating_sub(Duration::from_millis(1))
+                .max(at + Duration::from_millis(2));
+            self.append_scaled(&frame, hold)?;
         }
         unsafe {
             self.writer.Finalize()?;

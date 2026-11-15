@@ -9,14 +9,25 @@
 //! them with the `gif` crate, so memory stays bounded regardless of recording
 //! length. Consecutive identical frames are dropped; their time is folded into
 //! the previous frame, which for video becomes the previous sample's duration.
+//!
+//! Three things keep the GIF writer ahead of the capture clock: one NeuQuant
+//! palette trained on a sparse spatial sample (never per-frame
+//! `Frame::from_rgba_speed`), a lazily filled 6-bit RGB lookup table that makes
+//! mapping one array read per pixel, and partial frames — with `Keep` disposal,
+//! LZW only encodes the rectangle that changed. A palette refresh forces one
+//! full frame, since every index changes meaning.
+//!
+//! Retina frames arrive in physical pixels while the selection is in logical
+//! points, so `video::prepare` halves both axes with an integer box mean. Both
+//! sinks share it; `image::imageops::resize(Triangle)` cost ~10x as much.
 
 use std::{
     fs::File,
     io::{BufWriter, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -24,10 +35,27 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use color_quant::NeuQuant;
 use gif::Repeat;
-use snapit_capture::{LiveFrameWait, LiveRecorder, Region, RegionCapturer, RgbaImage};
+use snapit_capture::{LiveFrameWait, LiveRecorder, OutputSize, Region, RegionCapturer, RgbaImage};
 
 mod video;
+
+/// Bits per channel in the GIF colour lookup table. 6 bits keeps the table at
+/// 256 KiB and the quantisation error within two levels per channel.
+const GIF_LUT_BITS: usize = 6;
+const GIF_LUT_BINS: usize = 1 << GIF_LUT_BITS;
+const GIF_LUT_SHIFT: usize = 8 - GIF_LUT_BITS;
+const GIF_LUT_SIZE: usize = GIF_LUT_BINS * GIF_LUT_BINS * GIF_LUT_BINS;
+/// Pixels sampled to decide whether the current palette still fits the scene.
+const GIF_ERROR_SAMPLES: usize = 4_096;
+/// Average squared RGB error that triggers a new palette.
+const GIF_REFRESH_ERROR: u64 = 1_200;
+/// Never retrain more often than this many frames, even on noisy content.
+const GIF_REFRESH_COOLDOWN: usize = 12;
+/// Only encode a sub-rectangle when the changed area is below this share of the
+/// frame; a nearly full redraw is cheaper as one full frame.
+const GIF_PARTIAL_MAX_PERCENT: u64 = 70;
 
 /// Container the frames are written to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,7 +141,6 @@ impl RecordOptions {
         self.captures_cursor = captures_cursor;
         self
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -127,9 +154,57 @@ pub struct RecordingSummary {
     pub first_frame: Option<RgbaImage>,
 }
 
-/// A running recording. Call [`Recorder::stop`] to finish and flush the file.
+/// Pause bookkeeping shared by the UI thread and the capture thread.
+///
+/// Wall-clock time keeps flowing while a recording is paused, but neither the
+/// encoder's timeline nor the duration cap should. `total` holds completed
+/// pauses; `since` is the start of the current one, so the capture thread can
+/// read the accumulated pause without waiting for the UI to resume it.
+#[derive(Default)]
+struct PauseClock {
+    total: AtomicU64,
+    since: Mutex<Option<Instant>>,
+}
+
+impl PauseClock {
+    fn since(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_paused(&self) -> bool {
+        self.since().is_some()
+    }
+
+    fn set_paused(&self, paused: bool) {
+        let mut since = self.since();
+        if paused {
+            if since.is_none() {
+                *since = Some(Instant::now());
+            }
+        } else if let Some(at) = since.take() {
+            self.total
+                .fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn paused_duration(&self) -> Duration {
+        let total = Duration::from_nanos(self.total.load(Ordering::Relaxed));
+        let current = self
+            .since()
+            .as_ref()
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        total.saturating_add(current)
+    }
+}
+
+/// A running recording. Call [`Recorder::stop`] to finish and flush the file,
+/// or [`Recorder::discard`] to throw it away.
 pub struct Recorder {
     stop: Arc<AtomicBool>,
+    paused: Arc<PauseClock>,
     frames: Arc<AtomicUsize>,
     started: Instant,
     max_duration: Duration,
@@ -153,6 +228,7 @@ impl Recorder {
             .context("failed to capture region")?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(PauseClock::default());
         let frames = Arc::new(AtomicUsize::new(0));
         // AVFoundation takes about a second to start delivering frames. Wait
         // for the first one so the UI timer and the saved clip share an origin
@@ -168,6 +244,7 @@ impl Recorder {
                 output: output.clone(),
                 options: options.clone(),
                 stop,
+                paused: paused.clone(),
                 frames,
             };
             thread::Builder::new()
@@ -206,6 +283,7 @@ impl Recorder {
 
         Ok(Self {
             stop,
+            paused,
             frames,
             started: Instant::now(),
             max_duration: options.max_duration,
@@ -215,8 +293,22 @@ impl Recorder {
         })
     }
 
+    /// Time actually recorded, excluding paused stretches. This is what the UI
+    /// shows and what the duration cap compares against.
     pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+        self.started
+            .elapsed()
+            .saturating_sub(self.paused.paused_duration())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.is_paused()
+    }
+
+    /// Pause or resume frame delivery to the encoder. The capture thread keeps
+    /// draining the platform recorder so its queue cannot grow while paused.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.set_paused(paused);
     }
 
     pub fn max_duration(&self) -> Duration {
@@ -240,6 +332,9 @@ impl Recorder {
 
     /// Stop capturing and wait for the file to be fully written. Blocking.
     pub fn stop(self) -> Result<RecordingSummary> {
+        // Freeze the pause clock so stopping while paused reports the effective
+        // duration instead of one that keeps shrinking while the sinks flush.
+        self.paused.set_paused(false);
         self.stop.store(true, Ordering::Relaxed);
         let (duration, first_frame) = self
             .capture_thread
@@ -252,6 +347,25 @@ impl Recorder {
             duration,
             first_frame,
         })
+    }
+
+    /// Stop capturing and delete the container. No summary, no history, no
+    /// clipboard: this is what "cancel" means to the UI.
+    ///
+    /// `stop` joins the sinks first, so their file handles are closed before
+    /// the temporary file is removed (Windows refuses to delete an open file).
+    /// Blocking, like [`Recorder::stop`]; the caller must run it off the UI
+    /// thread.
+    pub fn discard(self) -> Result<()> {
+        let path = self.output.clone();
+        let stopped = self.stop();
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("failed to discard {}", path.display())),
+        };
+        stopped.map(|_| ())?;
+        removed
     }
 }
 
@@ -287,14 +401,14 @@ impl GifSink {
         // Probe once so permission errors surface before threads spawn.
         let file = File::create(output)
             .with_context(|| format!("failed to create {}", output.display()))?;
-        let speed = quality_to_speed(options.quality);
+        let quality = options.quality;
         let max_width = options.max_width;
         // Bounded so a slow encoder slows the capture down instead of piling
         // frames up in memory.
         let (sender, receiver) = sync_channel::<PendingFrame>(8);
         let writer = thread::Builder::new()
             .name("snapit-gif-writer".into())
-            .spawn(move || encode_gif(receiver, file, speed, max_width))?;
+            .spawn(move || encode_gif(receiver, file, quality, max_width))?;
         Ok(Self {
             sender: Some(sender),
             writer: Some(writer),
@@ -344,11 +458,174 @@ impl FrameSink for GifSink {
     }
 }
 
+/// A NeuQuant palette plus a lazily filled 6-bit RGB lookup table. Building all
+/// 262,144 entries up front costs ~50 ms because each one runs a nearest-colour
+/// search, while a screen recording visits only a small fraction of the RGB
+/// cube: resolve a bin the first time a frame actually contains it, then every
+/// later pixel is one array read.
+struct PaletteMap {
+    quant: NeuQuant,
+    palette: Vec<u8>,
+    lut: Vec<u8>,
+    resolved: Vec<bool>,
+}
+
+impl PaletteMap {
+    /// Train on a sparse spatial sample of one frame. Screen captures are fully
+    /// opaque, so alpha is ignored: GIF only has a 1-bit transparency mask.
+    fn train(frame: &RgbaImage, quality: u8) -> Self {
+        let samples = quality_to_samples(quality);
+        let rgba = spatial_sample(frame, samples);
+        let quant = NeuQuant::new(1, 256, &rgba);
+        let palette = quant.color_map_rgb();
+        Self {
+            quant,
+            palette,
+            lut: vec![0u8; GIF_LUT_SIZE],
+            resolved: vec![false; GIF_LUT_SIZE],
+        }
+    }
+
+    fn index(&mut self, pixel: &[u8]) -> u8 {
+        let r = (pixel[0] as usize) >> GIF_LUT_SHIFT;
+        let g = (pixel[1] as usize) >> GIF_LUT_SHIFT;
+        let b = (pixel[2] as usize) >> GIF_LUT_SHIFT;
+        let bin = (r << (2 * GIF_LUT_BITS)) | (g << GIF_LUT_BITS) | b;
+        if !self.resolved[bin] {
+            let step = 1 << GIF_LUT_SHIFT;
+            let center = [
+                (r * step + step / 2) as u8,
+                (g * step + step / 2) as u8,
+                (b * step + step / 2) as u8,
+                255,
+            ];
+            self.lut[bin] = self.quant.index_of(&center) as u8;
+            self.resolved[bin] = true;
+        }
+        self.lut[bin]
+    }
+
+    fn indices(&mut self, frame: &RgbaImage) -> Vec<u8> {
+        frame
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| self.index(pixel))
+            .collect()
+    }
+
+    fn indices_rect(&mut self, frame: &RgbaImage, rect: DirtyRect) -> Vec<u8> {
+        let width = frame.width() as usize;
+        let raw = frame.as_raw();
+        let mut out = Vec::with_capacity(rect.width as usize * rect.height as usize);
+        for y in rect.y..rect.y + rect.height {
+            let start = (y as usize * width + rect.x as usize) * 4;
+            let (pixels, _) = raw[start..start + rect.width as usize * 4].as_chunks::<4>();
+            for pixel in pixels {
+                out.push(self.index(pixel));
+            }
+        }
+        out
+    }
+
+    /// Average squared RGB error over a small sample. A scene change makes the
+    /// old palette a poor fit long before it becomes visible as banding.
+    fn error(&mut self, frame: &RgbaImage) -> u64 {
+        let rgba = spatial_sample(frame, GIF_ERROR_SAMPLES);
+        let mut total = 0u64;
+        for pixel in rgba.as_chunks::<4>().0 {
+            let at = self.index(pixel) as usize * 3;
+            let color = &self.palette[at..at + 3];
+            for (value, mapped) in pixel.iter().take(3).zip(color) {
+                let delta = *value as i32 - *mapped as i32;
+                total += (delta * delta) as u64;
+            }
+        }
+        total / (rgba.len() / 4).max(1) as u64
+    }
+}
+
+/// Rectangle of a frame that must be redrawn. GIF's `Keep` disposal keeps every
+/// pixel outside it from the previous frame, so LZW only has to encode this.
+#[derive(Clone, Copy)]
+struct DirtyRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl DirtyRect {
+    fn area(&self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+}
+
+/// Bounding box of the pixels that changed since the last written frame. One
+/// linear pass with no allocation; a static screen costs a comparison, not an
+/// encode.
+fn dirty_rect(previous: &RgbaImage, current: &RgbaImage) -> Option<DirtyRect> {
+    let (width, height) = current.dimensions();
+    let (w, h) = (width as usize, height as usize);
+    let (before, _) = previous.as_raw().as_chunks::<4>();
+    let (after, _) = current.as_raw().as_chunks::<4>();
+    if before.len() != after.len() {
+        return Some(DirtyRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+    }
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (0usize, 0usize);
+    let mut changed = false;
+    for y in 0..h {
+        let (row_before, row_after) = (&before[y * w..(y + 1) * w], &after[y * w..(y + 1) * w]);
+        for (x, (a, b)) in row_before.iter().zip(row_after).enumerate() {
+            if a != b {
+                changed = true;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some(DirtyRect {
+        x: min_x as u32,
+        y: min_y as u32,
+        width: (max_x - min_x + 1) as u32,
+        height: (max_y - min_y + 1) as u32,
+    })
+}
+
+/// Pick at most `target` RGBA pixels on a square grid so the sample covers the
+/// whole frame instead of just its first rows.
+fn spatial_sample(frame: &RgbaImage, target: usize) -> Vec<u8> {
+    let (width, height) = frame.dimensions();
+    let pixels = width as usize * height as usize;
+    let step = ((pixels as f64 / target.max(1) as f64).sqrt().ceil() as usize).max(1);
+    let mut sample = Vec::with_capacity(target.min(pixels).max(1) * 4);
+    let raw = frame.as_raw();
+    for y in (0..height as usize).step_by(step) {
+        for x in (0..width as usize).step_by(step) {
+            let at = (y * width as usize + x) * 4;
+            sample.extend_from_slice(&raw[at..at + 4]);
+        }
+    }
+    sample
+}
+
 /// Quantize and append frames to the file until the channel closes.
 fn encode_gif(
     receiver: Receiver<PendingFrame>,
     file: File,
-    speed: i32,
+    quality: u8,
     max_width: Option<u32>,
 ) -> Result<()> {
     let mut writer = BufWriter::new(file);
@@ -358,7 +635,6 @@ fn encode_gif(
     let anchored = loop {
         match receiver.recv() {
             Ok(pending) => {
-                // Owned up front so the frame and its pixels move out together.
                 let scaled = video::prepare(&pending.image, max_width).into_owned();
                 if let Some((width, height)) = fit_u16(&scaled) {
                     break Some((pending, scaled, width, height));
@@ -367,7 +643,7 @@ fn encode_gif(
             Err(_) => break None,
         }
     };
-    let Some((pending, scaled, width, height)) = anchored else {
+    let Some((first, first_scaled, width, height)) = anchored else {
         writer.flush().context("failed to flush the GIF file")?;
         return Ok(());
     };
@@ -376,33 +652,101 @@ fn encode_gif(
     encoder
         .write_extension(gif::ExtensionData::Repetitions(Repeat::Infinite))
         .context("failed to set GIF looping")?;
-    write_frame(&mut encoder, scaled, pending.ticks, width, height, speed)?;
+    let mut palette = PaletteMap::train(&first_scaled, quality);
+    let mut since_train = 0usize;
+    write_indexed_frame(
+        &mut encoder,
+        &first,
+        &first_scaled,
+        width,
+        height,
+        &mut palette,
+        None,
+    )?;
+    let mut previous = first_scaled;
+    let full_area = width as u64 * height as u64;
     // Frames whose size drifted (a display change) do not fit the fixed screen
     // and are skipped rather than corrupting the container.
-    while let Ok(pending) = receiver.recv() {
+    for pending in receiver.iter() {
         let scaled = video::prepare(&pending.image, max_width).into_owned();
-        let Some((width, height)) = fit_u16(&scaled) else {
+        let Some((frame_width, frame_height)) = fit_u16(&scaled) else {
             continue;
         };
-        write_frame(&mut encoder, scaled, pending.ticks, width, height, speed)?;
+        if (frame_width, frame_height) != (width, height) {
+            continue;
+        }
+        let retrain =
+            since_train >= GIF_REFRESH_COOLDOWN && palette.error(&scaled) > GIF_REFRESH_ERROR;
+        if retrain {
+            palette = PaletteMap::train(&scaled, quality);
+            since_train = 0;
+        } else {
+            since_train += 1;
+        }
+        let region = if retrain {
+            // A new palette changes what every index means, so pixels outside
+            // the changed rectangle can no longer be left as they were.
+            None
+        } else {
+            // Even a completely static frame needs a frame of its own to keep
+            // its delay and the frame count; one pixel is enough with Keep.
+            let changed = dirty_rect(&previous, &scaled).unwrap_or(DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            });
+            (changed.area() * 100 < full_area * GIF_PARTIAL_MAX_PERCENT).then_some(changed)
+        };
+        write_indexed_frame(
+            &mut encoder,
+            &pending,
+            &scaled,
+            width,
+            height,
+            &mut palette,
+            region,
+        )?;
+        previous = scaled;
     }
     drop(encoder);
     writer.flush().context("failed to flush the GIF file")?;
     Ok(())
 }
 
-/// Quantize one frame and append it to the container.
-fn write_frame(
+/// Map a frame (or just its changed rectangle) through the shared palette and
+/// append it to the container. Every frame carries its own local palette so a
+/// decoder can reconstruct it independently.
+fn write_indexed_frame(
     encoder: &mut gif::Encoder<&mut BufWriter<File>>,
-    scaled: RgbaImage,
-    ticks: u16,
+    pending: &PendingFrame,
+    scaled: &RgbaImage,
     width: u16,
     height: u16,
-    speed: i32,
+    map: &mut PaletteMap,
+    region: Option<DirtyRect>,
 ) -> Result<()> {
-    let mut rgba = scaled.into_raw();
-    let mut frame = gif::Frame::from_rgba_speed(width, height, &mut rgba, speed);
-    frame.delay = ticks;
+    let (left, top, frame_width, frame_height, indices) = match region {
+        Some(rect) => (
+            rect.x as u16,
+            rect.y as u16,
+            rect.width as u16,
+            rect.height as u16,
+            map.indices_rect(scaled, rect),
+        ),
+        None => (0, 0, width, height, map.indices(scaled)),
+    };
+    let mut frame = gif::Frame::from_palette_pixels(
+        frame_width,
+        frame_height,
+        indices,
+        map.palette.clone(),
+        None,
+    );
+    frame.left = left;
+    frame.top = top;
+    frame.dispose = gif::DisposalMethod::Keep;
+    frame.delay = pending.ticks;
     encoder
         .write_frame(&frame)
         .context("failed to encode GIF frame")
@@ -422,10 +766,11 @@ fn duration_to_ticks(duration: Duration) -> u16 {
     ticks.clamp(1., u16::MAX as f64) as u16
 }
 
-/// Map the 1-100 quality setting onto the quantizer's 1-30 speed range, where
-/// lower is slower but better: quality 100 becomes speed 1, quality 1 becomes 30.
-fn quality_to_speed(quality: u8) -> i32 {
-    ((101 - quality as i32) * 30 / 100).clamp(0, 29) + 1
+/// Map the 1-100 quality setting onto the number of pixels used to train the
+/// palette. More samples give a better palette but cost a little more on the
+/// (rare) retraining frames.
+fn quality_to_samples(quality: u8) -> usize {
+    1_024 + quality as usize * 160
 }
 
 /// A zero cap disables the automatic stop; otherwise the loop ends once the
@@ -461,6 +806,7 @@ struct CaptureJob {
     output: PathBuf,
     options: RecordOptions,
     stop: Arc<AtomicBool>,
+    paused: Arc<PauseClock>,
     frames: Arc<AtomicUsize>,
 }
 
@@ -475,14 +821,32 @@ fn capture_loop(
         output,
         options,
         stop,
+        paused,
         frames,
     } = job;
     let started = Instant::now();
+    // The compositor hint targets the selection's logical size, i.e. exactly
+    // the width the app already passes as `max_width`. It is disabled by
+    // `SNAPIT_CPU_DOWNSCALE=1` so one build can A/B the CPU box mean, and
+    // skipped when a caller asks for an even narrower output (then
+    // `video::prepare` should do the whole downscale itself). Nothing relies
+    // on the hint: `video::prepare` still downscales native frames, and DXGI
+    // ignores it entirely.
+    let logical_width = region.width.round().max(1.0) as u32;
+    let logical_height = region.height.round().max(1.0) as u32;
+    let output_size = if std::env::var_os("SNAPIT_CPU_DOWNSCALE").is_some()
+        || options.max_width.is_some_and(|limit| limit < logical_width)
+    {
+        OutputSize::Native
+    } else {
+        OutputSize::Logical
+    };
     let live = match LiveRecorder::start_with(
         monitor_id,
         region,
         options.fps,
         options.captures_cursor,
+        output_size,
     ) {
         Ok(live) => live,
         Err(err) => {
@@ -497,6 +861,10 @@ fn capture_loop(
     let mut first: Option<RgbaImage> = None;
     let mut previous: Option<RgbaImage> = None;
     let mut pending_duplicate_at: Option<Duration> = None;
+    // Presentation times must strictly increase: AVFoundation rejects two
+    // samples sharing a time, and a resume can land a millisecond before the
+    // pause clock has accumulated the whole stretch.
+    let mut last_at = Duration::ZERO;
     let mut pushed = 0usize;
 
     let mut push = |sink: &mut Box<dyn FrameSink>,
@@ -511,13 +879,42 @@ fn capture_loop(
     };
 
     while !stop.load(Ordering::Relaxed)
-        && !past_duration_limit(started.elapsed(), options.max_duration)
+        && !past_duration_limit(
+            started.elapsed().saturating_sub(paused.paused_duration()),
+            options.max_duration,
+        )
     {
         match live.recv_timeout(Duration::from_millis(50)) {
             LiveFrameWait::Frame(frame) => {
+                if paused.is_paused() {
+                    // Keep draining the platform recorder, but do not encode
+                    // these frames or let them advance the timeline.
+                    continue;
+                }
                 let frame_origin = *origin.get_or_insert(frame.timestamp);
-                let at = frame.timestamp.saturating_sub(frame_origin);
+                let at = frame
+                    .timestamp
+                    .saturating_sub(frame_origin)
+                    .saturating_sub(paused.paused_duration());
+                let at = if at > last_at {
+                    at
+                } else {
+                    last_at + Duration::from_millis(1)
+                };
+                last_at = at;
                 if sink.is_none() {
+                    // A/B evidence: the delivered size next to the selection's
+                    // logical size shows whether the compositor honoured the
+                    // hint. A mismatch only costs performance — `prepare`
+                    // still scales native frames before they reach the sink.
+                    log::debug!(
+                        "capture frame {}x{} (output size hint {:?}, logical selection {}x{})",
+                        frame.image.width(),
+                        frame.image.height(),
+                        output_size,
+                        logical_width,
+                        logical_height
+                    );
                     sink = Some(open_sink(&output, &options, &frame.image)?);
                 }
                 let sink = sink.as_mut().expect("sink was just created");
@@ -567,7 +964,8 @@ fn capture_loop(
 
     let duration = started
         .elapsed()
-        .saturating_sub(origin.unwrap_or(Duration::ZERO));
+        .saturating_sub(origin.unwrap_or(Duration::ZERO))
+        .saturating_sub(paused.paused_duration());
     if let Some(sink) = sink {
         sink.finish(duration)?;
     }
@@ -576,6 +974,7 @@ fn capture_loop(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::sync::mpsc;
 
@@ -595,6 +994,25 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn pause_clock_freezes_time_until_resumed() {
+        let clock = PauseClock::default();
+        assert!(!clock.is_paused());
+        assert!(clock.paused_duration().is_zero());
+        clock.set_paused(true);
+        clock.set_paused(true); // idempotent
+        std::thread::sleep(Duration::from_millis(20));
+        let during = clock.paused_duration();
+        assert!(during >= Duration::from_millis(10));
+        clock.set_paused(false);
+        clock.set_paused(false); // idempotent
+        assert!(!clock.is_paused());
+        let frozen = clock.paused_duration();
+        assert!(frozen >= during);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(clock.paused_duration(), frozen);
     }
 
     #[test]
@@ -619,10 +1037,38 @@ mod tests {
     }
 
     #[test]
-    fn quality_maps_onto_the_quantizer_speed_range() {
-        assert_eq!(quality_to_speed(100), 1);
-        assert_eq!(quality_to_speed(90), 4);
-        assert_eq!(quality_to_speed(1), 30);
+    fn quality_maps_onto_palette_training_samples() {
+        assert!(quality_to_samples(1) < quality_to_samples(50));
+        assert!(quality_to_samples(50) < quality_to_samples(100));
+        assert_eq!(quality_to_samples(90), 15_424);
+    }
+
+    #[test]
+    fn the_palette_lut_maps_every_rgb_bin_to_a_valid_colour() {
+        let mut frame = RgbaImage::from_pixel(64, 48, image::Rgba([10, 20, 30, 255]));
+        for x in 0..frame.width() {
+            for y in 0..frame.height() {
+                frame.put_pixel(x, y, image::Rgba([x as u8 * 3, y as u8 * 4, 30, 255]));
+            }
+        }
+        let mut map = PaletteMap::train(&frame, 90);
+        assert_eq!(map.lut.len(), GIF_LUT_SIZE);
+        assert_eq!(map.palette.len(), 256 * 3);
+        assert!(
+            map.lut
+                .iter()
+                .all(|index| (*index as usize) * 3 < map.palette.len())
+        );
+        assert_eq!(map.indices(&frame).len(), (64 * 48) as usize);
+    }
+
+    #[test]
+    fn a_scene_change_raises_the_palette_error() {
+        let dark = RgbaImage::from_pixel(96, 64, image::Rgba([12, 18, 24, 255]));
+        let bright = RgbaImage::from_pixel(96, 64, image::Rgba([240, 200, 120, 255]));
+        let mut map = PaletteMap::train(&dark, 90);
+        assert!(map.error(&dark) < GIF_REFRESH_ERROR);
+        assert!(map.error(&bright) > GIF_REFRESH_ERROR);
     }
 
     #[test]
@@ -673,7 +1119,127 @@ mod tests {
             "expected a non-empty GIF at {}",
             output.display()
         );
+        assert_eq!(decode_frame_count(&output), 8, "the GIF lost frames");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scene change retrains the shared palette; every frame must still carry
+    /// a readable local palette so decoders can reconstruct it.
+    #[test]
+    fn a_palette_refresh_keeps_the_gif_decodable() {
+        let dir = temp_dir("gif-refresh");
+        let output = dir.join("out.gif");
+        let options = RecordOptions::default()
+            .with_quality(80)
+            .with_max_width(Some(32));
+        let mut sink = GifSink::new(&output, &options).unwrap();
+        for i in 0..24u64 {
+            let color = if i < 10 { 12 } else { 240 };
+            let frame = RgbaImage::from_pixel(64, 48, image::Rgba([color, color, color, 255]));
+            sink.push(&frame, Duration::from_millis(i * 100)).unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = Box::new(sink).finish(Duration::from_millis(2_400));
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("GIF encode blocked for more than 10s")
+            .expect("GIF encode failed");
+        assert_eq!(decode_frame_count(&output), 24, "the GIF lost frames");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dirty_rect_covers_only_the_changed_pixels() {
+        let before = RgbaImage::from_pixel(32, 20, image::Rgba([5, 5, 5, 255]));
+        assert!(dirty_rect(&before, &before).is_none());
+        let mut after = before.clone();
+        after.put_pixel(3, 4, image::Rgba([200, 0, 0, 255]));
+        after.put_pixel(9, 12, image::Rgba([200, 0, 0, 255]));
+        let rect = dirty_rect(&before, &after).expect("two pixels changed");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (3, 4, 7, 9));
+    }
+
+    /// Partial frames must compose back into the full screen: a decoder keeps
+    /// untouched pixels from the previous frame, so the GIF has to stay correct
+    /// after both a small change and a completely static frame.
+    #[test]
+    fn partial_frames_decode_to_the_full_screen() {
+        let dir = temp_dir("gif-partial");
+        let output = dir.join("out.gif");
+        let options = RecordOptions::default().with_quality(80);
+        let mut sink = GifSink::new(&output, &options).unwrap();
+        let base = RgbaImage::from_pixel(64, 48, image::Rgba([10, 20, 30, 255]));
+        let mut lit = base.clone();
+        for y in 10..20 {
+            for x in 20..30 {
+                lit.put_pixel(x, y, image::Rgba([240, 100, 5, 255]));
+            }
+        }
+        sink.push(&base, Duration::ZERO).unwrap();
+        sink.push(&lit, Duration::from_millis(100)).unwrap();
+        sink.push(&lit, Duration::from_millis(200)).unwrap();
+        Box::new(sink).finish(Duration::from_millis(300)).unwrap();
+
+        let file = File::open(&output).unwrap();
+        let mut decode = gif::DecodeOptions::new();
+        decode.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = decode.read_info(file).unwrap();
+        let mut canvas = RgbaImage::new(decoder.width() as u32, decoder.height() as u32);
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            for y in 0..frame.height as usize {
+                for x in 0..frame.width as usize {
+                    let at = (y * frame.width as usize + x) * 4;
+                    canvas.put_pixel(
+                        frame.left as u32 + x as u32,
+                        frame.top as u32 + y as u32,
+                        image::Rgba([
+                            frame.buffer[at],
+                            frame.buffer[at + 1],
+                            frame.buffer[at + 2],
+                            frame.buffer[at + 3],
+                        ]),
+                    );
+                }
+            }
+            frames.push(canvas.clone());
+        }
+        let brightness = |image: &RgbaImage, x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y);
+            pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32
+        };
+        assert_eq!(frames.len(), 3, "a static frame must still be written");
+        assert!(brightness(&frames[0], 25, 15) < 150);
+        assert!(brightness(&frames[1], 25, 15) > 250, "the lit block");
+        assert!(
+            brightness(&frames[1], 5, 5) < 150,
+            "pixels outside the rectangle stay from the previous frame"
+        );
+        assert_eq!(
+            frames[1].as_raw(),
+            frames[2].as_raw(),
+            "a static frame must not change the picture"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn decode_frame_count(path: &Path) -> usize {
+        let file = File::open(path).expect("cannot reopen the GIF");
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options.read_info(file).expect("the GIF cannot be decoded");
+        let mut count = 0;
+        while let Some(frame) = decoder.read_next_frame().expect("bad GIF frame") {
+            assert_eq!(
+                frame.buffer.len(),
+                frame.width as usize * frame.height as usize * 4,
+                "a frame decoded to the wrong pixel count"
+            );
+            count += 1;
+        }
+        count
     }
 
     /// `Recorder::stop` must return after the duration cap without needing a UI
@@ -699,6 +1265,49 @@ mod tests {
             summary.path.is_file(),
             "missing GIF at {}",
             summary.path.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A paused recording must not advance its clock, and cancel must not
+    /// leave a container behind. Skipped when Screen Recording is missing.
+    #[test]
+    fn pause_freezes_the_clock_and_discard_leaves_no_file() {
+        let dir = temp_dir("discard");
+        let output = dir.join("cancelled.gif");
+        let options = RecordOptions::default()
+            .with_fps(8)
+            .with_max_duration(Duration::from_millis(400))
+            .with_max_width(Some(160));
+        let Some(recorder) = (|| {
+            let monitor = snapit_capture::monitors()
+                .ok()?
+                .into_iter()
+                .find(|m| m.is_primary)?;
+            Recorder::start(
+                monitor.id,
+                Region::new(0., 0., 160., 120.),
+                options,
+                &output,
+            )
+            .ok()
+        })() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        recorder.set_paused(true);
+        assert!(recorder.is_paused());
+        let paused_at = recorder.elapsed();
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            recorder.elapsed() <= paused_at + Duration::from_millis(30),
+            "the effective recording clock kept running while paused"
+        );
+        recorder.discard().expect("discard failed");
+        assert!(
+            !output.exists(),
+            "a cancelled recording left its file behind"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
