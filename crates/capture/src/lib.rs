@@ -19,6 +19,7 @@ use anyhow::{Context as _, Result, anyhow};
 pub use image::RgbaImage;
 use image::{ImageFormat, imageops};
 use xcap::Monitor;
+pub use xcap::OutputSize;
 
 mod elements;
 #[cfg(target_os = "macos")]
@@ -286,14 +287,20 @@ pub struct LiveRecorder {
 
 impl LiveRecorder {
     pub fn start(monitor_id: u32, region: Region, fps: u32) -> Result<Self> {
-        Self::start_with(monitor_id, region, fps, false)
+        Self::start_with(monitor_id, region, fps, false, OutputSize::Native)
     }
 
+    /// `output_size` states the intent, not a pixel number: `Logical` asks for
+    /// frames at the selection's monitor-unit size (macOS compositor scaling),
+    /// `Native` for physical pixels. It is best-effort — DXGI ignores it and
+    /// the platform may still deliver native frames — so callers must keep
+    /// their own downscale as a fallback.
     pub fn start_with(
         monitor_id: u32,
         region: Region,
         fps: u32,
         captures_cursor: bool,
+        output_size: OutputSize,
     ) -> Result<Self> {
         let (monitor, region) = resolve_region(monitor_id, region)?;
         let options = xcap::VideoRecorderOptions::default()
@@ -307,7 +314,8 @@ impl LiveRecorder {
             .captures_cursor(captures_cursor)
             // The overlay and the recording bar belong to this process; the
             // platform recorder must leave them out of the frames.
-            .excludes_own_windows(true);
+            .excludes_own_windows(true)
+            .output_size(output_size);
         let (recorder, frames) = monitor.video_recorder_with_options(options)?;
         recorder.start()?;
         Ok(Self { recorder, frames })
