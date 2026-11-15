@@ -23,7 +23,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 - **复制与保存**：复制为 PNG；另存为 PNG 或 JPEG（可调 JPG 质量），也可在保存对话框里改扩展名。
 - **贴图（Pin）**：把截图钉在屏幕上，可拖动、缩放、调整透明度，支持多张贴图。
 - **文字识别**：识别选区文字并尽量自动复制；结果面板可再次复制，识别文字也会写入历史记录。
-- **录制 GIF / MP4**：录制是两件独立的事，各有自己的快捷键和托盘菜单项——GIF 适合贴进聊天窗口，MP4 走系统硬件编码、体积更小也更流畅。录制时显示进度控制条；按快捷键、点「停止」或到达时长上限都会结束录制。
+- **录制 GIF / MP4**：录制是两件独立的事，各有自己的快捷键和托盘菜单项——GIF 适合贴进聊天窗口，MP4 走系统硬件编码、体积更小也更流畅。录制时显示进度控制条，可暂停 / 继续、取消或停止；按快捷键、点「停止」或到达时长上限会结束并保存，按 `Esc` 或点「取消」则丢弃本次录制。
 - **托盘与全局快捷键**：默认 `⌥⇧A` 截图、`⌥⇧O` 识别文字、`⌥⇧G` 录制 GIF、`⌥⇧V` 录制视频，可在设置中修改，冲突会提示。
 - **历史记录**：复制、保存、贴图、识别文字和录制的 GIF / 视频都会自动保存一份，按条数和占用空间自动清理。
 - **权限引导**：macOS 上缺少屏幕录制 / 辅助功能权限时（启动或开始截图时）会打开权限面板，说明用途并跳到系统设置。
@@ -86,7 +86,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | 录制 GIF | `⌥⇧G`（`Alt+Shift+G`） |
 | 录制视频 | `⌥⇧V`（`Alt+Shift+V`） |
 
-可在 **设置 → 快捷键** 中点击后按下新组合键；`Esc` 取消录制，`Backspace` / `⌫` 清除（禁用）。不支持的组合、与其他动作冲突或被其他应用占用时会显示错误。录制期间按任一全局快捷键会停止当前录制，并在编码完成后执行该快捷键对应的动作（例如再按一次 GIF 快捷键即可接着录下一段）。
+可在 **设置 → 快捷键** 中点击后按下新组合键；`Esc` 放弃录入，`Backspace` / `⌫` 清除（禁用）。不支持的组合、与其他动作冲突或被其他应用占用时会显示错误。录制期间按任一全局快捷键会停止当前录制，并在编码完成后执行该快捷键对应的动作（例如再按一次 GIF 快捷键即可接着录下一段）。
 
 同一数据目录只允许运行一个 SnapIt，避免重复托盘图标和全局快捷键冲突。再次启动时若不带参数会直接退出；带 `--capture` / `--settings` / `--history` 时，请求会通过数据目录里的 `snapit.request` 转交给已运行的实例执行（约 50 ms 内响应），不会静默丢失。开机自启的 `--background` 属于无参数启动，不会重复打开窗口。
 
@@ -137,13 +137,13 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 ### 录制 GIF / MP4
 
 1. 按对应快捷键、从托盘选择「录制 GIF」/「录制视频」，或在选区工具栏点击胶片 / 摄像机按钮。
-2. 拖动选区后立即开始录制：选区四周出现高亮边框（边框落在录制区域之外，不会录进画面），旁边出现控制条，显示已录制时间；设置了时长上限时还会显示上限。控制条可以拖动，拖到哪就停在哪儿；SnapIt 自己的窗口不会出现在录制画面里，所以拖到选区上也没关系。
-3. 按任一全局快捷键、点击控制条上的「停止」，或到达最长时长都会结束录制；随后控制条显示「正在生成 GIF…」或「正在生成 MP4…」。用快捷键停止时，该快捷键对应的动作会在编码完成后自动开始。
+2. 拖动选区后立即开始录制：选区四周出现高亮边框（边框落在录制区域之外，不会录进画面），旁边出现控制条，显示已录制时间；设置了时长上限时还会显示上限。控制条上是暂停 / 继续、取消、停止三个图标按钮（鼠标悬停会显示用途），可以拖动，拖到哪就停在哪儿；SnapIt 自己的窗口不会出现在录制画面里，所以拖到选区上也没关系。
+3. 按 `Space` 暂停或继续：暂停期间画面不会被写入文件，暂停的时间也不计入录制时长和时长上限，继续后时间轴接着走。按任一全局快捷键、点击停止图标（或按 `Enter`），或到达最长时长都会结束并保存录制；随后控制条显示「正在生成 GIF…」或「正在生成 MP4…」。用快捷键停止时，该快捷键对应的动作会在编码完成后自动开始。按 `Esc` 或点取消图标则直接丢弃本次录制：不生成文件、不进历史记录、不写剪贴板。
 4. 编码完成后文件自动保存到默认保存目录，文件名为 `SnapIt <日期> <时间>.gif` 或 `.mp4`，同时写入历史记录；通知里显示路径、帧数和时长。GIF 会以图片形式、MP4 会以文件形式自动复制到剪贴板，结束后直接粘贴即可。
 
 格式由入口决定：GIF 入口（快捷键、托盘菜单、胶片按钮）写 GIF，视频入口写 MP4，不需要再选「默认格式」。录制参数在 **设置 → 录制** 中调整：帧率 1–30 fps（默认 12）、最长时长 0–600 秒（默认 0，即不限时长）和是否录制鼠标光标（默认关闭，仅 macOS）。录制时会去掉连续相同的帧，并按选区的逻辑宽度输出，避免 HiDPI 下文件过大。
 
-一次录制只产出一个文件，但两种格式的录制都会留在历史记录里并存。MP4 走系统硬件编码（macOS 用 AVFoundation，Windows 用 Media Foundation），不需要另外安装编码器；GIF 用纯 Rust 的 gif 编码，任何地方都能直接播放。H.264 要求偶数宽高，所以 MP4 的尺寸最多比选区少 1 像素。
+一次录制只产出一个文件，但两种格式的录制都会留在历史记录里并存。MP4 走系统硬件编码（macOS 用 AVFoundation，Windows 用 Media Foundation），不需要另外安装编码器；GIF 用纯 Rust 编码，任何地方都能直接播放。两者都是边录边写：macOS 上由 ScreenCaptureKit 在采集阶段直接把 HiDPI 物理像素帧缩到选区的逻辑尺寸，Windows 与回落路径再做一次整数均值降采样；GIF 整段复用同一张 256 色板（从画面抽样训练、按需建立查表），并且只编码画面里变化的矩形，静止区域沿用上一帧内容，画面配色变化较大时会自动重建色板并写一帧全画面。所以停止后几乎不用等待，也不会像逐帧重新量化那样越录越慢。H.264 要求偶数宽高，所以 MP4 的尺寸最多比选区少 1 像素。
 
 ### 贴图
 
@@ -188,6 +188,9 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | 追加选区（多选） | <kbd>Shift</kbd> + 单击 / 拖动 | <kbd>Shift</kbd> + 单击 / 拖动 |
 | 撤销标注 | <kbd>⌘Z</kbd> | <kbd>Ctrl+Z</kbd> |
 | 取消截图 / 关闭贴图 | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
+| 录制时暂停 / 继续 | <kbd>Space</kbd> | <kbd>Space</kbd> |
+| 录制时停止并保存 | <kbd>Enter</kbd> | <kbd>Enter</kbd> |
+| 录制时取消并丢弃 | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
 | 关闭贴图 | <kbd>⌘W</kbd> | <kbd>Ctrl+W</kbd> |
 | 贴图放大 / 缩小 / 原始大小 | <kbd>⌘=</kbd> / <kbd>⌘-</kbd> / <kbd>⌘0</kbd> | <kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd> |
 | 打开设置 | <kbd>⌘,</kbd> | <kbd>Ctrl+,</kbd> |
@@ -217,7 +220,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 ### 准备
 
 - 安装 [rustup](https://rustup.rs/)。工具链固定在 `rust-toolchain.toml`（当前为 1.99.1），首次构建会自动下载。
-- 本仓库通过 git submodule 引入 `vendor/xcap`（录制需要的区域裁剪、帧率上限、时间戳和光标选项）。克隆时使用 `git clone --recursive`；已克隆的仓库执行 `git submodule update --init`。
+- 本仓库通过 git submodule 引入 `vendor/xcap`（录制需要的区域裁剪、帧率上限、时间戳、光标与 `OutputSize::Logical` 逻辑尺寸选项）。克隆时使用 `git clone --recursive`；已克隆的仓库执行 `git submodule update --init`。
 - **macOS**：Xcode Command Line Tools（`xcode-select --install`）。
 - **Windows**：安装 Visual Studio Build Tools 中的「使用 C++ 的桌面开发」工作负载，包括 MSVC 和 Windows SDK（gpui 用 SDK 中的 `fxc` 编译着色器，打包脚本用资源编译器嵌入图标）。打安装包还需要 [NSIS](https://nsis.sourceforge.io/)（`makensis`）。
 
@@ -361,7 +364,7 @@ curl -LO https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten
 ## 致谢与许可
 
 - UI 基于 [gpui](https://www.gpui.rs/) 和 [gpui-kit](https://github.com/longbridge/gpui-kit)（gpui-kit 固定为 `0.9.1`，对应 GPUI `gpui-pre` 0.3.12），均以 Apache-2.0 许可发布。
-- 截屏使用 [xcap](https://github.com/nashaofu/xcap)，录制部分使用以子模块引入的 [SnapIt 分支](https://github.com/gjfei/xcap)（macOS 改用 ScreenCaptureKit，补充区域录制、帧率上限、时间戳、光标与排除自身窗口），GIF 编码使用 [gif](https://github.com/image-rs/image-gif)；MP4 在 macOS / Windows 上调用系统硬件编码器（AVFoundation / Media Foundation）。
+- 截屏使用 [xcap](https://github.com/nashaofu/xcap)，录制部分使用以子模块引入的 [SnapIt 分支](https://github.com/gjfei/xcap)（macOS 改用 ScreenCaptureKit，补充区域录制、帧率上限、时间戳、光标、排除自身窗口与 `OutputSize::Logical` 逻辑尺寸选项），GIF 编码使用 [gif](https://github.com/image-rs/image-gif) 与 [color_quant](https://crates.io/crates/color_quant)（共享色板 + 查表量化 + 只编码变化区域），macOS 按该选项在合成阶段缩放到选区逻辑尺寸、整数均值降采样作为兜底，而不使用通用重采样滤镜；MP4 在 macOS / Windows 上调用系统硬件编码器（AVFoundation / Media Foundation）。
 - 纯 Rust OCR 使用 [ocrs](https://github.com/robertknight/ocrs)。
 - 标注烘焙使用 [tiny-skia](https://github.com/RazrFalcon/tiny-skia)，文字位图使用 [fontdue](https://github.com/mooman219/fontdue)。
 - 托盘、全局快捷键、开机启动分别使用 [tray-icon](https://github.com/tauri-apps/tray-icon)、[global-hotkey](https://github.com/tauri-apps/global-hotkey)、[auto-launch](https://github.com/zzzgydi/auto-launch)。

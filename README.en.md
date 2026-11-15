@@ -23,7 +23,7 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **Copy and save**: copy as PNG; save as PNG or JPEG (with adjustable JPG quality), or change the extension in the save dialog.
 - **Pins**: keep a capture on screen, movable, zoomable and translucent; multiple pins are supported.
 - **Text recognition**: recognizes the selection and copies the text when it can; the results panel lets you copy again, and the text is stored in history.
-- **GIF / MP4 recording**: two separate actions with their own shortcut and tray entry — a GIF drops straight into a chat, an MP4 goes through the system hardware encoder and stays small and smooth. Both show a progress bar; stop with the shortcut, the bar's button, or the duration limit.
+- **GIF / MP4 recording**: two separate actions with their own shortcut and tray entry — a GIF drops straight into a chat, an MP4 goes through the system hardware encoder and stays small and smooth. Both show a progress bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.
 - **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧O` recognize text, `⌥⇧G` record a GIF, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
 - **History**: copy, save, pin, OCR and recorded GIFs / videos are all saved automatically, pruned by item count and disk usage.
 - **Permission guidance**: when macOS screen recording or accessibility access is missing, SnapIt opens a permissions panel that explains what each one is for and links to System Settings.
@@ -86,7 +86,7 @@ Default global shortcuts:
 | Record GIF | `⌥⇧G` (`Alt+Shift+G`) |
 | Record video | `⌥⇧V` (`Alt+Shift+V`) |
 
-Rebind them in **Settings → Shortcuts** by clicking and pressing a new combination; `Esc` cancels recording and `Backspace` / `⌫` clears (disables) a binding. Unsupported combinations, conflicts with another action and shortcuts the system refuses to register are reported. While recording, any global shortcut stops the current recording and then runs that shortcut's own action once encoding finishes (press the GIF shortcut again to start the next recording).
+Rebind them in **Settings → Shortcuts** by clicking and pressing a new combination; `Esc` aborts the rebinding and `Backspace` / `⌫` clears (disables) a binding. Unsupported combinations, conflicts with another action and shortcuts the system refuses to register are reported. While recording, any global shortcut stops the current recording and then runs that shortcut's own action once encoding finishes (press the GIF shortcut again to start the next recording).
 
 Only one SnapIt process runs per data directory, so the tray icon and global hotkeys are never duplicated. A second launch without flags simply exits; `--capture` / `--settings` / `--history` are forwarded to the running instance through `snapit.request` in the data directory and executed there (within about 50 ms) instead of being silently dropped. The login item's `--background` launch has no request and does not open another window.
 
@@ -137,13 +137,13 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 ### GIF / MP4 recording
 
 1. Press the shortcut for the format you want, choose Record GIF / Record Video in the tray, or click the film / camera button in the overlay toolbar.
-2. Recording starts as soon as the region is committed: an outline frames the selection (it sits just outside the captured area, so it never appears in the recording) and a control bar beside it shows the elapsed time and, when set, the duration limit. The bar can be dragged and stays where you drop it; SnapIt's own windows never appear in the recording, so dropping it over the selection is fine.
-3. Any global shortcut, the bar's Stop button, or reaching the limit ends the recording; the bar then shows “Encoding GIF…” or “Encoding MP4…”. When a shortcut stopped it, that shortcut's action starts automatically after encoding.
+2. Recording starts as soon as the region is committed: an outline frames the selection (it sits just outside the captured area, so it never appears in the recording) and a control bar beside it shows the elapsed time and, when set, the duration limit. The bar has three icon-only buttons — pause / resume, cancel and stop (hover for a tooltip); it can be dragged and stays where you drop it. SnapIt's own windows never appear in the recording, so dropping it over the selection is fine.
+3. `Space` pauses or resumes: paused frames are not encoded, and the paused stretch is left out of both the file's timeline and the duration limit. Any global shortcut, the bar's stop icon (or `Enter`), or reaching the limit ends and saves the recording; the bar then shows “Encoding GIF…” or “Encoding MP4…”. When a shortcut stopped it, that shortcut's action starts automatically after encoding. `Esc` or the cancel icon discards the recording outright: no file, no history entry, no clipboard write.
 4. When encoding finishes, the file is saved automatically to the default save directory as `SnapIt <date> <time>.gif` or `.mp4`, added to history, and a notification shows the path, frame count and duration. The recording is also copied to the clipboard automatically — the GIF as an image, the MP4 as a file — ready to paste right away.
 
 The format comes from the entry point — the GIF shortcut, tray item and film button write a GIF; the video ones write an MP4 — so there is no default format to pick. Recording options live in **Settings → Recording**: 1–30 fps (default 12), 0–600 seconds (default 0, unlimited), whether to record the mouse pointer (off by default, macOS only). Consecutive identical frames are dropped, and output is scaled to the selection's logical width so HiDPI captures stay small.
 
-Each recording writes exactly one file, but GIF and MP4 entries coexist in history. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows), so no codec has to be installed; GIF is encoded in pure Rust with the gif crate and plays anywhere. H.264 needs even dimensions, so an MP4 can be up to one pixel narrower or shorter than the selection.
+Each recording writes exactly one file, but GIF and MP4 entries coexist in history. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows), so no codec has to be installed; GIF is encoded in pure Rust and plays anywhere. Both stream to disk while recording: on macOS ScreenCaptureKit scales physical-pixel frames down to the selection's logical size during capture (Windows and the fallback path use an integer box mean), and a GIF shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. That is why stopping takes almost no time and long recordings do not slow down the way per-frame re-quantisation does. H.264 needs even dimensions, so an MP4 can be up to one pixel narrower or shorter than the selection.
 
 ### Pins
 
@@ -188,6 +188,9 @@ Global shortcuts are listed above and can be changed in settings. The following 
 | Add a region (multi-select) | <kbd>Shift</kbd> + click / drag | <kbd>Shift</kbd> + click / drag |
 | Undo annotation | <kbd>⌘Z</kbd> | <kbd>Ctrl+Z</kbd> |
 | Cancel capture / close pin | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
+| Pause / resume while recording | <kbd>Space</kbd> | <kbd>Space</kbd> |
+| Stop and save while recording | <kbd>Enter</kbd> | <kbd>Enter</kbd> |
+| Discard while recording | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
 | Close pin | <kbd>⌘W</kbd> | <kbd>Ctrl+W</kbd> |
 | Pin zoom in / out / reset | <kbd>⌘=</kbd> / <kbd>⌘-</kbd> / <kbd>⌘0</kbd> | <kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd> |
 | Open settings | <kbd>⌘,</kbd> | <kbd>Ctrl+,</kbd> |
@@ -217,7 +220,7 @@ The default TOML is written on first run. A corrupt config is moved to `config.t
 ### Prerequisites
 
 - Install [rustup](https://rustup.rs/). The toolchain is pinned in `rust-toolchain.toml` (currently 1.99.1) and is downloaded on the first build.
-- This repository pulls `vendor/xcap` in as a git submodule (it carries the recording needs: region crop, frame-rate cap, timestamps and cursor options). Clone with `git clone --recursive`; an existing clone needs `git submodule update --init`.
+- This repository pulls `vendor/xcap` in as a git submodule (it carries the recording needs: region crop, frame-rate cap, timestamps, cursor options and the `OutputSize::Logical` hint). Clone with `git clone --recursive`; an existing clone needs `git submodule update --init`.
 - **macOS**: Xcode Command Line Tools (`xcode-select --install`).
 - **Windows**: install the “Desktop development with C++” workload in Visual Studio Build Tools, including MSVC and the Windows SDK (gpui compiles shaders with the SDK's `fxc`, and the packaging script uses the resource compiler to embed the icon). Building the installer also needs [NSIS](https://nsis.sourceforge.io/) (`makensis`).
 
@@ -361,7 +364,7 @@ Model lookup order: the `SNAPIT_OCR_MODELS` environment variable → `models/` n
 ## Credits and license
 
 - The UI is built on [gpui](https://www.gpui.rs/) and [gpui-kit](https://github.com/longbridge/gpui-kit) (pinned to `0.9.1`, which tracks GPUI `gpui-pre` 0.3.12), both Apache-2.0.
-- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/gjfei/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor and own-window exclusion). GIF encoding uses [gif](https://github.com/image-rs/image-gif). MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
+- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/gjfei/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor, own-window exclusion and an `OutputSize::Logical` hint). GIF encoding uses [gif](https://github.com/image-rs/image-gif) with [color_quant](https://crates.io/crates/color_quant) for a shared palette, table-driven quantization and dirty-rectangle frames; macOS scales in the compositor when the logical-size hint is set and keeps an integer box mean as the fallback rather than a general resize filter. MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
 - Pure-Rust OCR uses [ocrs](https://github.com/robertknight/ocrs).
 - Annotation baking uses [tiny-skia](https://github.com/RazrFalcon/tiny-skia); text bitmaps use [fontdue](https://github.com/mooman219/fontdue).
 - The tray, global shortcuts and launch at login use [tray-icon](https://github.com/tauri-apps/tray-icon), [global-hotkey](https://github.com/tauri-apps/global-hotkey) and [auto-launch](https://github.com/zzzgydi/auto-launch).
