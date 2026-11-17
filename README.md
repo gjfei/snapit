@@ -14,6 +14,11 @@
 
 SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-kit](https://github.com/longbridge/gpui-kit)（Zed GPUI）写成，不依赖 Electron 或 WebView。它常驻托盘，没有主窗口或启动器：按下全局快捷键后冻结所有显示器，在选区上完成复制、保存、贴图、文字识别或录制 GIF / MP4。
 
+<p align="center">
+  <img src="assets/screenshots/zh-CN/capture.png" width="820" alt="SnapIt 选区浮层与工具栏">
+</p>
+<p align="center"><sub>选区浮层与工具栏 · 以下界面预览中的演示数据均为虚构内容</sub></p>
+
 ## 功能
 
 - **多显示器区域截图**：截图时冻结全部显示器，每个显示器一个全屏浮层；拖拽选区，或把光标悬停在窗口 / 界面元素上单击选择。
@@ -99,6 +104,11 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 5. `F` 直接选中当前显示器的整个画面；`C` 复制光标下的颜色（`#RRGGBB`，放大镜里也会显示）。
 6. 按住 `Shift` 进入多选模式：单击窗口 / 元素或拖动框选可逐个添加，单击已选区域可移除。松开 `Shift` 后同一显示器上的选区会合成一个整体选区，可直接标注、复制、保存、贴图：各区域保持屏幕上的原始位置，其余部分在 PNG 中透明；合成后不能拖边缩放，也不支持录制，再按住 `Shift` 可恢复为多个选区继续增删。跨显示器时改为上下拼接，仍按多个区域处理（不支持标注和录制）。
 
+<p align="center">
+  <img src="assets/screenshots/zh-CN/multi-region.png" width="820" alt="Shift 多选区">
+</p>
+<p align="center"><sub>按住 Shift 逐个收集选区，松开后合成一个整体选区</sub></p>
+
 保存对话框默认文件名是 `SnapIt <日期> <时间>.<扩展名>`，默认目录依次为：设置里指定的保存目录 → `~/Pictures` → `~/Desktop` → 用户主目录。图片格式和 JPG 质量在 **设置 → 截图** 中调整；在保存对话框里把扩展名改成 `.jpg` / `.jpeg` 会按 JPEG 保存。
 
 未打开选区时，悬停会高亮光标下的窗口；开元素框选时高亮最小的界面控件，滚轮向外切换容器，反向滚动再收回。单击高亮区域直接选中它。
@@ -115,6 +125,11 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | 马赛克 | 真实像素化，不跟随颜色 |
 | 文字 | 点击定位后输入，`Enter` 确认、`Esc` 取消 |
 | 序号 | 依次放置 1、2、3… 的圆形编号 |
+
+<p align="center">
+  <img src="assets/screenshots/zh-CN/annotations.png" width="820" alt="标注工具与样式">
+</p>
+<p align="center"><sub>矩形、箭头、画笔、马赛克、文字与序号标注，可选颜色和线宽</sub></p>
 
 除马赛克外都可以选颜色；矩形、箭头、画笔可选线宽。工具栏上还有撤销和清除标注。工具栏可以拖动，拖到想放的位置后就停在那里。标注只画在冻结的截图上：复制、保存和贴图时会把标注烘焙进图片；文字识别和录制使用未标注的选区。
 
@@ -134,12 +149,27 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | Windows.Media.Ocr | Windows | 默认，需要系统安装对应 OCR 语言包；创建失败时回退到 ocrs |
 | [ocrs](https://github.com/robertknight/ocrs) | 回退后端 | 纯 Rust，仅拉丁字母，需要下载模型 |
 
+<p align="center">
+  <img src="assets/screenshots/zh-CN/ocr.png" width="820" alt="文字识别结果面板">
+</p>
+<p align="center"><sub>识别结果面板：有结果时自动复制到剪贴板，可再次复制</sub></p>
+
 ### 录制 GIF / MP4
 
 1. 按对应快捷键、从托盘选择「录制 GIF」/「录制视频」，或在选区工具栏点击胶片 / 摄像机按钮。
 2. 拖动选区后立即开始录制：选区四周出现高亮边框（边框落在录制区域之外，不会录进画面），旁边出现控制条，显示已录制时间；设置了时长上限时还会显示上限。控制条上是暂停 / 继续、取消、停止三个图标按钮（鼠标悬停会显示用途），可以拖动，拖到哪就停在哪儿；SnapIt 自己的窗口不会出现在录制画面里，所以拖到选区上也没关系。
 3. 按 `Space` 暂停或继续：暂停期间画面不会被写入文件，暂停的时间也不计入录制时长和时长上限，继续后时间轴接着走。按任一全局快捷键、点击停止图标（或按 `Enter`），或到达最长时长都会结束并保存录制；随后控制条显示「正在生成 GIF…」或「正在生成 MP4…」。用快捷键停止时，该快捷键对应的动作会在编码完成后自动开始。按 `Esc` 或点取消图标则直接丢弃本次录制：不生成文件、不进历史记录、不写剪贴板。
 4. 编码完成后文件自动保存到默认保存目录，文件名为 `SnapIt <日期> <时间>.gif` 或 `.mp4`，同时写入历史记录；通知里显示路径、帧数和时长。GIF 会以图片形式、MP4 会以文件形式自动复制到剪贴板，结束后直接粘贴即可。
+
+<p align="center">
+  <img src="assets/screenshots/zh-CN/recording.png" width="820" alt="录制时的选区边框与控制条">
+</p>
+<p align="center"><sub>录制边框落在选区之外，控制条可暂停 / 取消 / 停止并可拖动</sub></p>
+
+<p align="center">
+  <img src="assets/screenshots/zh-CN/recording-demo.gif" width="820" alt="SnapIt 录制的 GIF 效果演示">
+</p>
+<p align="center"><sub>GIF 录制效果（演示画面为虚构内容）：逐帧记录选区内的变化</sub></p>
 
 格式由入口决定：GIF 入口（快捷键、托盘菜单、胶片按钮）写 GIF，视频入口写 MP4，不需要再选「默认格式」。录制参数在 **设置 → 录制** 中调整：帧率 1–30 fps（默认 12）、最长时长 0–600 秒（默认 0，即不限时长）和是否录制鼠标光标（默认关闭，仅 macOS）。录制时会去掉连续相同的帧，并按选区的逻辑宽度输出，避免 HiDPI 下文件过大。
 
@@ -149,6 +179,11 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 
 在选区工具栏点击「钉住」、从托盘选择「钉住上次截图」，或在历史记录里选择「钉在屏幕上」。没有本次会话的截图时，「钉住上次截图」会使用历史记录里最新的一张图片。
 
+<p align="center">
+  <img src="assets/screenshots/zh-CN/pin.png" width="820" alt="置顶贴图窗口">
+</p>
+<p align="center"><sub>贴图始终置顶，可拖动、缩放并调整透明度，支持多张</sub></p>
+
 - 拖动贴图移动；滚轮缩放；按住 `⌥` / `Alt` 滚动调整不透明度（最低 20%）。
 - 双击或 `Esc` 关闭；右键菜单可复制、保存、调整不透明度（100% / 80% / 60% / 40%）、缩放、恢复原始大小、关闭。
 - `⌘C` / `Ctrl+C` 复制，`⌘S` / `Ctrl+S` 保存，`⌘=` / `⌘-` / `⌘0`（Windows：`Ctrl+=` 等）缩放，`⌘W` / `Ctrl+W` 关闭。
@@ -157,6 +192,11 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 ### 历史记录
 
 复制、保存、贴图、识别文字和录制时都会自动保存一份到历史记录（可在 **设置 → 历史记录** 关闭）。默认最多保留 200 项、最多占用 512 MB，超出后删除最早的记录。
+
+<p align="center">
+  <img src="assets/screenshots/zh-CN/history.png" width="820" alt="历史记录面板">
+</p>
+<p align="center"><sub>历史面板：筛选、缩略图与复制 / 贴图 / 在文件夹中显示 / 删除</sub></p>
 
 历史面板顶部有「全部 / 截图 / 录制」三个筛选按钮，切换时条数和占用空间一起更新。支持复制图片、钉在屏幕上、在文件夹中显示、删除，以及清空全部记录。**单击条目的缩略图或文字区域**会用系统默认程序打开**原始文件**（PNG 交给看图应用、GIF 交给默认查看器、MP4 交给播放器），应用内不做预览。视频没有「复制图片」按钮，但有「复制文件」：复制的是视频文件本身，可直接粘贴到 Finder 或聊天窗口。GIF / MP4 在列表和贴图里都用首帧 PNG 缩略图。
 
@@ -171,6 +211,11 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | 文字识别 | 识别语言 |
 | 历史记录 | 是否保存、最多保留条数、最大占用空间，以及打开历史面板 |
 | 关于 | 配置文件路径、在文件夹中显示 |
+
+<p align="center">
+  <img src="assets/screenshots/zh-CN/settings.png" width="820" alt="设置面板">
+</p>
+<p align="center"><sub>设置面板：通用、快捷键、截图、录制、文字识别、历史记录与关于</sub></p>
 
 开机启动通过 LaunchAgent（macOS）或当前用户注册表 Run 项（Windows）注册，启动时带 `--background` 参数，只显示托盘图标。
 

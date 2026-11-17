@@ -14,6 +14,11 @@
 
 SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [gpui-kit](https://github.com/longbridge/gpui-kit) (Zed's GPUI) — no Electron, no WebView. It lives in the tray with no main window or launcher: a global shortcut freezes every display, and the overlay lets you copy, save, pin, recognize text or record a GIF / MP4 from the selection.
 
+<p align="center">
+  <img src="assets/screenshots/en/capture.png" width="820" alt="SnapIt selection overlay and toolbar">
+</p>
+<p align="center"><sub>Selection overlay and toolbar · all demo data in the previews below is fictional</sub></p>
+
 ## Features
 
 - **Multi-monitor region capture**: the whole desktop freezes and each display gets a fullscreen overlay. Drag a region, or hover a window / UI element and click to snap to it.
@@ -99,6 +104,11 @@ Only one SnapIt process runs per data directory, so the tray icon and global hot
 5. `F` selects the whole current display; `C` copies the color under the cursor (`#RRGGBB`, also shown in the magnifier).
 6. Hold `Shift` to enter multi-select: click windows / elements or drag to add regions, click a selected region to remove it. Releasing `Shift` combines same-display regions into one selection that can be annotated, copied, saved and pinned: each region keeps its original on-screen position and the rest is transparent in PNG. A combined selection cannot be resized and does not support recording; hold `Shift` again to restore the separate regions for further edits. Regions on different displays are stitched top to bottom and stay separate (no annotations or recording).
 
+<p align="center">
+  <img src="assets/screenshots/en/multi-region.png" width="820" alt="Shift multi-region selection">
+</p>
+<p align="center"><sub>Hold Shift to collect regions one by one, then release to combine them</sub></p>
+
 The save dialog suggests `SnapIt <date> <time>.<extension>`, and the directory is, in order: the configured save directory → `~/Pictures` → `~/Desktop` → the home directory. Image format and JPG quality live in **Settings → Capture**; changing the extension to `.jpg` / `.jpeg` in the dialog saves as JPEG.
 
 With no selection, hovering highlights the window under the cursor; with element snapping, the smallest control is highlighted, the wheel moves outward to containers and reverses back. Clicking the highlight selects it.
@@ -115,6 +125,11 @@ Once a region is selected, annotation tools appear on the left of the toolbar:
 | Mosaic | Real pixelation; no color |
 | Text | Click to place, then type; `Enter` confirms, `Esc` cancels |
 | Step | Places numbered circles 1, 2, 3… |
+
+<p align="center">
+  <img src="assets/screenshots/en/annotations.png" width="820" alt="Annotation tools and style">
+</p>
+<p align="center"><sub>Rectangle, arrow, pen, mosaic, text and step annotations, with color and line width</sub></p>
 
 Everything except mosaic takes a color; rectangle, arrow and pen also take a line width. Undo and clear buttons sit on the same toolbar, which can be dragged and stays where you drop it. Annotations live on the frozen screenshot: copy, save and pin bake them into the image, while OCR and recording use the unannotated selection.
 
@@ -134,12 +149,27 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 | Windows.Media.Ocr | Windows | Default; needs the matching OCR language pack, falls back to ocrs if creation fails |
 | [ocrs](https://github.com/robertknight/ocrs) | All | Pure Rust, Latin script only, needs downloaded models |
 
+<p align="center">
+  <img src="assets/screenshots/en/ocr.png" width="820" alt="Text recognition results panel">
+</p>
+<p align="center"><sub>Results panel: a result is copied automatically and can be copied again</sub></p>
+
 ### GIF / MP4 recording
 
 1. Press the shortcut for the format you want, choose Record GIF / Record Video in the tray, or click the film / camera button in the overlay toolbar.
 2. Recording starts as soon as the region is committed: an outline frames the selection (it sits just outside the captured area, so it never appears in the recording) and a control bar beside it shows the elapsed time and, when set, the duration limit. The bar has three icon-only buttons — pause / resume, cancel and stop (hover for a tooltip); it can be dragged and stays where you drop it. SnapIt's own windows never appear in the recording, so dropping it over the selection is fine.
 3. `Space` pauses or resumes: paused frames are not encoded, and the paused stretch is left out of both the file's timeline and the duration limit. Any global shortcut, the bar's stop icon (or `Enter`), or reaching the limit ends and saves the recording; the bar then shows “Encoding GIF…” or “Encoding MP4…”. When a shortcut stopped it, that shortcut's action starts automatically after encoding. `Esc` or the cancel icon discards the recording outright: no file, no history entry, no clipboard write.
 4. When encoding finishes, the file is saved automatically to the default save directory as `SnapIt <date> <time>.gif` or `.mp4`, added to history, and a notification shows the path, frame count and duration. The recording is also copied to the clipboard automatically — the GIF as an image, the MP4 as a file — ready to paste right away.
+
+<p align="center">
+  <img src="assets/screenshots/en/recording.png" width="820" alt="Recording outline and control bar">
+</p>
+<p align="center"><sub>The outline sits outside the recorded area; the bar pauses / cancels / stops and can be dragged</sub></p>
+
+<p align="center">
+  <img src="assets/screenshots/en/recording-demo.gif" width="820" alt="GIF produced by SnapIt's recorder">
+</p>
+<p align="center"><sub>Recorded GIF (fictional demo content): changes inside the selection captured frame by frame</sub></p>
 
 The format comes from the entry point — the GIF shortcut, tray item and film button write a GIF; the video ones write an MP4 — so there is no default format to pick. Recording options live in **Settings → Recording**: 1–30 fps (default 12), 0–600 seconds (default 0, unlimited), whether to record the mouse pointer (off by default, macOS only). Consecutive identical frames are dropped, and output is scaled to the selection's logical width so HiDPI captures stay small.
 
@@ -149,6 +179,11 @@ Each recording writes exactly one file, but GIF and MP4 entries coexist in histo
 
 Click Pin in the overlay toolbar, choose Pin Last Capture in the tray, or pick Pin to Screen in history. If this session has no capture yet, Pin Last Capture uses the newest image in history.
 
+<p align="center">
+  <img src="assets/screenshots/en/pin.png" width="820" alt="Always-on-top pin windows">
+</p>
+<p align="center"><sub>Pins stay on top, can be moved, zoomed and made translucent, several at once</sub></p>
+
 - Drag a pin to move it; scroll to zoom; hold `⌥` / `Alt` while scrolling to change opacity (minimum 20%).
 - Double-click or `Esc` closes it. The right-click menu copies, saves, sets opacity (100% / 80% / 60% / 40%), zooms, resets zoom or closes.
 - `⌘C` / `Ctrl+C` copies, `⌘S` / `Ctrl+S` saves, `⌘=` / `⌘-` / `⌘0` (`Ctrl+=` etc. on Windows) zoom, `⌘W` / `Ctrl+W` closes.
@@ -157,6 +192,11 @@ Click Pin in the overlay toolbar, choose Pin Last Capture in the tray, or pick P
 ### History
 
 Copying, saving, pinning, OCR and recording all store a copy in history (disable this in **Settings → History**). By default history keeps at most 200 entries and 512 MB; older entries are removed first.
+
+<p align="center">
+  <img src="assets/screenshots/en/history.png" width="820" alt="History panel">
+</p>
+<p align="center"><sub>History panel with filters, thumbnails and per-entry actions</sub></p>
 
 The history panel has **All / Screenshots / Recordings** filters at the top; the entry count and disk usage update with the selection. It can copy an image, pin it to the screen, reveal it in the file manager, delete an entry, or clear everything. **Click a row's thumbnail or text** to open the **original file** with the system's default app — an image viewer for PNG, a viewer for GIF, a player for MP4. There is no in-app preview. Videos have no Copy Image button but do have **Copy File**, which puts the video file itself on the clipboard, ready to paste into Finder or a chat window. GIF and MP4 entries use a first-frame PNG thumbnail in the list and when pinned.
 
@@ -171,6 +211,11 @@ The history panel has **All / Screenshots / Recordings** filters at the top; the
 | Text Recognition | Recognition language |
 | History | Enable saving, maximum entries, maximum disk usage, and a button to open the history panel |
 | About | Config file path and Reveal in Folder |
+
+<p align="center">
+  <img src="assets/screenshots/en/settings.png" width="820" alt="Settings panel">
+</p>
+<p align="center"><sub>Settings: General, Shortcuts, Capture, Recording, Text Recognition, History and About</sub></p>
 
 Launch at login is registered through a LaunchAgent (macOS) or the current user's registry Run key (Windows). It passes `--background`, so the app starts in the tray.
 
