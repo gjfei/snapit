@@ -1,9 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
-*.gif
-*.png
-!docs/**/*.png
 
 # OCR models are downloaded separately (see README).
 /models
