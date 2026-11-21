@@ -26,6 +26,7 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **Window and element snapping**: highlight the window under the cursor; with element snapping on, the smallest control is highlighted and the wheel moves up through its containers.
 - **Annotations**: rectangle, arrow, pen, mosaic, text and numbered steps, with 6 colors and 3 line widths; `⌘Z` / `Ctrl+Z` to undo, plus one-click clear.
 - **Copy and save**: copy as PNG; save as PNG or JPEG (with adjustable JPG quality), or change the extension in the save dialog.
+- **HDR capture**: when the display is in HDR and the frame actually exceeds SDR white, Save writes a 16-bit PNG tagged with cICP (BT.2020 / PQ). Copy, pins, OCR, GIF and history thumbnails keep the SDR preview, and annotated or multi-region captures stay 8-bit. macOS needs 15+ on Apple Silicon; Windows needs an HDR-enabled display.
 - **Pins**: keep a capture on screen, movable, zoomable and translucent; multiple pins are supported.
 - **Text recognition**: recognizes the selection and copies the text when it can; the results panel lets you copy again, and the text is stored in history.
 - **GIF / MP4 recording**: two separate actions with their own shortcut and tray entry — a GIF drops straight into a chat, an MP4 goes through the system hardware encoder and stays small and smooth. Both show a progress bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.

@@ -6,7 +6,7 @@ use anyhow::Result;
 use gpui_kit::{
     Bounds, Context, DisplayId, EventEmitter, Pixels, Point, RenderImage, Size, point, px, size,
 };
-use snapit_capture::{ElementRole, Region, RgbaImage, Screenshot, WindowInfo};
+use snapit_capture::{ElementRole, HdrImage, Region, RgbaImage, Screenshot, WindowInfo};
 use snapit_recorder::RecordFormat;
 use snapit_store::AnnotationConfig;
 
@@ -38,8 +38,10 @@ impl CapturedFrame {
 }
 
 /// Freeze every monitor. BGRA conversion happens before overlay windows map.
-pub fn capture_shots() -> Result<Vec<Screenshot>> {
-    snapit_capture::capture_all()
+/// `hdr` comes from [`snapit_capture::hdr_candidates`], which needs the main
+/// thread (AppKit).
+pub fn capture_shots(hdr: &[u32]) -> Result<Vec<Screenshot>> {
+    snapit_capture::capture_all(hdr)
 }
 
 /// GPUI renders BGRA, captures are RGBA.
@@ -1951,6 +1953,19 @@ impl CaptureSession {
         }
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(height)));
         Some((stitch_vertical(images), bounds))
+    }
+
+    /// HDR pixels for Save, when they can be written unchanged: one region,
+    /// not combined, and no annotations (the baked overlay is 8-bit).
+    pub fn export_hdr(&self) -> Option<HdrImage> {
+        if self.composed.is_some() || !self.extra_selections.is_empty() {
+            return None;
+        }
+        if !self.annotations.committed().is_empty() {
+            return None;
+        }
+        let (frame, bounds) = self.selected_frame()?;
+        frame.frame.shot.crop_hdr(frame.to_region(bounds))
     }
 
     /// Crop plus baked annotations (Copy / Save / Pin). A combined selection is

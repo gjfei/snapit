@@ -17,7 +17,7 @@ use gpui_kit::{
     Global, Image, ImageFormat, Pixels, SharedString, Subscription, TitlebarOptions, WeakEntity,
     Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
-use snapit_capture::RgbaImage;
+use snapit_capture::{HdrImage, RgbaImage};
 use snapit_ocr::{OcrEngine, OcrOptions};
 use snapit_recorder::{RecordFormat, RecordOptions, Recorder};
 use snapit_store::{EntryKind, ImageFormat as SaveFormat};
@@ -437,8 +437,9 @@ impl Controller {
         // Start the freeze on a worker first: the BGRA conversion runs on the
         // same thread, so the overlay only waits for one background round trip
         // while window creation overlaps the capture.
-        let capture = cx.background_spawn(async {
-            let shots = session::capture_shots()?;
+        let hdr = snapit_capture::hdr_candidates();
+        let capture = cx.background_spawn(async move {
+            let shots = session::capture_shots(&hdr)?;
             Ok::<_, anyhow::Error>(
                 shots
                     .into_iter()
@@ -665,7 +666,8 @@ impl Controller {
             command,
             SessionCommand::Copy | SessionCommand::Save | SessionCommand::Pin
         );
-        let (image, record_target) = active.session.update(cx, |session, _| {
+        let want_hdr = matches!(command, SessionCommand::Save);
+        let (image, hdr, record_target) = active.session.update(cx, |session, _| {
             if bake {
                 session.finish_annotations();
             }
@@ -675,6 +677,7 @@ impl Controller {
                 session.crop_selections()
             }
             .map(|(image, bounds)| Captured::new(image, bounds));
+            let hdr = if want_hdr { session.export_hdr() } else { None };
             let record_target = session.selected_frame().map(|(frame, bounds)| {
                 (
                     frame.monitor_id(),
@@ -684,7 +687,7 @@ impl Controller {
                     bounds,
                 )
             });
-            (image, record_target)
+            (image, hdr, record_target)
         });
         if let Some((_, _, display_id, _, _)) = record_target.as_ref() {
             self.last_display_id = *display_id;
@@ -707,7 +710,7 @@ impl Controller {
             }
             (SessionCommand::Save, Some(captured)) => {
                 self.remember(&captured, cx);
-                self.save_image(captured.image, cx)
+                self.save_image(captured.image, hdr, cx)
             }
             (SessionCommand::Pin, Some(captured)) => {
                 self.remember(&captured, cx);
@@ -791,7 +794,12 @@ impl Controller {
         .detach();
     }
 
-    pub(crate) fn save_image(&mut self, image: Arc<RgbaImage>, cx: &mut Context<Self>) {
+    pub(crate) fn save_image(
+        &mut self,
+        image: Arc<RgbaImage>,
+        hdr: Option<HdrImage>,
+        cx: &mut Context<Self>,
+    ) {
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
         let name = format!("SnapIt {}.{}", timestamp(), format.extension());
@@ -807,9 +815,10 @@ impl Controller {
             });
             let saved = cx
                 .background_spawn(async move {
-                    match format {
-                        SaveFormat::Png => snapit_capture::save_png(&image, &path),
-                        SaveFormat::Jpg => snapit_capture::save_jpeg(&image, &path, quality),
+                    match (format, hdr) {
+                        (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
+                        (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
+                        (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
                     }
                     .map(|_| path)
                 })

@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    for shot in snapit_capture::capture_all()? {
+    for shot in snapit_capture::capture_all(&snapit_capture::hdr_candidates())? {
         let monitor = shot.monitor();
         let path = out_dir.join(format!("snapit-monitor-{}.png", monitor.id));
         snapit_capture::save_png(shot.image(), &path)?;

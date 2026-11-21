@@ -235,7 +235,7 @@ impl PinView {
 
     fn save(&mut self, _: &SavePin, _: &mut Window, cx: &mut Context<Self>) {
         let image = self.captured.image.clone();
-        Controller::global(cx).update(cx, |controller, cx| controller.save_image(image, cx));
+        Controller::global(cx).update(cx, |controller, cx| controller.save_image(image, None, cx));
     }
 }
 
