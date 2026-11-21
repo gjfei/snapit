@@ -7,8 +7,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-color_quant = "1.1"
-gif = "0.13"
+color_quant = "2.0"
+gif = "0.14"
 image.workspace = true
 log.workspace = true
 snapit-capture.workspace = true

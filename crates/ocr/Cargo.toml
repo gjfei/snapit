@@ -22,7 +22,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+futures.workspace = true
+windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",
     "Globalization",

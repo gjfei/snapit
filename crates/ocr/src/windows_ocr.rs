@@ -293,10 +293,14 @@ fn recognize_with_engine(
 ) -> Result<Vec<TextBlock>> {
     ensure_winrt();
     let bitmap = software_bitmap(image)?;
-    let result = engine
+    // `windows` 0.62 dropped the blocking `IAsyncOperation::get`; the operation
+    // is `IntoFuture`, and the completion handler only wakes this thread.
+    use std::future::IntoFuture;
+
+    let operation = engine
         .RecognizeAsync(&bitmap)
-        .context("Windows.Media.Ocr RecognizeAsync failed to start")?
-        .get()
+        .context("Windows.Media.Ocr RecognizeAsync failed to start")?;
+    let result = futures::executor::block_on(operation.into_future())
         .context("Windows.Media.Ocr RecognizeAsync failed")?;
     let lines = result
         .Lines()
