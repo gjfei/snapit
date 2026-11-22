@@ -7,7 +7,11 @@
 //! needed; both threads just have to have joined the MTA, which `ensure_com`
 //! does.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, bail};
 use snapit_capture::RgbaImage;
@@ -37,6 +41,10 @@ pub(crate) struct Mp4Sink {
     frame_ticks: i64,
     last: Option<(RgbaImage, Duration)>,
     frames: usize,
+    t_scale: Duration,
+    t_buffer: Duration,
+    t_copy: Duration,
+    t_write: Duration,
 }
 
 /// The writer lives on the capture thread after construction and Media
@@ -96,6 +104,10 @@ impl Mp4Sink {
             frame_ticks: TICKS_PER_SECOND / fps as i64,
             last: None,
             frames: 0,
+            t_scale: Duration::ZERO,
+            t_buffer: Duration::ZERO,
+            t_copy: Duration::ZERO,
+            t_write: Duration::ZERO,
         })
     }
 
@@ -110,7 +122,10 @@ impl Mp4Sink {
         }
 
         let stride = (width * 4) as usize;
+        let buffer_started = Instant::now();
         let buffer = unsafe { MFCreateMemoryBuffer((stride * height as usize) as u32) }?;
+        self.t_buffer += buffer_started.elapsed();
+        let copy_started = Instant::now();
         {
             let mut raw: *mut u8 = std::ptr::null_mut();
             unsafe { buffer.Lock(&mut raw, None, None) }?;
@@ -131,7 +146,9 @@ impl Mp4Sink {
             unsafe { buffer.Unlock() }?;
         }
         unsafe { buffer.SetCurrentLength((stride * height as usize) as u32) }?;
+        self.t_copy += copy_started.elapsed();
 
+        let write_started = Instant::now();
         let sample = unsafe { MFCreateSample() }?;
         unsafe {
             sample.AddBuffer(&buffer)?;
@@ -139,26 +156,31 @@ impl Mp4Sink {
             sample.SetSampleDuration(self.frame_ticks.max(1))?;
             self.writer.WriteSample(self.stream, &sample)?;
         }
+        self.t_write += write_started.elapsed();
         self.frames += 1;
         Ok(())
     }
 }
 
 impl FrameSink for Mp4Sink {
-    fn push(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()> {
         // The capture thread has to be in the MTA as well; the call is a no-op
         // when it already is.
         ensure_com()?;
         // Keep the scaled frame: finish() needs one more sample, and cloning
         // the full-resolution capture (or scaling it again) would mean another
         // pass over four times as many pixels.
-        let scaled = prepare(frame, self.max_width).into_owned();
+        let scaled_started = Instant::now();
+        let scaled = prepare(&frame, self.max_width).into_owned();
+        self.t_scale += scaled_started.elapsed();
         self.append_scaled(&scaled, at)?;
         self.last = Some((scaled, at));
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        let closing_started = Instant::now();
+        let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
         // needs a frame of its own or the video looks cut short.
         if let Some((frame, at)) = self.last.take()
@@ -170,12 +192,25 @@ impl FrameSink for Mp4Sink {
                 .saturating_sub(Duration::from_millis(1))
                 .max(at + Duration::from_millis(2));
             self.append_scaled(&frame, hold)?;
+            closing = closing_started.elapsed();
         }
+        let finalize_started = Instant::now();
         unsafe {
             self.writer.Finalize()?;
             let _ = MFShutdown();
         }
         log::info!("encoded {} frames to MP4", self.frames);
+        log::info!(
+            target: "timing",
+            "mp4 sink: {} frames, scale {:.1} ms, buffer {:.1} ms, copy {:.1} ms, write {:.1} ms; closing sample {:.1} ms, finalize {:.1} ms",
+            self.frames,
+            crate::ms(self.t_scale),
+            crate::ms(self.t_buffer),
+            crate::ms(self.t_copy),
+            crate::ms(self.t_write),
+            crate::ms(closing),
+            crate::ms(finalize_started.elapsed())
+        );
         Ok(())
     }
 }

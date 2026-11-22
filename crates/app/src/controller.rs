@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
@@ -83,6 +83,10 @@ struct ActiveRecording {
     /// Kept here so the bar can name the container while the encoder owns the
     /// `Recorder`.
     format: RecordFormat,
+    /// Where the `.part` file is renamed once encoding finishes.
+    dest: PathBuf,
+    /// The file the recorder is writing; removed if encoding fails.
+    part: PathBuf,
 }
 
 /// A cropped selection and its physical-to-logical pixel ratio.
@@ -144,6 +148,11 @@ pub struct Controller {
     busy: Option<Busy>,
     panels: [PanelSlot; Panel::COUNT],
     selection: Option<ActiveSelection>,
+    /// macOS: overlays already hidden with `orderOut` but whose GPUI teardown
+    /// (~37 ms on the main thread) is deferred until the command's clipboard or
+    /// file write has landed. Empty on Windows, where overlays are removed
+    /// synchronously.
+    pending_close: Vec<AnyWindowHandle>,
     recording: Option<ActiveRecording>,
     ocr: OcrState,
     ocr_revision: usize,
@@ -187,6 +196,7 @@ impl Controller {
             busy: None,
             panels: Default::default(),
             selection: None,
+            pending_close: Vec::new(),
             recording: None,
             ocr: OcrState::Idle,
             ocr_revision: 0,
@@ -437,18 +447,30 @@ impl Controller {
         // Start the freeze on a worker first: the BGRA conversion runs on the
         // same thread, so the overlay only waits for one background round trip
         // while window creation overlaps the capture.
+        let started = Instant::now();
+        let hdr_started = Instant::now();
         let hdr = snapit_capture::hdr_candidates();
+        let hdr_ms = ms(hdr_started.elapsed());
         let capture = cx.background_spawn(async move {
+            let capture_started = Instant::now();
             let shots = session::capture_shots(&hdr)?;
-            Ok::<_, anyhow::Error>(
-                shots
-                    .into_iter()
-                    .map(|shot| {
-                        let image = session::render_image(shot.image());
-                        session::CapturedFrame::new(shot, image)
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let captured = capture_started.elapsed();
+            let convert_started = Instant::now();
+            let frames = shots
+                .into_iter()
+                .map(|shot| {
+                    let image = session::render_image(shot.image());
+                    session::CapturedFrame::new(shot, image)
+                })
+                .collect::<Vec<_>>();
+            log::info!(
+                target: "timing",
+                "freeze: {} displays, capture {:.1} ms, BGRA {:.1} ms",
+                frames.len(),
+                ms(captured),
+                ms(convert_started.elapsed())
+            );
+            Ok::<_, anyhow::Error>(frames)
         });
         // Only macOS can pre-place overlays without them reaching the screen:
         // the window stays hidden and is revealed after the first frozen frame.
@@ -458,9 +480,11 @@ impl Controller {
         let placed = cfg!(target_os = "macos")
             .then(|| self.open_overlays(intent, None, cx))
             .flatten();
+        let pre_placed = started.elapsed();
 
         cx.spawn(async move |this, cx| {
             let frames = capture.await;
+            let frozen = started.elapsed();
             this.update(cx, |this, cx| {
                 this.busy = None;
                 let frames = match frames {
@@ -475,10 +499,28 @@ impl Controller {
                     }
                 };
                 match placed {
-                    Some(session) => this.reveal_overlays(&session, frames, cx),
+                    Some(session) => {
+                        log::info!(
+                            target: "timing",
+                            "capture: {:.1} ms to a frozen frame (hdr {hdr_ms:.1} ms on main, overlays pre-placed at {:.1} ms)",
+                            ms(frozen),
+                            ms(pre_placed)
+                        );
+                        this.reveal_overlays(&session, frames, cx)
+                    }
                     None => {
+                        let opening = Instant::now();
                         if let Some(session) = this.open_overlays(intent, Some(frames), cx) {
+                            let opened = opening.elapsed();
+                            let activating = Instant::now();
                             this.activate_overlays(&session, cx);
+                            log::info!(
+                                target: "timing",
+                                "capture: {:.1} ms to a frozen frame (hdr {hdr_ms:.1} ms), overlays opened in {:.1} ms, activated in {:.1} ms",
+                                ms(frozen),
+                                ms(opened),
+                                ms(activating.elapsed())
+                            );
                         }
                     }
                 }
@@ -496,6 +538,7 @@ impl Controller {
             .is_some_and(|active| Some(&active.session) == session)
         {
             self.close_selection(cx);
+            self.finish_pending_close(cx);
         }
     }
 
@@ -610,8 +653,17 @@ impl Controller {
         else {
             return;
         };
+        let filling = Instant::now();
         session.update(cx, |session, cx| session.set_frames(frames, cx));
+        let set_frames = filling.elapsed();
+        let activating = Instant::now();
         self.activate_overlays(&session, cx);
+        log::info!(
+            target: "timing",
+            "overlays: set_frames {:.1} ms, activate call {:.1} ms",
+            ms(set_frames),
+            ms(activating.elapsed())
+        );
     }
 
     /// Show and focus the overlays of the current session. A display that
@@ -647,6 +699,7 @@ impl Controller {
         cx.activate(true);
         if kept.is_empty() {
             self.close_selection(cx);
+            self.finish_pending_close(cx);
             self.fail(t!("controller.overlay_failed").to_string(), cx);
             return;
         }
@@ -657,6 +710,7 @@ impl Controller {
     }
 
     fn handle_command(&mut self, command: SessionCommand, cx: &mut Context<Self>) {
+        let started = Instant::now();
         let Some(active) = self.selection.as_ref() else {
             return;
         };
@@ -692,6 +746,7 @@ impl Controller {
         if let Some((_, _, display_id, _, _)) = record_target.as_ref() {
             self.last_display_id = *display_id;
         }
+        let exported = started.elapsed();
         // A record command keeps the active overlay: it becomes the live
         // recording outline instead of closing and opening another window.
         let record_now = matches!(command, SessionCommand::Record(_))
@@ -701,6 +756,12 @@ impl Controller {
         if !record_now {
             self.close_selection(cx);
         }
+        log::info!(
+            target: "timing",
+            "command {command:?}: bake+crop {:.1} ms, overlays closed at {:.1} ms",
+            ms(exported),
+            ms(started.elapsed())
+        );
 
         match (command, image) {
             (SessionCommand::Cancel, _) => {}
@@ -733,17 +794,47 @@ impl Controller {
             }
             (_, None) => self.fail(t!("controller.selection_empty").to_string(), cx),
         }
+        // Copy and Save flush the hidden overlays from their async completion
+        // (after the clipboard/file write). Every other command has no such
+        // late work, so release the overlays now rather than leaking them.
+        if !matches!(command, SessionCommand::Copy | SessionCommand::Save) {
+            self.finish_pending_close(cx);
+        }
         cx.notify();
     }
 
     fn close_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(active) = self.selection.take() {
             for overlay in active.overlays {
+                #[cfg(target_os = "macos")]
+                {
+                    // Hide now so the selection disappears instantly, but keep
+                    // the handle: tearing down a fullscreen GPUI layer on the
+                    // main thread costs ~37 ms and would block the clipboard
+                    // write. `finish_pending_close` runs once the command lands.
+                    overlay
+                        .window
+                        .update(cx, |_, window, _| crate::overlay::hide(window))
+                        .ok();
+                    self.pending_close.push(overlay.window);
+                }
+                #[cfg(not(target_os = "macos"))]
                 overlay
                     .window
                     .update(cx, |_, window, _| window.remove_window())
                     .ok();
             }
+        }
+    }
+
+    /// Destroy overlays hidden by `close_selection`. Called after the
+    /// clipboard/file write so the ~37 ms teardown no longer delays the user's
+    /// command. Idempotent: the queue is drained on the first call.
+    fn finish_pending_close(&mut self, cx: &mut Context<Self>) {
+        for handle in self.pending_close.drain(..) {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
         }
     }
 
@@ -769,27 +860,54 @@ impl Controller {
 
     pub(crate) fn copy_image(&mut self, image: Arc<RgbaImage>, cx: &mut Context<Self>) {
         let (width, height) = image.dimensions();
+        let started = Instant::now();
         cx.spawn(async move |this, cx| {
+            let encoded = Instant::now();
             let png = cx
-                .background_spawn(async move { snapit_capture::encode_png(&image) })
-                .await;
-            this.update(cx, |this, cx| match png {
-                Ok(png) => {
-                    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
-                        ImageFormat::Png,
-                        png,
-                    )));
-                    this.inform(
-                        t!("controller.copy_done", width = width, height = height).to_string(),
-                        cx,
+                .background_spawn(async move {
+                    let started = Instant::now();
+                    let png = snapit_capture::encode_png(&image);
+                    log::info!(
+                        target: "timing",
+                        "copy: {width}x{height} PNG encode {:.1} ms",
+                        ms(started.elapsed())
                     );
+                    png
+                })
+                .await;
+            let encode = encoded.elapsed();
+            this.update(cx, |this, cx| {
+                match png {
+                    Ok(png) => {
+                        let writing = Instant::now();
+                        cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+                            ImageFormat::Png,
+                            png,
+                        )));
+                        log::info!(
+                            target: "timing",
+                            "copy: clipboard filled {:.1} ms after the command (worker result at {:.1} ms), write {:.1} ms",
+                            ms(started.elapsed()),
+                            ms(encode),
+                            ms(writing.elapsed())
+                        );
+                        this.inform(
+                            t!("controller.copy_done", width = width, height = height).to_string(),
+                            cx,
+                        );
+                    }
+                    Err(err) => this.fail(
+                        t!("controller.copy_failed", error = format!("{err:#}")).to_string(),
+                        cx,
+                    ),
                 }
-                Err(err) => this.fail(
-                    t!("controller.copy_failed", error = format!("{err:#}")).to_string(),
-                    cx,
-                ),
+                // The overlay was hidden at command time; destroy it only now
+                // that the clipboard holds the image, so the ~37 ms teardown is
+                // no longer on the critical path to a paste.
+                this.finish_pending_close(cx);
             })
             .ok();
+            log::debug!(target: "timing", "copy command handled in {:.1} ms", ms(started.elapsed()));
         })
         .detach();
     }
@@ -807,6 +925,10 @@ impl Controller {
         let path = cx.prompt_for_new_path(&save_dir(cx), Some(&name));
         cx.spawn(async move |this, cx| {
             let Some(mut path) = await_path(path, &this, cx).await else {
+                // Save dialog dismissed: nothing will follow to flush the
+                // hidden overlays, so release them here.
+                this.update(cx, |this, cx| this.finish_pending_close(cx))
+                    .ok();
                 return;
             };
             let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
@@ -815,23 +937,32 @@ impl Controller {
             });
             let saved = cx
                 .background_spawn(async move {
-                    match (format, hdr) {
+                    let writing = Instant::now();
+                    let result = match (format, hdr) {
                         (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
                         (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
                         (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
-                    }
-                    .map(|_| path)
+                    };
+                    log::info!(
+                        target: "timing",
+                        "save: encode+write {:.1} ms",
+                        ms(writing.elapsed())
+                    );
+                    result.map(|_| path)
                 })
                 .await;
-            this.update(cx, |this, cx| match saved {
-                Ok(path) => this.inform(
-                    t!("controller.save_done", path = path.display()).to_string(),
-                    cx,
-                ),
-                Err(err) => this.fail(
-                    t!("controller.save_failed", error = format!("{err:#}")).to_string(),
-                    cx,
-                ),
+            this.update(cx, |this, cx| {
+                match saved {
+                    Ok(path) => this.inform(
+                        t!("controller.save_done", path = path.display()).to_string(),
+                        cx,
+                    ),
+                    Err(err) => this.fail(
+                        t!("controller.save_failed", error = format!("{err:#}")).to_string(),
+                        cx,
+                    ),
+                }
+                this.finish_pending_close(cx);
             })
             .ok();
         })
@@ -913,8 +1044,7 @@ impl Controller {
             });
         }
         let recording = &AppSettings::get(cx).recording;
-        let output =
-            std::env::temp_dir().join(format!("snapit-{}.{}", timestamp(), format.extension()));
+        let (output, dest) = recording_paths(cx, format);
         let options = RecordOptions::default()
             .with_fps(recording.fps)
             .with_max_duration(Duration::from_secs(recording.max_duration_secs.into()))
@@ -943,6 +1073,8 @@ impl Controller {
             frame: Some(overlay.window),
             started: false,
             format,
+            dest,
+            part: output.clone(),
         });
         self.open_recording_bar(display_id, display_bounds, selection, cx);
         let controller = cx.entity();
@@ -1033,6 +1165,9 @@ impl Controller {
                         if this.recording.is_none() {
                             return;
                         }
+                        // A failed start can leave an empty `.part` behind in
+                        // the save directory.
+                        std::fs::remove_file(&path).ok();
                         this.finish_recording_ui(cx);
                         this.fail(
                             t!("controller.record_start_failed", error = format!("{err:#}"))
@@ -1221,6 +1356,9 @@ impl Controller {
             return;
         }
         let recorder = active.recorder.take().expect("checked above");
+        let dest = active.dest.clone();
+        let part = active.part.clone();
+        let clicked = Instant::now();
         self.busy = Some(Busy::Encoding);
         cx.notify();
 
@@ -1236,6 +1374,7 @@ impl Controller {
             {
                 Ok(handle) => handle,
                 Err(err) => {
+                    std::fs::remove_file(&part).ok();
                     this.update(cx, |this, cx| {
                         this.finish_recording_ui(cx);
                         this.fail(
@@ -1247,14 +1386,17 @@ impl Controller {
                     return;
                 }
             };
+            // 4 ms, not 16: this timer is the only delay between the encoder
+            // finishing and the clipboard being filled.
             while !handle.is_finished() {
                 cx.background_executor()
-                    .timer(Duration::from_millis(50))
+                    .timer(Duration::from_millis(4))
                     .await;
             }
             let summary = match handle.join() {
                 Ok(Ok(summary)) => summary,
                 Ok(Err(err)) => {
+                    std::fs::remove_file(&part).ok();
                     this.update(cx, |this, cx| {
                         this.finish_recording_ui(cx);
                         this.fail(
@@ -1266,6 +1408,7 @@ impl Controller {
                     return;
                 }
                 Err(_) => {
+                    std::fs::remove_file(&part).ok();
                     this.update(cx, |this, cx| {
                         this.finish_recording_ui(cx);
                         this.fail(t!("controller.record_thread_crashed").to_string(), cx);
@@ -1275,28 +1418,21 @@ impl Controller {
                 }
             };
 
-            if let Some(preview) = summary.first_frame.clone() {
-                let path = summary.path.clone();
-                let kind = entry_kind(summary.format);
-                let added = this.update(cx, |_, cx| {
-                    HistoryStore::global(cx).update(cx, |history, cx| {
-                        history.add_recording(path, kind, preview, 1.0, cx)
-                    })
-                });
-                if let Ok(added) = added {
-                    added.await;
-                }
-            }
-
-            let name = format!("SnapIt {}.{}", timestamp(), summary.format.extension());
-            let dest = this
-                .update(cx, |_, cx| save_dir(cx).join(&name))
-                .unwrap_or_else(|_| std::env::temp_dir().join(&name));
+            let encoded = clicked.elapsed();
             let source = summary.path.clone();
             let format = summary.format;
+            let publishing = Instant::now();
             let saved = cx
                 .background_spawn(async move {
-                    let path = move_file(&source, &dest).map(|_| dest)?;
+                    // The recorder wrote a `.part` file next to its final name,
+                    // so publishing it is a same-directory rename.
+                    let path = match move_file(&source, &dest) {
+                        Ok(()) => dest,
+                        Err(err) => {
+                            std::fs::remove_file(&source).ok();
+                            return Err(err);
+                        }
+                    };
                     // Read a finished GIF off the main thread; large recordings
                     // would otherwise stall a frame while copying.
                     let gif = matches!(format, RecordFormat::Gif)
@@ -1305,22 +1441,16 @@ impl Controller {
                     Ok::<_, anyhow::Error>((path, gif))
                 })
                 .await;
+            let published = publishing.elapsed();
 
+            let preview = summary.first_frame.clone();
             this.update(cx, |this, cx| {
-                this.finish_recording_ui(cx);
                 match saved {
                     Ok((path, gif)) => {
-                        this.inform(
-                            t!(
-                                "controller.record_saved",
-                                format = format_label(summary.format),
-                                path = path.display(),
-                                frames = summary.frames,
-                                seconds = format!("{:.1}", summary.duration.as_secs_f32())
-                            )
-                            .to_string(),
-                            cx,
-                        );
+                        // Fill the clipboard before the bar closes: a paste
+                        // right after completion must find this recording, not
+                        // whatever was copied last.
+                        let filling = Instant::now();
                         let copied = match (summary.format, gif) {
                             (RecordFormat::Gif, Some(bytes)) => {
                                 cx.write_to_clipboard(ClipboardItem::new_image(
@@ -1333,6 +1463,27 @@ impl Controller {
                             }
                             (RecordFormat::Mp4, _) => clipboard::copy_file_reference(&path, cx),
                         };
+                        let clipboard_time = filling.elapsed();
+                        this.finish_recording_ui(cx);
+                        log::info!(
+                            target: "timing",
+                            "stop: encode {:.1} ms, publish+read {:.1} ms, clipboard {:.1} ms, UI closed {:.1} ms after the stop click",
+                            ms(encoded),
+                            ms(published),
+                            ms(clipboard_time),
+                            ms(clicked.elapsed())
+                        );
+                        this.inform(
+                            t!(
+                                "controller.record_saved",
+                                format = format_label(summary.format),
+                                path = path.display(),
+                                frames = summary.frames,
+                                seconds = format!("{:.1}", summary.duration.as_secs_f32())
+                            )
+                            .to_string(),
+                            cx,
+                        );
                         match copied {
                             Ok(clipboard::FileCopy::File) => this.inform(
                                 t!(
@@ -1356,16 +1507,30 @@ impl Controller {
                                 cx,
                             ),
                         }
+                        // History copies the file and renders a thumbnail;
+                        // neither has to finish before the recording is
+                        // usable, so let it run after the bar is gone.
+                        if let Some(preview) = preview {
+                            let kind = entry_kind(summary.format);
+                            HistoryStore::global(cx)
+                                .update(cx, |history, cx| {
+                                    history.add_recording(path, kind, preview, 1.0, cx)
+                                })
+                                .detach();
+                        }
                     }
-                    Err(err) => this.fail(
-                        t!(
-                            "controller.record_save_failed",
-                            format = format_label(summary.format),
-                            error = format!("{err:#}")
-                        )
-                        .to_string(),
-                        cx,
-                    ),
+                    Err(err) => {
+                        this.finish_recording_ui(cx);
+                        this.fail(
+                            t!(
+                                "controller.record_save_failed",
+                                format = format_label(summary.format),
+                                error = format!("{err:#}")
+                            )
+                            .to_string(),
+                            cx,
+                        );
+                    }
                 }
                 this.resume_queued_capture(cx);
             })
@@ -1389,11 +1554,19 @@ impl Controller {
             .take()
             .map(|active| (active.bar, active.frame));
         if let Some((bar, frame)) = windows {
+            let deferred_at = Instant::now();
             cx.defer(move |cx| {
                 for handle in [bar, frame].into_iter().flatten() {
+                    let removing = Instant::now();
                     handle
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
+                    log::info!(
+                        target: "timing",
+                        "teardown: remove_window {:.1} ms, ran {:.1} ms after the deferred close",
+                        ms(removing.elapsed()),
+                        ms(deferred_at.elapsed())
+                    );
                 }
             });
         }
@@ -1566,6 +1739,10 @@ fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string()
 }
 
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 /// Format the overlay's single record button uses: whatever was recorded last,
 /// wherever that happened (shortcut, tray or the button's dropdown).
 pub fn last_record_format(cx: &App) -> RecordFormat {
@@ -1597,6 +1774,34 @@ pub fn save_dir(cx: &App) -> PathBuf {
         .clone()
         .filter(|dir| dir.is_dir())
         .unwrap_or_else(default_save_dir)
+}
+
+/// Where a recording is written while it runs, and the name it takes once the
+/// encoder finishes. The `.part` file already sits in the final directory, so
+/// publishing it is a rename instead of a copy out of the temp directory. A
+/// save directory that cannot be written falls back to the temp directory.
+fn recording_paths(cx: &App, format: RecordFormat) -> (PathBuf, PathBuf) {
+    let extension = format.extension();
+    let name = format!("SnapIt {}.{extension}", timestamp());
+    let paths_in = |dir: PathBuf| {
+        let dest = dir.join(&name);
+        (dest.with_extension(format!("{extension}.part")), dest)
+    };
+    let (part, dest) = paths_in(save_dir(cx));
+    // AVAssetWriter refuses to open an existing file, so probe writability
+    // with a throwaway sibling instead of the recording path itself.
+    let probe = part.with_extension("probe");
+    let writable = std::fs::File::create(&probe).is_ok();
+    std::fs::remove_file(&probe).ok();
+    if writable {
+        (part, dest)
+    } else {
+        log::warn!(
+            "cannot record into {}; using the temporary directory",
+            part.display()
+        );
+        paths_in(std::env::temp_dir())
+    }
 }
 
 fn default_save_dir() -> PathBuf {

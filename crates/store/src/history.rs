@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Local, Utc};
@@ -86,10 +87,20 @@ impl NewEntry {
         ocr_text: Option<String>,
     ) -> Result<Self> {
         let (id, file) = reserve(dir, EntryKind::Png)?;
+        let writing = Instant::now();
         image
             .save_with_format(dir.join(&file), image::ImageFormat::Png)
             .with_context(|| format!("failed to write {file}"))?;
-        Self::finish(dir, id, EntryKind::Png, file, image, scale_factor, ocr_text)
+        let written = writing.elapsed();
+        let previewing = Instant::now();
+        let entry = Self::finish(dir, id, EntryKind::Png, file, image, scale_factor, ocr_text)?;
+        log::info!(
+            target: "timing",
+            "history: image write {:.1} ms, thumbnail {:.1} ms",
+            written.as_secs_f64() * 1e3,
+            previewing.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(entry)
     }
 
     /// Copy an existing file (e.g. a finished GIF) into the history directory.
@@ -101,9 +112,19 @@ impl NewEntry {
         scale_factor: f32,
     ) -> Result<Self> {
         let (id, file) = reserve(dir, kind)?;
+        let copying = Instant::now();
         std::fs::copy(source, dir.join(&file))
             .with_context(|| format!("failed to copy {}", source.display()))?;
-        Self::finish(dir, id, kind, file, preview, scale_factor, None)
+        let copied = copying.elapsed();
+        let previewing = Instant::now();
+        let entry = Self::finish(dir, id, kind, file, preview, scale_factor, None)?;
+        log::info!(
+            target: "timing",
+            "history: copy {:.1} ms, thumbnail {:.1} ms",
+            copied.as_secs_f64() * 1e3,
+            previewing.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(entry)
     }
 
     fn finish(

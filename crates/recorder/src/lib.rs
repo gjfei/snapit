@@ -41,6 +41,10 @@ use snapit_capture::{LiveFrameWait, LiveRecorder, OutputSize, Region, RegionCapt
 
 mod video;
 
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 /// Bits per channel in the GIF colour lookup table. 6 bits keeps the table at
 /// 256 KiB and the quantisation error within two levels per channel.
 const GIF_LUT_BITS: usize = 6;
@@ -222,10 +226,14 @@ impl Recorder {
         output: impl AsRef<Path>,
     ) -> Result<Self> {
         let output = output.as_ref().to_path_buf();
-        // Probe once so permission errors surface before threads spawn.
-        let probe = RegionCapturer::new(monitor_id, region)?
-            .capture()
-            .context("failed to capture region")?;
+        let started = Instant::now();
+        // Surface a missing permission before threads spawn. A full-screen
+        // capture was used here only for this check; on macOS TCC answers the
+        // same question instantly, and the fall-back capture is now deferred
+        // to the rare path where the recorder never receives a frame.
+        if !snapit_capture::screen_recording_granted() {
+            return Err(anyhow!("screen recording permission is not granted"));
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(PauseClock::default());
@@ -240,7 +248,6 @@ impl Recorder {
             let job = CaptureJob {
                 monitor_id,
                 region,
-                probe,
                 output: output.clone(),
                 options: options.clone(),
                 stop,
@@ -257,7 +264,11 @@ impl Recorder {
         };
 
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => log::info!(
+                target: "timing",
+                "recorder start: ready after {:.1} ms (permission preflight only, no probe capture)",
+                ms(started.elapsed())
+            ),
             Ok(Err(message)) => {
                 stop.store(true, Ordering::Relaxed);
                 let _ = capture_thread.join();
@@ -332,6 +343,7 @@ impl Recorder {
 
     /// Stop capturing and wait for the file to be fully written. Blocking.
     pub fn stop(self) -> Result<RecordingSummary> {
+        let requested = Instant::now();
         // Freeze the pause clock so stopping while paused reports the effective
         // duration instead of one that keeps shrinking while the sinks flush.
         self.paused.set_paused(false);
@@ -340,6 +352,11 @@ impl Recorder {
             .capture_thread
             .join()
             .map_err(|_| anyhow!("capture thread panicked"))??;
+        log::info!(
+            target: "timing",
+            "recorder stop: capture thread joined after {:.1} ms",
+            ms(requested.elapsed())
+        );
         Ok(RecordingSummary {
             path: self.output,
             format: self.format,
@@ -371,9 +388,13 @@ impl Recorder {
 
 /// Where a captured frame goes. Both sinks are driven from the capture thread
 /// and finish on it, so `stop` only has one thread left to join.
+///
+/// Frames are handed over as `Arc` because the capture loop keeps the previous
+/// one for duplicate detection while the GIF sink holds it until the next
+/// timestamp arrives; sharing the allocation avoids a full-frame copy per frame.
 pub(crate) trait FrameSink: Send {
     /// Encode one frame, shown from `at` until the next one.
-    fn push(&mut self, frame: &RgbaImage, at: Duration) -> Result<()>;
+    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()>;
 
     /// Flush the container. `end` is the recording's total duration, which is
     /// how long the last frame stays on screen.
@@ -383,7 +404,7 @@ pub(crate) trait FrameSink: Send {
 /// A frame handed to the writer thread: the image plus how long it stays on
 /// screen, in GIF delay ticks of 10 ms.
 struct PendingFrame {
-    image: RgbaImage,
+    image: Arc<RgbaImage>,
     ticks: u16,
 }
 
@@ -392,8 +413,11 @@ struct PendingFrame {
 struct GifSink {
     sender: Option<SyncSender<PendingFrame>>,
     writer: Option<JoinHandle<Result<()>>>,
-    pending: Option<RgbaImage>,
+    pending: Option<Arc<RgbaImage>>,
     pending_at: Option<Duration>,
+    /// Time the capture thread spent blocked on the bounded channel.
+    blocked: Duration,
+    max_block: Duration,
 }
 
 impl GifSink {
@@ -414,28 +438,36 @@ impl GifSink {
             writer: Some(writer),
             pending: None,
             pending_at: None,
+            blocked: Duration::ZERO,
+            max_block: Duration::ZERO,
         })
     }
 }
 
 impl FrameSink for GifSink {
-    fn push(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()> {
         let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| anyhow!("GIF encoder already closed"))?;
         if let (Some(image), Some(started)) = (self.pending.take(), self.pending_at) {
             let ticks = duration_to_ticks(at - started);
-            sender
+            let queued = Instant::now();
+            let sent = sender
                 .send(PendingFrame { image, ticks })
-                .map_err(|_| anyhow!("failed to queue frame: the GIF writer stopped"))?;
+                .map_err(|_| anyhow!("failed to queue frame: the GIF writer stopped"));
+            let wait = queued.elapsed();
+            self.blocked += wait;
+            self.max_block = self.max_block.max(wait);
+            sent?;
         }
-        self.pending = Some(frame.clone());
+        self.pending = Some(frame);
         self.pending_at = Some(at);
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        let queued = Instant::now();
         let result = match self.sender.take() {
             Some(sender) => match (self.pending.take(), self.pending_at) {
                 (Some(image), Some(started)) => {
@@ -448,12 +480,22 @@ impl FrameSink for GifSink {
             },
             None => Ok(()),
         };
+        let final_send = queued.elapsed();
         result?;
+        let joined = Instant::now();
         if let Some(writer) = self.writer.take() {
             writer
                 .join()
                 .map_err(|_| anyhow!("GIF writer thread panicked"))??;
         }
+        log::info!(
+            target: "timing",
+            "gif sink: capture blocked {:.1} ms total (max {:.1} ms), final send {:.1} ms, writer join {:.1} ms",
+            ms(self.blocked),
+            ms(self.max_block),
+            ms(final_send),
+            ms(joined.elapsed())
+        );
         Ok(())
     }
 }
@@ -629,13 +671,24 @@ fn encode_gif(
     max_width: Option<u32>,
 ) -> Result<()> {
     let mut writer = BufWriter::new(file);
+    let (mut t_prepare, mut t_diff, mut t_error, mut t_train, mut t_write) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let mut retrains = 0usize;
+    let mut encoded = 0usize;
     // The encoder's screen size is fixed at creation, so anchor it on the
     // first frame that is encodable. A stream that yields none leaves the
     // file empty rather than corrupt.
     let anchored = loop {
         match receiver.recv() {
             Ok(pending) => {
+                let scratch = Instant::now();
                 let scaled = video::prepare(&pending.image, max_width).into_owned();
+                t_prepare += scratch.elapsed();
                 if let Some((width, height)) = fit_u16(&scaled) {
                     break Some((pending, scaled, width, height));
                 }
@@ -652,33 +705,50 @@ fn encode_gif(
     encoder
         .write_extension(gif::ExtensionData::Repetitions(Repeat::Infinite))
         .context("failed to set GIF looping")?;
-    let mut palette = PaletteMap::train(&first_scaled, quality);
+    let mut palette = {
+        let scratch = Instant::now();
+        let palette = PaletteMap::train(&first_scaled, quality);
+        t_train += scratch.elapsed();
+        palette
+    };
     let mut since_train = 0usize;
-    write_indexed_frame(
-        &mut encoder,
-        &first,
-        &first_scaled,
-        width,
-        height,
-        &mut palette,
-        None,
-    )?;
+    {
+        let scratch = Instant::now();
+        write_indexed_frame(
+            &mut encoder,
+            &first,
+            &first_scaled,
+            width,
+            height,
+            &mut palette,
+            None,
+        )?;
+        t_write += scratch.elapsed();
+        encoded += 1;
+    }
     let mut previous = first_scaled;
     let full_area = width as u64 * height as u64;
     // Frames whose size drifted (a display change) do not fit the fixed screen
     // and are skipped rather than corrupting the container.
     for pending in receiver.iter() {
+        let scratch = Instant::now();
         let scaled = video::prepare(&pending.image, max_width).into_owned();
+        t_prepare += scratch.elapsed();
         let Some((frame_width, frame_height)) = fit_u16(&scaled) else {
             continue;
         };
         if (frame_width, frame_height) != (width, height) {
             continue;
         }
+        let scratch = Instant::now();
         let retrain =
             since_train >= GIF_REFRESH_COOLDOWN && palette.error(&scaled) > GIF_REFRESH_ERROR;
+        t_error += scratch.elapsed();
         if retrain {
+            let scratch = Instant::now();
             palette = PaletteMap::train(&scaled, quality);
+            t_train += scratch.elapsed();
+            retrains += 1;
             since_train = 0;
         } else {
             since_train += 1;
@@ -690,14 +760,17 @@ fn encode_gif(
         } else {
             // Even a completely static frame needs a frame of its own to keep
             // its delay and the frame count; one pixel is enough with Keep.
+            let scratch = Instant::now();
             let changed = dirty_rect(&previous, &scaled).unwrap_or(DirtyRect {
                 x: 0,
                 y: 0,
                 width: 1,
                 height: 1,
             });
+            t_diff += scratch.elapsed();
             (changed.area() * 100 < full_area * GIF_PARTIAL_MAX_PERCENT).then_some(changed)
         };
+        let scratch = Instant::now();
         write_indexed_frame(
             &mut encoder,
             &pending,
@@ -707,10 +780,21 @@ fn encode_gif(
             &mut palette,
             region,
         )?;
+        t_write += scratch.elapsed();
+        encoded += 1;
         previous = scaled;
     }
     drop(encoder);
     writer.flush().context("failed to flush the GIF file")?;
+    log::info!(
+        target: "timing",
+        "gif writer: {encoded} frames, prepare {:.1} ms, diff {:.1} ms, palette error {:.1} ms, train {:.1} ms ({retrains} refreshes), encode {:.1} ms",
+        ms(t_prepare),
+        ms(t_diff),
+        ms(t_error),
+        ms(t_train),
+        ms(t_write)
+    );
     Ok(())
 }
 
@@ -802,7 +886,6 @@ fn signal_ready(
 struct CaptureJob {
     monitor_id: u32,
     region: Region,
-    probe: RgbaImage,
     output: PathBuf,
     options: RecordOptions,
     stop: Arc<AtomicBool>,
@@ -817,7 +900,6 @@ fn capture_loop(
     let CaptureJob {
         monitor_id,
         region,
-        probe,
         output,
         options,
         stop,
@@ -859,7 +941,7 @@ fn capture_loop(
     let mut sink: Option<Box<dyn FrameSink>> = None;
     let mut origin: Option<Duration> = None;
     let mut first: Option<RgbaImage> = None;
-    let mut previous: Option<RgbaImage> = None;
+    let mut previous: Option<Arc<RgbaImage>> = None;
     let mut pending_duplicate_at: Option<Duration> = None;
     // Presentation times must strictly increase: AVFoundation rejects two
     // samples sharing a time, and a resume can land a millisecond before the
@@ -869,7 +951,7 @@ fn capture_loop(
 
     let mut push = |sink: &mut Box<dyn FrameSink>,
                     frames: &Arc<AtomicUsize>,
-                    image: &RgbaImage,
+                    image: Arc<RgbaImage>,
                     at: Duration|
      -> Result<()> {
         sink.push(image, at)?;
@@ -884,7 +966,9 @@ fn capture_loop(
             options.max_duration,
         )
     {
-        match live.recv_timeout(Duration::from_millis(50)) {
+        // Bounds how long a stop request waits for this thread to notice it
+        // without busy-waiting: 4 ms costs ~0.1% of a core, 0 ms pegs one.
+        match live.recv_timeout(Duration::from_millis(4)) {
             LiveFrameWait::Frame(frame) => {
                 if paused.is_paused() {
                     // Keep draining the platform recorder, but do not encode
@@ -902,6 +986,7 @@ fn capture_loop(
                     last_at + Duration::from_millis(1)
                 };
                 last_at = at;
+                let image = Arc::new(frame.image);
                 if sink.is_none() {
                     // A/B evidence: the delivered size next to the selection's
                     // logical size shows whether the compositor honoured the
@@ -909,29 +994,28 @@ fn capture_loop(
                     // still scales native frames before they reach the sink.
                     log::debug!(
                         "capture frame {}x{} (output size hint {:?}, logical selection {}x{})",
-                        frame.image.width(),
-                        frame.image.height(),
+                        image.width(),
+                        image.height(),
                         output_size,
                         logical_width,
                         logical_height
                     );
-                    sink = Some(open_sink(&output, &options, &frame.image)?);
+                    sink = Some(open_sink(&output, &options, &image)?);
                 }
                 let sink = sink.as_mut().expect("sink was just created");
                 let is_duplicate = previous.as_ref().is_some_and(|prev| {
-                    prev.dimensions() == frame.image.dimensions()
-                        && prev.as_raw() == frame.image.as_raw()
+                    prev.dimensions() == image.dimensions() && prev.as_raw() == image.as_raw()
                 });
                 if is_duplicate {
                     pending_duplicate_at = Some(at);
                 } else {
-                    push(sink, &frames, &frame.image, at)?;
+                    push(sink, &frames, Arc::clone(&image), at)?;
                     pending_duplicate_at = None;
                     if first.is_none() {
-                        first = Some(frame.image.clone());
+                        first = Some((*image).clone());
                     }
                     signal_ready(&mut ready, Ok(()));
-                    previous = Some(frame.image);
+                    previous = Some(image);
                 }
             }
             LiveFrameWait::Timeout => {}
@@ -945,30 +1029,73 @@ fn capture_loop(
         }
     }
 
-    if let Err(err) = live.stop() {
-        log::warn!("failed to stop the platform recorder: {err:#}");
-    }
+    let closing = Instant::now();
     if sink.is_none() {
         // Windows duplication only reports changes, so a static screen can
-        // yield no frame at all; the probe still makes a valid file.
+        // yield no frame at all. Capture one now, only on this rare path: doing
+        // it at `start` cost ~10 ms on every recording for no benefit.
+        let probe = Arc::new(
+            RegionCapturer::new(monitor_id, region)?
+                .capture()
+                .context("failed to capture region")?,
+        );
         let mut created = open_sink(&output, &options, &probe)?;
-        push(&mut created, &frames, &probe, Duration::ZERO)?;
-        first = Some(probe);
+        push(&mut created, &frames, Arc::clone(&probe), Duration::ZERO)?;
+        first = Some((*probe).clone());
         sink = Some(created);
     } else if let (Some(image), Some(timestamp), Some(created)) =
         (&previous, pending_duplicate_at, sink.as_mut())
     {
         // Keep the final still stretch visible for its real duration.
-        push(created, &frames, image, timestamp)?;
+        push(created, &frames, Arc::clone(image), timestamp)?;
     }
+    let last_frame = closing.elapsed();
 
     let duration = started
         .elapsed()
         .saturating_sub(origin.unwrap_or(Duration::ZERO))
         .saturating_sub(paused.paused_duration());
-    if let Some(sink) = sink {
-        sink.finish(duration)?;
+    // Platform stop and container finalisation are independent: the capture
+    // loop has already pushed its last frame, so the sink only has to flush
+    // what it holds, and stopping the stream talks to SCK/DXGI. Overlap them.
+    // Only the sink crosses threads (`FrameSink: Send`); `LiveRecorder` holds
+    // Objective-C objects and stays on this thread.
+    let (stop_error, platform, finish, finish_ms) = thread::scope(move |scope| {
+        let finisher = sink.map(|sink| {
+            scope.spawn(move || {
+                let begun = Instant::now();
+                let result = sink.finish(duration);
+                (result, begun.elapsed())
+            })
+        });
+        let flushing = Instant::now();
+        let stop_error = live.stop().err();
+        let platform = flushing.elapsed();
+        let mut finish = Ok(());
+        let mut finish_ms = Duration::ZERO;
+        if let Some(finisher) = finisher {
+            match finisher.join() {
+                Ok((result, elapsed)) => {
+                    finish = result;
+                    finish_ms = elapsed;
+                }
+                Err(_) => finish = Err(anyhow!("sink finish thread panicked")),
+            }
+        }
+        (stop_error, platform, finish, finish_ms)
+    });
+    if let Some(err) = stop_error {
+        log::warn!("failed to stop the platform recorder: {err:#}");
     }
+    finish?;
+    log::info!(
+        target: "timing",
+        "recording flush: platform stop {:.1} ms (parallel with sink finish), final frame {:.1} ms, sink finish {:.1} ms (duration {:.1} s)",
+        ms(platform),
+        ms(last_frame),
+        ms(finish_ms),
+        duration.as_secs_f64()
+    );
     Ok((duration, first))
 }
 
@@ -1100,8 +1227,11 @@ mod tests {
             }
         }
         for i in 0..8u64 {
-            sink.push(&frame, Duration::from_secs_f64(i as f64 * 0.1))
-                .unwrap();
+            sink.push(
+                Arc::new(frame.clone()),
+                Duration::from_secs_f64(i as f64 * 0.1),
+            )
+            .unwrap();
         }
 
         let (tx, rx) = mpsc::channel();
@@ -1135,8 +1265,15 @@ mod tests {
         let mut sink = GifSink::new(&output, &options).unwrap();
         for i in 0..24u64 {
             let color = if i < 10 { 12 } else { 240 };
-            let frame = RgbaImage::from_pixel(64, 48, image::Rgba([color, color, color, 255]));
-            sink.push(&frame, Duration::from_millis(i * 100)).unwrap();
+            sink.push(
+                Arc::new(RgbaImage::from_pixel(
+                    64,
+                    48,
+                    image::Rgba([color, color, color, 255]),
+                )),
+                Duration::from_millis(i * 100),
+            )
+            .unwrap();
         }
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -1177,9 +1314,11 @@ mod tests {
                 lit.put_pixel(x, y, image::Rgba([240, 100, 5, 255]));
             }
         }
-        sink.push(&base, Duration::ZERO).unwrap();
-        sink.push(&lit, Duration::from_millis(100)).unwrap();
-        sink.push(&lit, Duration::from_millis(200)).unwrap();
+        sink.push(Arc::new(base), Duration::ZERO).unwrap();
+        sink.push(Arc::new(lit.clone()), Duration::from_millis(100))
+            .unwrap();
+        sink.push(Arc::new(lit), Duration::from_millis(200))
+            .unwrap();
         Box::new(sink).finish(Duration::from_millis(300)).unwrap();
 
         let file = File::open(&output).unwrap();

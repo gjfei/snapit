@@ -119,24 +119,27 @@ fn copy_file_reference_windows(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn copy_file_reference_macos(path: &Path) -> anyhow::Result<()> {
-    const SCRIPT: &str = r#"use framework "Foundation"
-use framework "AppKit"
-on run argv
-    set pb to current application's NSPasteboard's generalPasteboard()
-    set fileURL to current application's NSURL's fileURLWithPath:(item 1 of argv)
-    pb's clearContents()
-    return pb's writeObjects:{fileURL}
-end run"#;
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(SCRIPT)
-        .arg(path)
-        .output()
-        .map_err(|err| anyhow::anyhow!("osascript failed: {err}"))?;
-    anyhow::ensure!(
-        output.status.success() && output.stdout.starts_with(b"true"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+
+    // Spawning `osascript` for this took ~230 ms per copy and ran on the main
+    // thread, which delayed every MP4 completion. The pasteboard API is a
+    // sub-millisecond call and needs no extra dependency.
+    let class = AnyClass::get(c"NSPasteboard")
+        .ok_or_else(|| anyhow::anyhow!("NSPasteboard unavailable"))?;
+    let pasteboard: *mut AnyObject = unsafe { msg_send![class, generalPasteboard] };
+    anyhow::ensure!(!pasteboard.is_null(), "no general pasteboard");
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let objects = NSArray::from_retained_slice(&[url]);
+    unsafe {
+        let _: isize = msg_send![pasteboard, clearContents];
+        let written: Bool = msg_send![pasteboard, writeObjects: &*objects];
+        anyhow::ensure!(
+            written == Bool::YES,
+            "NSPasteboard refused {}",
+            path.display()
+        );
+    }
     Ok(())
 }

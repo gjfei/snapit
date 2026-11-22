@@ -2,7 +2,12 @@
 //! (VideoToolbox) and muxes the container. Frames are handed over as BGRA
 //! `CVPixelBuffer`s, the format the encoder converts most cheaply.
 
-use std::{path::Path, ptr::NonNull, time::Duration};
+use std::{
+    path::Path,
+    ptr::NonNull,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, anyhow, bail};
 use objc2::rc::Retained;
@@ -43,6 +48,11 @@ pub(crate) struct Mp4Sink {
     /// the file if something is written after it.
     last: Option<(RgbaImage, Duration)>,
     frames: usize,
+    t_scale: Duration,
+    t_buffer: Duration,
+    t_copy: Duration,
+    t_wait: Duration,
+    t_append: Duration,
 }
 
 impl Mp4Sink {
@@ -132,6 +142,11 @@ impl Mp4Sink {
             max_width: options.max_width,
             last: None,
             frames: 0,
+            t_scale: Duration::ZERO,
+            t_buffer: Duration::ZERO,
+            t_copy: Duration::ZERO,
+            t_wait: Duration::ZERO,
+            t_append: Duration::ZERO,
         })
     }
 
@@ -145,7 +160,10 @@ impl Mp4Sink {
             );
         }
 
+        let buffer_started = Instant::now();
         let buffer = pixel_buffer(frame)?;
+        self.t_buffer += buffer_started.elapsed();
+        let copy_started = Instant::now();
         if unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) } != 0 {
             bail!("failed to lock the pixel buffer");
         }
@@ -171,9 +189,11 @@ impl Mp4Sink {
             }
         }
         unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
+        self.t_copy += copy_started.elapsed();
 
         // The hardware encoder drains on the capture thread, so waiting for
         // room costs at most a frame's encode time.
+        let wait_started = Instant::now();
         let mut spins = 0;
         while !unsafe { self.input.isReadyForMoreMediaData() } {
             if spins > 2_000 {
@@ -182,12 +202,16 @@ impl Mp4Sink {
             std::thread::sleep(Duration::from_millis(1));
             spins += 1;
         }
+        self.t_wait += wait_started.elapsed();
 
+        let append_started = Instant::now();
         let time = unsafe { CMTime::with_seconds(at.as_secs_f64(), TIMESCALE) };
-        if !unsafe {
+        let appended = unsafe {
             self.adaptor
                 .appendPixelBuffer_withPresentationTime(&buffer, time)
-        } {
+        };
+        self.t_append += append_started.elapsed();
+        if !appended {
             bail!("failed to append a frame: {}", status(&self.writer));
         }
         self.frames += 1;
@@ -200,17 +224,21 @@ impl Mp4Sink {
 unsafe impl Send for Mp4Sink {}
 
 impl FrameSink for Mp4Sink {
-    fn push(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()> {
         // Keep the scaled frame, not the full-resolution capture: finish()
         // needs one more sample, and cloning the capture (or scaling it again)
         // would mean another pass over four times as many pixels.
-        let scaled = prepare(frame, self.max_width).into_owned();
+        let scaled_started = Instant::now();
+        let scaled = prepare(&frame, self.max_width).into_owned();
+        self.t_scale += scaled_started.elapsed();
         self.append_scaled(&scaled, at)?;
         self.last = Some((scaled, at));
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        let closing_started = Instant::now();
+        let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
         // needs a frame of its own or the video looks cut short.
         if let Some((frame, at)) = self.last.take()
@@ -224,16 +252,31 @@ impl FrameSink for Mp4Sink {
                 .saturating_sub(Duration::from_millis(1))
                 .max(at + Duration::from_millis(2));
             self.append_scaled(&frame, hold)?;
+            closing = closing_started.elapsed();
         }
         unsafe { self.input.markAsFinished() };
         // The completion-handler variant needs a block and a semaphore for the
         // same result; this thread has nothing else to do anyway.
+        let finish_started = Instant::now();
         #[allow(deprecated)]
         let finished = unsafe { self.writer.finishWriting() };
+        let finished_in = finish_started.elapsed();
         if !finished {
             bail!("failed to finish the video: {}", status(&self.writer));
         }
         log::info!("encoded {} frames to MP4", self.frames);
+        log::info!(
+            target: "timing",
+            "mp4 sink: {} frames, scale {:.1} ms, buffer {:.1} ms, copy {:.1} ms, encoder wait {:.1} ms, append {:.1} ms; closing sample {:.1} ms, finishWriting {:.1} ms",
+            self.frames,
+            crate::ms(self.t_scale),
+            crate::ms(self.t_buffer),
+            crate::ms(self.t_copy),
+            crate::ms(self.t_wait),
+            crate::ms(self.t_append),
+            crate::ms(closing),
+            crate::ms(finished_in)
+        );
         Ok(())
     }
 }

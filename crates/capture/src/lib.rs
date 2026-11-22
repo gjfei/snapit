@@ -6,7 +6,6 @@
 //! between the two.
 
 use std::{
-    io::Cursor,
     path::Path,
     sync::{
         Arc,
@@ -17,7 +16,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 pub use image::RgbaImage;
-use image::{ImageFormat, imageops};
+use image::{ImageEncoder as _, ImageFormat, imageops};
 use xcap::Monitor;
 pub use xcap::{HdrImage, OutputSize};
 
@@ -376,6 +375,22 @@ pub fn elements_at(window: WindowInfo, x: f32, y: f32) -> Vec<ElementHit> {
     elements::at(window, x, y)
 }
 
+/// Cheap, non-prompting check for screen-recording permission. macOS answers
+/// from TCC state without capturing a frame; other platforms have no separate
+/// permission gate and always grant. Callers use this instead of a throwaway
+/// full-screen capture, which costs ~10 ms and is only needed when a recorder
+/// never receives a frame at all.
+pub fn screen_recording_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        objc2_core_graphics::CGPreflightScreenCaptureAccess()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 /// Live capture of a region (in monitor units) of one monitor.
 pub struct RegionCapturer {
     monitor: Monitor,
@@ -499,11 +514,24 @@ fn resolve_region(monitor_id: u32, region: Region) -> Result<(Monitor, Region)> 
     Ok((monitor, region))
 }
 
+/// PNG for the clipboard. The default encoder spends most of its time choosing
+/// an adaptive filter per scanline; `Sub` skips that (20 ms -> 3 ms for a
+/// 1560x1040 capture) for ~27% more bytes, which is the right trade for a
+/// transient pasteboard payload. [`save_png`] keeps the small-file default.
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
-        .context("failed to encode PNG")?;
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut bytes,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Sub,
+    )
+    .write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )
+    .context("failed to encode PNG")?;
     Ok(bytes)
 }
 

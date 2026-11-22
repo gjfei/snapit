@@ -88,6 +88,14 @@ pub fn pre_place(window: &mut Window) {
     macos_window::pre_place(window);
 }
 
+/// 立即把浮层从屏幕移除，但不销毁 GPUI 窗口。复制/保存时主线程销毁全屏
+/// overlay 要花约 37 ms（Metal layer + renderer drop），排在剪贴板写入前面；
+/// 先 orderOut 让浮层视觉上瞬间消失，等写入完成再真正 remove_window。
+#[cfg(target_os = "macos")]
+pub fn hide(window: &mut Window) {
+    macos_window::hide(window);
+}
+
 pub struct OverlayView {
     session: Entity<CaptureSession>,
     frame_ix: usize,
@@ -409,9 +417,17 @@ impl OverlayView {
         {
             // 预建时窗口是零 alpha、还没有画过冻结帧；这时直接恢复 alpha 会先露出
             // 未渲染图层的黑色，等 GPUI 再画一帧才正常。等首帧合成完再置前。
-            window.on_next_frame(|window, _| {
+            let asked = Instant::now();
+            window.on_next_frame(move |window, _| {
+                let showing = Instant::now();
                 macos_window::reveal(window);
                 window.activate_window();
+                log::info!(
+                    target: "timing",
+                    "overlay reveal: presented {:.1} ms after activate, reveal+activate {:.1} ms",
+                    asked.elapsed().as_secs_f64() * 1e3,
+                    showing.elapsed().as_secs_f64() * 1e3
+                );
             });
         }
         #[cfg(not(target_os = "macos"))]
@@ -2305,6 +2321,17 @@ mod macos_window {
         unsafe {
             let _: () = msg_send![layer, setBackgroundColor: cg_color];
             let _: () = msg_send![layer, setOpaque: Bool::NO];
+        }
+    }
+
+    /// 从屏幕移除窗口但保留 GPUI 的一切状态，供稍后的 `remove_window` 真正销毁。
+    /// `orderOut` 是同步且近乎零成本的；真正昂贵的是 GPUI 释放全屏 layer 的那 37 ms。
+    pub fn hide(window: &mut Window) {
+        let Some(native_window) = native_window(window) else {
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![native_window, orderOut: std::ptr::null_mut::<AnyObject>()];
         }
     }
 
