@@ -208,12 +208,24 @@ impl Controller {
             element_permission_acknowledged: false,
         });
         cx.set_global(GlobalController(controller.clone()));
-        cx.on_window_closed(|cx, _| {
+        cx.on_window_closed(|cx, window_id| {
             // A window can close while this controller is mid-update, so
             // recompute after that update returns.
-            cx.defer(|cx| {
-                Controller::global(cx)
-                    .update(cx, |controller, cx| controller.sync_dock_visible(cx));
+            cx.defer(move |cx| {
+                Controller::global(cx).update(cx, |controller, cx| {
+                    // Forget the slot: a closed panel must be recreated rather
+                    // than "reactivated" through a handle that no longer has a
+                    // window behind it.
+                    for slot in &mut controller.panels {
+                        if slot
+                            .handle
+                            .is_some_and(|handle| handle.window_id() == window_id)
+                        {
+                            slot.handle = None;
+                        }
+                    }
+                    controller.sync_dock_visible(cx);
+                });
             });
         })
         .detach();
@@ -1609,13 +1621,32 @@ impl Controller {
 
     /// Focus `panel`'s window, opening it if needed.
     pub fn open_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        // Trust the live window list, not the slot: a window that was closed a
+        // moment ago can still leave its handle behind, and "reactivating" it
+        // would silently drop the open request (no panel, no refresh).
+        let live: Vec<_> = cx
+            .windows()
+            .iter()
+            .map(|window| window.window_id())
+            .collect();
         let slot = &mut self.panels[panel as usize];
-        if let Some(handle) = slot.handle
+        if slot
+            .handle
+            .is_some_and(|handle| !live.contains(&handle.window_id()))
+        {
+            slot.handle = None;
+        }
+        if let Some(handle) = slot.handle.take()
             && handle
                 .update(cx, |_, window, _| window.activate_window())
                 .is_ok()
         {
+            slot.handle = Some(handle);
             cx.activate(true);
+            // The panel keeps the previous run's content; tell its view the
+            // controller changed so a repeated capture refreshes in place
+            // instead of waiting for the next result to land.
+            cx.notify();
             return;
         }
         if slot.pending {
