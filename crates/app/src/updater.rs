@@ -2,16 +2,19 @@
 //!
 //! Every release carries a `latest.json` manifest naming one package per
 //! platform with its size and SHA-256 (see `.github/workflows/release.yml`).
-//! An update downloads that package and verifies it, installs it over the
-//! running app (a `.app` bundle on macOS, the `-setup.exe` installer on
-//! Windows) and restarts.
+//! An update downloads that package and verifies it, then waits for the user:
+//! Windows installs the `-setup.exe` over the running app and restarts, macOS
+//! saves the disk image and leaves the installation to them. Pre-releases are
+//! checked too, so a beta build can see the next beta.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -129,8 +132,8 @@ pub fn repo_url() -> Option<String> {
     repo().map(|repo| format!("https://github.com/{repo}"))
 }
 
-fn source() -> Option<Source> {
-    // Lets a debug build test updates against a local server.
+/// Lets a debug build test updates against a local server.
+fn override_source() -> Option<Source> {
     #[cfg(debug_assertions)]
     if let Ok(manifest_url) = std::env::var("SNAPIT_UPDATE_MANIFEST_URL") {
         let page_url = repo().map_or_else(|| manifest_url.clone(), |repo| release_page(&repo));
@@ -139,11 +142,140 @@ fn source() -> Option<Source> {
             page_url,
         });
     }
-    let repo = repo()?;
-    Some(Source {
-        manifest_url: format!("https://github.com/{repo}/releases/latest/download/latest.json"),
-        page_url: release_page(&repo),
+    None
+}
+
+/// Whether this build knows where to look for updates.
+pub fn is_configured() -> bool {
+    override_source().is_some() || repo().is_some()
+}
+
+/// Resolve the newest release's manifest, pre-releases included:
+/// `releases/latest` skips them, so beta builds would never see an update.
+/// The API is rate-limited for anonymous callers, so a failure falls back to
+/// github.com's own release pages.
+fn resolve_source() -> Result<Source> {
+    if let Some(source) = override_source() {
+        return Ok(source);
+    }
+    let Some(repo) = repo() else {
+        return Err(UpdateError::new("update.not_configured").into());
+    };
+    api_source(&repo).or_else(|_| web_source(&repo))
+}
+
+fn api_source(repo: &str) -> Result<Source> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+    let text = get_text(&url)?;
+    let entries: Vec<ReleaseEntry> =
+        serde_json::from_str(&text).localize("update.error.releases")?;
+    newest_release(&entries).ok_or_else(|| UpdateError::new("update.error.releases").into())
+}
+
+/// The Atom feed and a release's asset fragment are ordinary web pages, so
+/// they do not share the API's anonymous rate limit.
+fn web_source(repo: &str) -> Result<Source> {
+    let feed = get_text(&format!("https://github.com/{repo}/releases.atom"))?;
+    let tags = atom_tags(&feed);
+    let tag = newest_tag(&tags).ok_or_else(|| UpdateError::new("update.error.releases"))?;
+    let html = get_text(&format!(
+        "https://github.com/{repo}/releases/expanded_assets/{tag}"
+    ))?;
+    let manifest_url = expanded_manifest_url(&html, tag)
+        .ok_or_else(|| UpdateError::new("update.error.releases"))?;
+    Ok(Source {
+        manifest_url,
+        page_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
     })
+}
+
+fn get_text(url: &str) -> Result<String> {
+    let mut body =
+        http::get(url, MANIFEST_TIMEOUT, MAX_MANIFEST_BYTES).localize("update.error.network")?;
+    let mut text = String::new();
+    body.read_to_string(&mut text)
+        .localize("update.error.network")?;
+    body.finish().localize("update.error.network")?;
+    Ok(text)
+}
+
+/// One entry of the GitHub release list.
+#[derive(Debug, Deserialize)]
+struct ReleaseEntry {
+    tag_name: String,
+    html_url: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    assets: Vec<EntryAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntryAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// The highest-versioned published release carrying a `latest.json`; drafts,
+/// unparsable tags and releases without the manifest are skipped.
+fn newest_release(entries: &[ReleaseEntry]) -> Option<Source> {
+    let mut best: Option<(&ReleaseEntry, &str)> = None;
+    for entry in entries {
+        if entry.draft || parse_version(&entry.tag_name).is_none() {
+            continue;
+        }
+        let Some(asset) = entry
+            .assets
+            .iter()
+            .find(|asset| asset.name == "latest.json")
+        else {
+            continue;
+        };
+        if best.is_none_or(|(best, _)| is_newer(&entry.tag_name, &best.tag_name)) {
+            best = Some((entry, &asset.browser_download_url));
+        }
+    }
+    best.map(|(entry, url)| Source {
+        manifest_url: url.to_string(),
+        page_url: entry.html_url.clone(),
+    })
+}
+
+/// Release tags linked by the Atom feed, in feed order.
+fn atom_tags(feed: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut rest = feed;
+    while let Some(at) = rest.find("/releases/tag/") {
+        rest = &rest[at + "/releases/tag/".len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        if parse_version(tag).is_some() && !tags.iter().any(|t| t == tag) {
+            tags.push(tag.to_string());
+        }
+        rest = &rest[end..];
+    }
+    tags
+}
+
+fn newest_tag(tags: &[String]) -> Option<&String> {
+    tags.iter()
+        .reduce(|best, tag| if is_newer(tag, best) { tag } else { best })
+}
+
+/// The `latest.json` link inside a release's expanded-assets fragment, whose
+/// hrefs are root-relative.
+fn expanded_manifest_url(html: &str, tag: &str) -> Option<String> {
+    let needle = format!("/releases/download/{tag}/latest.json");
+    let at = html.find(&needle)?;
+    let start = html[..at].rfind('"')? + 1;
+    let url = &html[start..at + needle.len()];
+    if url.starts_with('/') {
+        Some(format!("https://github.com{url}"))
+    } else if url.starts_with("https://github.com/") {
+        Some(url.to_string())
+    } else {
+        None
+    }
 }
 
 fn release_page(repo: &str) -> String {
@@ -267,13 +399,34 @@ fn select_asset(manifest: &Manifest, key: &str) -> Option<Asset> {
     (checksum_ok && url_ok && asset.size > 0).then(|| asset.clone())
 }
 
+/// macOS installs by hand from a disk image; older manifests only carry the
+/// zip, which a user can still unpack themselves.
+fn update_asset(manifest: &Manifest, key: &str) -> Option<Asset> {
+    #[cfg(target_os = "macos")]
+    if let Some(dmg) = select_asset(manifest, &format!("{key}-dmg")) {
+        return Some(dmg);
+    }
+    select_asset(manifest, key)
+}
+
+/// Whether the version carries a pre-release part such as `-beta.1`.
+fn is_pre(version: &str) -> bool {
+    parse_version(version).is_some_and(|(_, pre)| pre.is_some())
+}
+
+/// A stable build moving to a pre-release confirms once before downloading;
+/// every other combination downloads directly.
+pub(crate) fn needs_confirm(current: &str, target: &str) -> bool {
+    parse_version(current).is_some_and(|(_, pre)| pre.is_none()) && is_pre(target)
+}
+
 /// The release in `manifest` when it is newer than `current`.
 fn evaluate(manifest: Manifest, current: &str, key: &str) -> Option<Release> {
     if !is_newer(&manifest.version, current) {
         return None;
     }
     Some(Release {
-        asset: select_asset(&manifest, key),
+        asset: update_asset(&manifest, key),
         version: manifest.version.trim().trim_start_matches('v').to_string(),
         notes: truncate_notes(manifest.notes.trim(), MAX_NOTES_CHARS),
     })
@@ -484,7 +637,14 @@ fn download(asset: &Asset, dest: &Path, progress: &AtomicU64, cancel: &AtomicBoo
     }
     body.finish().localize("update.error.download")?;
     file.sync_all().localize("update.error.download")?;
-    verify(size, &hex(&hasher.finalize()), asset)
+    drop(file);
+    // A package that fails verification must not sit on disk looking
+    // installable.
+    let verified = verify(size, &hex(&hasher.finalize()), asset);
+    if verified.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    verified
 }
 
 /// File name of a download URL, ignoring any query.
@@ -506,6 +666,7 @@ fn url_file_name(url: &str) -> String {
 
 // -- installing ----------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
 fn run(command: &mut Command, key: &'static str) -> Result<()> {
     let program = command.get_program().to_string_lossy().into_owned();
     let output = command
@@ -521,6 +682,7 @@ fn run(command: &mut Command, key: &'static str) -> Result<()> {
 }
 
 /// Whether files can be created in `dir`.
+#[cfg(any(windows, test))]
 fn is_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".snapit-write-test-{}", std::process::id()));
     let writable = fs::File::create(&probe).is_ok();
@@ -529,6 +691,7 @@ fn is_writable(dir: &Path) -> bool {
 }
 
 /// The first entry in `dir`, or one level below it, matching `pred`.
+#[cfg(any(windows, test))]
 fn find_entry(dir: &Path, pred: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     let entries: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
@@ -598,157 +761,23 @@ fn remove_leftovers() {
     }
 }
 
-/// The `.app` bundle of an executable at `X.app/Contents/MacOS/<bin>`.
+/// Where a downloaded disk image goes: the user's Downloads folder, or the
+/// temp directory when it is unavailable.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bundle_root(exe: &Path) -> Option<PathBuf> {
-    let macos = exe.parent()?;
-    let contents = macos.parent()?;
-    let bundle = contents.parent()?;
-    let is_app = bundle
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
-    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents" && is_app)
-        .then(|| bundle.to_path_buf())
+fn download_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
-/// A `/bin/sh` command that waits for this process to exit, then runs
-/// `script` with the given path as `$0`.
+/// macOS installs by hand: the verified disk image is revealed in Finder and
+/// the user drags the app into Applications.
 #[cfg(target_os = "macos")]
-fn relaunch_command(script: &str, path: &Path) -> Command {
-    use std::os::unix::process::CommandExt as _;
-    let wait =
-        "i=0; while kill -0 \"$1\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done";
-    let mut command = Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg(format!("{wait}; {script}"))
-        .arg(path)
-        .arg(std::process::id().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    command
-}
-
-#[cfg(target_os = "macos")]
-fn plist_version(plist: &Path) -> Option<String> {
-    let output = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleShortVersionString"])
-        .arg(plist)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// `'…'`-quote for `/bin/sh`.
-#[cfg(target_os = "macos")]
-fn sh_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
-}
-
-/// Unpack the archive and put its app in place of `bundle`.
-#[cfg(target_os = "macos")]
-fn install_macos(archive: &Path, work: &Path, bundle: &Path, version: &str) -> Result<()> {
-    let staging = work.join("extract");
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).localize("update.error.extract")?;
-    run(
-        Command::new("/usr/bin/ditto")
-            .args(["-x", "-k"])
-            .arg(archive)
-            .arg(&staging),
-        "update.error.extract",
-    )?;
-    let is_app = |p: &Path| p.is_dir() && p.extension().is_some_and(|ext| ext == "app");
-    let new_app =
-        find_entry(&staging, &is_app).ok_or_else(|| UpdateError::new("update.error.package"))?;
-    let found = plist_version(&new_app.join("Contents/Info.plist"));
-    if found.as_deref() != Some(version) || !new_app.join("Contents/MacOS").is_dir() {
-        let detail = format!(
-            "version {}, expected {version}",
-            found.as_deref().unwrap_or("?")
-        );
-        return Err(UpdateError::new("update.error.package")
-            .detail(detail)
-            .into());
+fn reveal(path: &Path) {
+    if let Err(err) = Command::new("/usr/bin/open").arg("-R").arg(path).spawn() {
+        log::warn!("cannot reveal {}: {err}", path.display());
     }
-    let _ = Command::new("/usr/bin/xattr")
-        .args(["-dr", "com.apple.quarantine"])
-        .arg(&new_app)
-        .output();
-    replace_bundle(&new_app, bundle)
-}
-
-#[cfg(target_os = "macos")]
-fn replace_bundle(new_app: &Path, bundle: &Path) -> Result<()> {
-    let parent = bundle
-        .parent()
-        .ok_or_else(|| UpdateError::new("update.error.install"))?;
-    let backup = with_suffix(bundle, ".update-backup");
-    if is_writable(parent) {
-        let _ = fs::remove_dir_all(&backup);
-        fs::rename(bundle, &backup).localize("update.error.install")?;
-        let moved = fs::rename(new_app, bundle).or_else(|_| {
-            run(
-                Command::new("/usr/bin/ditto").arg(new_app).arg(bundle),
-                "update.error.install",
-            )
-            .map_err(std::io::Error::other)
-        });
-        if let Err(err) = moved {
-            let _ = fs::remove_dir_all(bundle);
-            let _ = fs::rename(&backup, bundle);
-            return Err(err).localize("update.error.install");
-        }
-        let _ = fs::remove_dir_all(&backup);
-        return Ok(());
-    }
-
-    // Such as /Applications for a standard user: ask for an admin password.
-    let (cur, bak, new) = (sh_quote(bundle), sh_quote(&backup), sh_quote(new_app));
-    let shell = format!(
-        "rm -rf {bak} && mv {cur} {bak} && if /usr/bin/ditto {new} {cur}; then rm -rf {bak}; \
-         else rm -rf {cur}; mv {bak} {cur}; exit 1; fi"
-    );
-    let script = format!(
-        "do shell script \"{}\" with administrator privileges",
-        shell.replace('\\', "\\\\").replace('"', "\\\"")
-    );
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|err| UpdateError::new("update.error.launch").detail(err))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // -128 is userCanceledErr, the password prompt was dismissed.
-        let key = if stderr.contains("(-128)") {
-            "update.error.auth_cancelled"
-        } else {
-            "update.error.install"
-        };
-        return Err(UpdateError::new(key).detail(stderr.trim()).into());
-    }
-    Ok(())
-}
-
-/// Install the downloaded archive over the running app and return the
-/// command that starts the new version.
-#[cfg(target_os = "macos")]
-fn install(archive: &Path, work: &Path, version: &str) -> Result<Command> {
-    let exe = std::env::current_exe().localize("update.error.install")?;
-    let bundle = bundle_root(&exe).ok_or_else(|| UpdateError::new("update.error.dev_build"))?;
-    // Gatekeeper runs quarantined apps from a read-only copy.
-    if bundle.to_string_lossy().contains("/AppTranslocation/") {
-        return Err(UpdateError::new("update.error.translocated").into());
-    }
-    install_macos(archive, work, &bundle, version)?;
-    let _ = fs::remove_dir_all(work);
-    Ok(relaunch_command("open \"$0\"", &bundle))
 }
 
 #[cfg(target_os = "windows")]
@@ -1043,7 +1072,9 @@ fn install(_: &Path, _: &Path, _: &str) -> Result<Command> {
         .into())
 }
 
-/// A fresh scratch directory for one update.
+/// A fresh scratch directory for one update. macOS has no installer to feed,
+/// so nothing there needs a work directory.
+#[cfg(any(not(target_os = "macos"), test))]
 fn work_dir(version: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("snapit-update-{version}"));
     let _ = fs::remove_dir_all(&dir);
@@ -1089,12 +1120,29 @@ pub(crate) struct Job {
     pub(crate) total: u64,
     cancel: Arc<AtomicBool>,
     pub(crate) phase: Phase,
+    /// Verified package on disk: the disk image on macOS, the downloaded
+    /// installer or archive on Windows. `None` until the download finishes.
+    archive: Option<PathBuf>,
+    /// Scratch directory a Windows install needs while it runs.
+    work: Option<PathBuf>,
 }
 
 pub(crate) enum Phase {
     Downloading,
+    /// Downloaded and verified, waiting for the user's click.
+    Ready,
+    /// Windows only: the installer helper is running.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Installing,
     Failed(String),
+}
+
+impl Job {
+    /// Where the verified package landed, for the window's "ready" line.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn path(&self) -> Option<String> {
+        self.archive.as_ref().map(|path| path.display().to_string())
+    }
 }
 
 impl UpdateState {
@@ -1116,6 +1164,14 @@ impl UpdateState {
 
     pub(crate) fn job(&self) -> Option<&Job> {
         self.job.as_ref()
+    }
+
+    /// Version of the job's package, for label text and install paths.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn job_version(&self) -> String {
+        self.release
+            .as_ref()
+            .map_or_else(String::new, |release| release.version.clone())
     }
 
     pub(crate) fn page_url(&self) -> Option<&str> {
@@ -1171,7 +1227,7 @@ pub fn init(cx: &mut App) {
 /// Look for a newer release. A manual check opens the update window; an
 /// automatic one opens it only when a newer release exists.
 pub fn check(manual: bool, cx: &mut App) {
-    let Some(source) = source() else {
+    if !is_configured() {
         if manual {
             let state = cx.global_mut::<UpdateState>();
             state.checked = true;
@@ -1180,7 +1236,7 @@ pub fn check(manual: bool, cx: &mut App) {
             open_panel(cx);
         }
         return;
-    };
+    }
     let state = cx.global_mut::<UpdateState>();
     if state.checking || state.busy() {
         if manual {
@@ -1196,22 +1252,30 @@ pub fn check(manual: bool, cx: &mut App) {
     state.checked = false;
     state.release = None;
     state.error = None;
-    state.source = Some(source.clone());
+    state.source = None;
     AppSettings::update(cx, |config| config.update.last_check = Some(now()));
     cx.refresh_windows();
     if manual {
         open_panel(cx);
     }
 
-    let url = source.manifest_url.clone();
     cx.spawn(async move |cx| {
+        // Finding the newest release costs a couple of requests (the API, then
+        // github.com's pages), so it runs off the UI thread with the download.
         let result = cx
             .background_executor()
-            .spawn(async move { fetch_manifest(&url) })
+            .spawn(async move {
+                let source = resolve_source()?;
+                let manifest = fetch_manifest(&source.manifest_url)?;
+                anyhow::Ok((source, manifest))
+            })
             .await;
         cx.update(|cx| {
             let found = match result {
-                Ok(manifest) => evaluate(manifest, CURRENT_VERSION, &platform_key()),
+                Ok((source, manifest)) => {
+                    cx.global_mut::<UpdateState>().source = Some(source);
+                    evaluate(manifest, CURRENT_VERSION, &platform_key())
+                }
                 Err(err) => {
                     log::warn!("update check failed: {err:#}");
                     cx.global_mut::<UpdateState>().checking = false;
@@ -1290,6 +1354,8 @@ pub fn start_update(cx: &mut App) {
         total: asset.size,
         cancel: cancel.clone(),
         phase: Phase::Downloading,
+        archive: None,
+        work: None,
     });
     cx.refresh_windows();
 
@@ -1303,42 +1369,83 @@ pub fn start_update(cx: &mut App) {
     })
     .detach();
 
+    // Only the Windows install needs the version: it names the scratch
+    // directory the installer helper reads from.
+    #[cfg(not(target_os = "macos"))]
     let version = release.version.clone();
     cx.spawn(async move |cx| {
-        let downloaded_archive = cx
+        let fetched = cx
             .background_executor()
             .spawn(async move {
-                let work = work_dir(&version)?;
-                let archive = work.join(url_file_name(&asset.url));
-                if let Err(err) = download(&asset, &archive, &downloaded, &cancel) {
-                    let _ = fs::remove_dir_all(&work);
-                    return Err(err);
-                }
-                anyhow::Ok((work, archive, version))
+                let name = url_file_name(&asset.url);
+                // macOS gets the disk image in Downloads where the user can
+                // install it; Windows keeps it in a scratch directory the
+                // installer helper can reach.
+                #[cfg(target_os = "macos")]
+                let (dest, work) = (download_dir().join(&name), None);
+                #[cfg(not(target_os = "macos"))]
+                let (dest, work) = {
+                    let work = work_dir(&version)?;
+                    (work.join(&name), Some(work))
+                };
+                // Stage beside the target so a cancelled run never truncates
+                // a package the user already had there.
+                let staging = with_suffix(&dest, ".part");
+                let _ = fs::remove_file(&staging);
+                download(&asset, &staging, &downloaded, &cancel)?;
+                fs::rename(&staging, &dest).localize("update.error.install")?;
+                anyhow::Ok((dest, work))
             })
             .await;
-        let (work, archive, version) = match downloaded_archive {
-            Ok(downloaded) => downloaded,
-            Err(err) => {
-                finished.store(true, Ordering::Relaxed);
-                cx.update(|cx| fail(err, cx));
-                return;
+        finished.store(true, Ordering::Relaxed);
+        cx.update(|cx| match fetched {
+            Ok((archive, work)) => {
+                let state = cx.global_mut::<UpdateState>();
+                if let Some(job) = &mut state.job {
+                    job.archive = Some(archive);
+                    job.work = work;
+                }
+                set_phase(Phase::Ready, cx);
             }
-        };
-        cx.update(|cx| set_phase(Phase::Installing, cx));
+            Err(err) => fail(err, cx),
+        });
+    })
+    .detach();
+}
+
+/// Windows: install the verified package and restart, on the user's click.
+#[cfg(not(target_os = "macos"))]
+pub fn install_ready(cx: &mut App) {
+    let Some(job) = cx.global::<UpdateState>().job() else {
+        return;
+    };
+    if !matches!(job.phase, Phase::Ready) {
+        return;
+    }
+    let (Some(archive), Some(work), version) = (
+        job.archive.clone(),
+        job.work.clone(),
+        cx.global::<UpdateState>().job_version(),
+    ) else {
+        return;
+    };
+    if !archive.exists() {
+        forget_stale_package(cx);
+        return;
+    }
+    set_phase(Phase::Installing, cx);
+    cx.spawn(async move |cx| {
         let installed = cx
             .background_executor()
             .spawn(async move {
                 let relaunch = install(&archive, &work, &version);
-                // A successful install removes its own work directory; the
-                // Windows helper needs it to hold the installer until it runs.
+                // The Windows helper needs the work directory until it runs.
                 if relaunch.is_err() {
                     let _ = fs::remove_dir_all(&work);
                 }
                 relaunch
             })
             .await;
-        finished.store(true, Ordering::Relaxed);
         cx.update(|cx| match installed {
             Ok(relaunch) => restart(relaunch, cx),
             Err(err) => fail(err, cx),
@@ -1347,8 +1454,35 @@ pub fn start_update(cx: &mut App) {
     .detach();
 }
 
+/// macOS: show the saved disk image in Finder; installing it is the user's job.
+#[cfg(target_os = "macos")]
+pub fn reveal_ready(cx: &mut App) {
+    let Some(job) = cx.global::<UpdateState>().job() else {
+        return;
+    };
+    if !matches!(job.phase, Phase::Ready) {
+        return;
+    }
+    let Some(archive) = job.archive.clone() else {
+        return;
+    };
+    if !archive.exists() {
+        forget_stale_package(cx);
+        return;
+    }
+    reveal(&archive);
+}
+
+/// The package was moved or deleted after the download: drop the job so the
+/// window offers a fresh download instead of a dead button.
+pub(crate) fn forget_stale_package(cx: &mut App) {
+    cx.global_mut::<UpdateState>().job = None;
+    cx.refresh_windows();
+}
+
 /// Start the installed version and quit this one through the app's own quit
 /// path.
+#[cfg(not(target_os = "macos"))]
 fn restart(mut relaunch: Command, cx: &mut App) {
     if let Err(err) = relaunch.spawn() {
         set_phase(
@@ -1465,6 +1599,112 @@ mod tests {
     }
 
     #[test]
+    fn picks_the_newest_release_with_a_manifest() {
+        let entries: Vec<ReleaseEntry> = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.4.0", "html_url": "https://github.com/o/r/releases/tag/v0.4.0",
+                 "assets": [{"name": "app.zip", "browser_download_url": "https://x/0.4.0/app.zip"}]},
+                {"tag_name": "v0.3.0", "html_url": "https://github.com/o/r/releases/tag/v0.3.0",
+                 "assets": [{"name": "latest.json", "browser_download_url": "https://x/0.3.0/latest.json"}]},
+                {"tag_name": "v0.5.0", "html_url": "https://github.com/o/r/releases/tag/v0.5.0",
+                 "draft": true,
+                 "assets": [{"name": "latest.json", "browser_download_url": "https://x/0.5.0/latest.json"}]},
+                {"tag_name": "nightly", "html_url": "https://github.com/o/r/releases/tag/nightly",
+                 "assets": [{"name": "latest.json", "browser_download_url": "https://x/n/latest.json"}]},
+                {"tag_name": "v1.0.0-beta.2", "html_url": "https://github.com/o/r/releases/tag/v1.0.0-beta.2",
+                 "assets": [{"name": "latest.json", "browser_download_url": "https://x/beta/latest.json"}]}
+            ]"#,
+        )
+        .unwrap();
+        // The highest version wins even when it is a pre-release, which
+        // `releases/latest` would never report.
+        let source = newest_release(&entries).unwrap();
+        assert_eq!(source.manifest_url, "https://x/beta/latest.json");
+        assert_eq!(
+            source.page_url,
+            "https://github.com/o/r/releases/tag/v1.0.0-beta.2"
+        );
+        assert!(newest_release(&[]).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_release_pages() {
+        let feed = r#"<feed>
+            <entry><link href="https://github.com/o/r/releases/tag/v0.3.0"/></entry>
+            <entry><link href="https://github.com/o/r/releases/tag/v0.10.0"/></entry>
+            <entry><link href="https://github.com/o/r/releases/tag/v0.10.0"/></entry>
+            <entry><link href="https://github.com/o/r/releases/tag/nightly"/></entry>
+            <entry><title>v9.9.9</title></entry>
+        </feed>"#;
+        let tags = atom_tags(feed);
+        assert_eq!(tags, vec!["v0.3.0", "v0.10.0"]);
+        assert_eq!(newest_tag(&tags).map(String::as_str), Some("v0.10.0"));
+        assert!(newest_tag(&[]).is_none());
+
+        let relative = r#"<a href="/o/r/releases/download/v0.10.0/latest.json">latest.json</a>"#;
+        assert_eq!(
+            expanded_manifest_url(relative, "v0.10.0").as_deref(),
+            Some("https://github.com/o/r/releases/download/v0.10.0/latest.json")
+        );
+        assert_eq!(expanded_manifest_url(relative, "v0.3.0"), None);
+        let absolute = concat!(
+            r#"<a href="https://github.com/o/r/releases/download/"#,
+            r#"v0.10.0/latest.json">x</a>"#
+        );
+        assert_eq!(
+            expanded_manifest_url(absolute, "v0.10.0").as_deref(),
+            Some("https://github.com/o/r/releases/download/v0.10.0/latest.json")
+        );
+        // Anything else, such as a link to another host, is refused.
+        let elsewhere = concat!(
+            r#"<a href="https://evil.example/o/r/releases/download/"#,
+            r#"v0.10.0/latest.json">x</a>"#
+        );
+        assert_eq!(expanded_manifest_url(elsewhere, "v0.10.0"), None);
+    }
+
+    #[test]
+    fn confirms_before_a_prerelease() {
+        assert!(needs_confirm("0.1.0", "0.2.0-beta.1"));
+        assert!(!needs_confirm("0.1.0", "0.2.0"));
+        assert!(!needs_confirm("0.2.0-beta.1", "0.2.0-beta.2"));
+        assert!(!needs_confirm("0.2.0-beta.1", "0.2.0"));
+        assert!(is_pre("1.0.0-rc.1"));
+        assert!(!is_pre("1.0.0"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefers_the_disk_image_on_macos() {
+        let sha = "ab0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+        let both = parse_manifest(&format!(
+            r#"{{"version": "0.3.0", "assets": {{
+                "macos-aarch64": {{"url": "https://example.com/a.zip", "sha256": "{sha}", "size": 10}},
+                "macos-aarch64-dmg": {{"url": "https://example.com/a.dmg", "sha256": "{sha}", "size": 20}}
+            }}}}"#
+        ))
+        .unwrap();
+        assert_eq!(select_asset(&both, "macos-aarch64").unwrap().size, 10);
+        let asset = update_asset(&both, "macos-aarch64").unwrap();
+        assert_eq!(
+            (asset.url.as_str(), asset.size),
+            ("https://example.com/a.dmg", 20)
+        );
+
+        // A release that only publishes the zip still updates.
+        let only_zip = parse_manifest(&format!(
+            r#"{{"version": "0.3.0", "assets": {{
+                "macos-aarch64": {{"url": "https://example.com/a.zip", "sha256": "{sha}", "size": 10}}
+            }}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            update_asset(&only_zip, "macos-aarch64").unwrap().url,
+            "https://example.com/a.zip"
+        );
+    }
+
+    #[test]
     fn verifies_size_and_checksum() {
         let digest = hex(&Sha256::digest(b"abc"));
         assert_eq!(
@@ -1479,21 +1719,6 @@ mod tests {
         assert!(verify(3, &digest, &asset).is_ok());
         assert!(verify(4, &digest, &asset).is_err());
         assert!(verify(3, &hex(&Sha256::digest(b"abd")), &asset).is_err());
-    }
-
-    #[test]
-    fn finds_bundle_root() {
-        let exe = Path::new("/Applications/SnapIt.app/Contents/MacOS/SnapIt");
-        assert_eq!(
-            bundle_root(exe),
-            Some(PathBuf::from("/Applications/SnapIt.app"))
-        );
-        assert_eq!(bundle_root(Path::new("/repo/target/debug/snapit")), None);
-        assert_eq!(bundle_root(Path::new("/x/Foo/Contents/MacOS/bin")), None);
-        assert_eq!(
-            bundle_root(Path::new("/x/Foo.app/Contents/Resources/bin")),
-            None
-        );
     }
 
     #[test]
@@ -1575,20 +1800,21 @@ mod tests {
         );
     }
 
-    /// Updates an app bundle from a local release, by hand:
-    /// `SNAPIT_TEST_MANIFEST_URL=http://127.0.0.1:8765/latest.json SNAPIT_TEST_BUNDLE=/tmp/x/SnapIt.app
-    /// cargo test simulate_update -- --ignored`.
+    /// Downloads a package from a local release, by hand:
+    /// `SNAPIT_TEST_MANIFEST_URL=http://127.0.0.1:8765/latest.json
+    /// cargo test simulate_update -- --ignored`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn simulate_update() {
         let url = std::env::var("SNAPIT_TEST_MANIFEST_URL").unwrap();
-        let bundle = PathBuf::from(std::env::var("SNAPIT_TEST_BUNDLE").unwrap());
-        let plist = bundle.join("Contents/Info.plist");
-        let before = plist_version(&plist).unwrap();
-        let release = evaluate(fetch_manifest(&url).unwrap(), &before, &platform_key())
-            .expect("a newer release");
-        let asset = release.asset.expect("an archive for this platform");
+        let release = evaluate(
+            fetch_manifest(&url).unwrap(),
+            &std::env::var("SNAPIT_TEST_CURRENT").unwrap_or_else(|_| "0.0.1".to_string()),
+            &platform_key(),
+        )
+        .expect("a newer release");
+        let asset = release.asset.clone().expect("a package for this platform");
 
         let work = work_dir(&release.version).unwrap();
         let archive = work.join(url_file_name(&asset.url));
@@ -1597,14 +1823,19 @@ mod tests {
         assert!(cancelled.is::<Cancelled>() && !archive.exists());
         download(&asset, &archive, &progress, &AtomicBool::new(false)).unwrap();
         assert_eq!(progress.load(Ordering::Relaxed), asset.size);
+        assert_eq!(fs::read(&archive).unwrap().len() as u64, asset.size);
 
-        let wrong = install_macos(&archive, &work, &bundle, "99.0.0").unwrap_err();
-        eprintln!("mismatched package refused: {wrong:#}");
-        assert_eq!(plist_version(&plist), Some(before));
-
-        install_macos(&archive, &work, &bundle, &release.version).unwrap();
-        assert_eq!(plist_version(&plist), Some(release.version.clone()));
-        assert!(!with_suffix(&bundle, ".update-backup").exists());
+        // A package that does not match the manifest is refused, and the
+        // rejected file is removed rather than left looking installable.
+        let wrong = Asset {
+            url: asset.url.clone(),
+            sha256: "0".repeat(64),
+            size: asset.size,
+        };
+        let rejected = work.join("rejected.dmg");
+        let err = download(&wrong, &rejected, &progress, &AtomicBool::new(false)).unwrap_err();
+        eprintln!("mismatched package refused: {err:#}");
+        assert!(!rejected.exists());
         let _ = fs::remove_dir_all(&work);
     }
 

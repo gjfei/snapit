@@ -40,7 +40,7 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **Tray-only**: no main window, launcher or always-open window. Settings, history and OCR results are panels opened on demand.
 - **Region-only recording**: GIF / MP4 recording covers the selection; no camera, microphone or picture-in-picture.
 - **Element snapping needs a system accessibility API**: available on macOS and Windows.
-- **Built-in updater**: checks GitHub Releases after launch (can be disabled in Settings) and on demand from the tray or app menu; downloads, verifies SHA-256, installs and restarts.
+- **Built-in updater**: checks GitHub Releases after launch (can be disabled in Settings) and on demand from the tray or app menu; pre-releases are included, and every download is verified against SHA-256. Windows installs and restarts; macOS saves the verified DMG to Downloads and reveals it in Finder — drag it into Applications.
 - **Windows has an installer**: `setup.exe` installs to `Program Files` with an uninstall entry and is also used for in-app updates; macOS uses DMG / zip.
 
 ## Download and install
@@ -54,7 +54,7 @@ Download the file for your platform from [GitHub Releases](https://github.com/gj
 | Windows x64 | `SnapIt-<version>-windows-x86_64-setup.exe` |
 | Windows ARM64 | `SnapIt-<version>-windows-aarch64-setup.exe` |
 
-Each release also includes `SHA256SUMS.txt` with the checksums of all files and an update manifest, `latest.json`. SnapIt checks it after launch, or on demand from the tray menu or Settings → General → Updates; a manual first install on macOS still needs the Gatekeeper step described below.
+Each release also includes `SHA256SUMS.txt` with the checksums of all files and an update manifest, `latest.json`. SnapIt checks it after launch (pre-releases included), or on demand from the tray menu or Settings → General → Updates; a manual first install on macOS still needs the Gatekeeper step described below.
 
 ### macOS
 
@@ -377,7 +377,7 @@ Uploaded files:
 | Windows x64 | `SnapIt-<version>-windows-x86_64-setup.exe` |
 | Windows ARM64 | `SnapIt-<version>-windows-aarch64-setup.exe` |
 
-The release job also generates `SHA256SUMS.txt` and the `latest.json` update manifest (`scripts/release-manifest.py`), then creates a GitHub Release with automatically generated notes. Tags containing `-` (for example `v0.2.0-beta.1`) become pre-releases. You can also run `workflow_dispatch` for an **existing** tag from the Actions page; do not release from an untagged branch.
+The release job also generates `SHA256SUMS.txt` and the `latest.json` update manifest (`scripts/release-manifest.py`; the macOS DMG adds a `macos-<arch>-dmg` key, which the app prefers), then creates a GitHub Release with automatically generated notes. Tags containing `-` (for example `v0.2.0-beta.1`) become pre-releases, which the app can still find. You can also run `workflow_dispatch` for an **existing** tag from the Actions page; do not release from an untagged branch.
 
 `.github/workflows/ci.yml` runs `cargo test --locked` and clippy on macOS and Windows. CI uses the 1.99.1 pin from `rust-toolchain.toml`; **do not change it to `stable`**.
 
@@ -404,7 +404,7 @@ Model lookup order: the `SNAPIT_OCR_MODELS` environment variable → `models/` n
 - **Recording bar and cursor**: SnapIt's own windows (the selection outline and the bar) are always left out of the recording — through ScreenCaptureKit on macOS and display affinity on Windows — so the bar can sit anywhere. DXGI never includes the pointer, so recording the cursor is macOS-only.
 - **Copying a video file**: macOS writes a file reference (pasteable); Windows falls back to copying the path as text.
 - **OCR**: the ocrs backend is Latin-only; the language setting only affects Vision and Windows.Media.Ocr.
-- **Auto-updates**: macOS builds are ad-hoc signed by default and the updater replaces the `.app` in `/Applications`; a development build run from `target/debug` cannot update itself. Windows updates run `setup.exe` elevated.
+- **Auto-updates**: macOS only downloads the DMG to Downloads and reveals it in Finder; installing it (drag into `/Applications`) is left to you, because an app cannot reliably replace itself while running. A development build run from `target/debug` cannot update itself. Windows updates run `setup.exe` elevated and restart afterwards.
 - **One selection at a time**: all displays freeze together, but a selection always lives on a single display.
 
 ## Credits and license

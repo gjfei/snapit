@@ -40,7 +40,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 - **只做托盘应用**：没有主窗口、启动器和常驻大窗口，设置、历史、识别结果都是按需打开的面板。
 - **只录选区**：录制（GIF / MP4）只支持选区，没有摄像头、麦克风和画中画。
 - **元素框选依赖系统辅助功能 API**：macOS 与 Windows 均可用。
-- **内置更新器**：启动后自动检查 GitHub Releases（可在设置中关闭），托盘「检查更新…」或应用菜单可手动检查；下载后校验 SHA-256，安装并自动重启。
+- **内置更新器**：启动后自动检查 GitHub Releases（可在设置中关闭），托盘「检查更新…」或应用菜单可手动检查；预发布版本也参与检查，下载后校验 SHA-256。Windows 会安装并自动重启，macOS 把校验过的 DMG 存到「下载」并在 Finder 中显示，拖进「应用程序」即可。
 - **Windows 提供安装程序**：`setup.exe` 安装到 `Program Files`，自带卸载项，应用内更新会静默调用它；macOS 使用 DMG / zip。
 
 ## 下载安装
@@ -54,7 +54,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 | Windows x64 | `SnapIt-<版本>-windows-x86_64-setup.exe` |
 | Windows ARM64 | `SnapIt-<版本>-windows-aarch64-setup.exe` |
 
-每个版本还附带 `SHA256SUMS.txt`（所有文件的校验和）和更新清单 `latest.json`。应用会在启动后检查它，也可以在托盘菜单或设置 → 通用 → 更新中手动检查；macOS 首次手动覆盖安装仍需按下方 macOS 说明绕过 Gatekeeper。
+每个版本还附带 `SHA256SUMS.txt`（所有文件的校验和）和更新清单 `latest.json`。应用会在启动后检查它（包含预发布版本），也可以在托盘菜单或设置 → 通用 → 更新中手动检查；macOS 首次手动覆盖安装仍需按下方 macOS 说明绕过 Gatekeeper。
 
 ### macOS
 
@@ -377,7 +377,7 @@ git push origin v0.1.0
 | Windows x64 | `SnapIt-<版本>-windows-x86_64-setup.exe` |
 | Windows ARM64 | `SnapIt-<版本>-windows-aarch64-setup.exe` |
 
-发布任务还会生成 `SHA256SUMS.txt` 和更新清单 `latest.json`（`scripts/release-manifest.py`），并创建 GitHub Release（更新说明自动生成）。带 `-` 的标签（例如 `v0.2.0-beta.1`）会发布为预发布版本。也可以在 Actions 页面对**已有**标签手动运行 `workflow_dispatch`；不要对未打标签的分支做发布。
+发布任务还会生成 `SHA256SUMS.txt` 和更新清单 `latest.json`（`scripts/release-manifest.py`；macOS 的 DMG 会额外写一个 `macos-<架构>-dmg` 键，应用优先下载它），并创建 GitHub Release（更新说明自动生成）。带 `-` 的标签（例如 `v0.2.0-beta.1`）会发布为预发布版本，应用同样能检查到。也可以在 Actions 页面对**已有**标签手动运行 `workflow_dispatch`；不要对未打标签的分支做发布。
 
 `.github/workflows/ci.yml` 在 macOS 和 Windows 上运行 `cargo test --locked` 与 clippy。CI 使用 `rust-toolchain.toml` 固定的 1.99.1，**不要改成 `stable`**。
 
@@ -404,7 +404,7 @@ curl -LO https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten
 - **录制控制条与光标**：SnapIt 自己的窗口（选区高亮和控制条）在 macOS（ScreenCaptureKit）和 Windows（显示亲和力）上都不会被录进画面，控制条可以放在任意位置。Windows 的 DXGI 本身不含鼠标光标，所以录制光标只在 macOS 生效。
 - **复制视频文件**：macOS 写入的是文件引用（可直接粘贴）；Windows 退回复制文件路径文本。
 - **文字识别**的 ocrs 后端只支持拉丁字母；语言设置只对 Vision 和 Windows.Media.Ocr 生效。
-- **自动更新**：macOS 默认 ad-hoc 签名，更新由应用内下载 `/Applications` 中的 `.app` 并覆盖；从 `target/debug` 直接运行的开发构建不能自更新。Windows 更新通过管理员权限运行 `setup.exe` 完成。
+- **自动更新**：macOS 只下载 DMG 到「下载」并在 Finder 中显示，安装（拖进 `/Applications`）由用户完成，因为应用无法可靠地替换正在运行的自身；从 `target/debug` 直接运行的开发构建不能自更新。Windows 更新通过管理员权限运行 `setup.exe` 完成，安装后自动重启。
 - **一次只处理一个选区**：多显示器同时冻结，但选区始终位于单个显示器内。
 
 ## 致谢与许可

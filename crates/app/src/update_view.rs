@@ -20,6 +20,7 @@ use crate::updater::{self, Phase};
 
 enum JobView {
     Downloading { done: u64, total: u64, percent: f32 },
+    Ready { path: String },
     Installing,
     Failed(String),
 }
@@ -41,6 +42,20 @@ impl UpdateView {
             .on_click(|_, _, cx| updater::check(true, cx))
     }
 
+    /// `content` at the top, `actions` along the bottom edge. The window keeps
+    /// a fixed size, so an action row that merely follows short content floats
+    /// in the middle of an empty window.
+    fn dialog(content: AnyElement, actions: Option<AnyElement>) -> AnyElement {
+        v_flex()
+            .size_full()
+            .gap_3()
+            .child(div().flex_1().min_h_0().child(content))
+            .when_some(actions, |this, actions| {
+                this.child(h_flex().w_full().justify_end().child(actions))
+            })
+            .into_any_element()
+    }
+
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let state = updater::state(cx);
@@ -48,41 +63,52 @@ impl UpdateView {
         let danger = theme.danger;
 
         if state.checking() {
-            return h_flex()
-                .gap_2()
-                .text_sm()
-                .text_color(muted)
-                .child(Spinner::new().small())
-                .child(t!("update.checking").to_string())
-                .into_any_element();
+            return Self::dialog(
+                h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(Spinner::new().small())
+                    .child(t!("update.checking").to_string())
+                    .into_any_element(),
+                None,
+            );
         }
         if let Some(error) = state.error() {
-            return v_flex()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .text_sm()
-                        .child(
-                            div()
-                                .text_color(danger)
-                                .child(t!("update.check_failed").to_string()),
-                        )
-                        .child(div().text_color(muted).child(error.to_string())),
-                )
-                .child(self.check_button(t!("update.check_again").to_string().into()))
-                .into_any_element();
+            return Self::dialog(
+                v_flex()
+                    .gap_1()
+                    .text_sm()
+                    .child(
+                        div()
+                            .text_color(danger)
+                            .child(t!("update.check_failed").to_string()),
+                    )
+                    .child(div().text_color(muted).child(error.to_string()))
+                    .into_any_element(),
+                Some(
+                    self.check_button(t!("update.check_again").to_string().into())
+                        .into_any_element(),
+                ),
+            );
         }
         let Some(release) = state.release() else {
-            return v_flex()
-                .gap_3()
-                .when(state.checked(), |this| {
-                    this.child(h_flex().gap_2().text_sm().text_color(muted).child(
-                        t!("update.up_to_date", version = updater::CURRENT_VERSION).to_string(),
-                    ))
-                    .child(self.check_button(t!("update.check_again").to_string().into()))
-                })
-                .into_any_element();
+            return Self::dialog(
+                h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(muted)
+                    .when(state.checked(), |this| {
+                        this.child(
+                            t!("update.up_to_date", version = updater::CURRENT_VERSION).to_string(),
+                        )
+                    })
+                    .into_any_element(),
+                state.checked().then(|| {
+                    self.check_button(t!("update.check_again").to_string().into())
+                        .into_any_element()
+                }),
+            );
         };
 
         let notes = if release.notes.is_empty() {
@@ -101,12 +127,16 @@ impl UpdateView {
                     percent: done as f32 * 100. / total.max(1) as f32,
                 }
             }
+            Phase::Ready => JobView::Ready {
+                path: job.path().unwrap_or_default(),
+            },
             Phase::Installing => JobView::Installing,
             Phase::Failed(message) => JobView::Failed(message.clone()),
         });
         let busy = state.busy();
         let downloading = matches!(state.job().map(|job| &job.phase), Some(Phase::Downloading));
         let has_asset = release.asset.is_some();
+        let pre_release = updater::needs_confirm(updater::CURRENT_VERSION, &release.version);
         let page_url = state.page_url().map(str::to_string);
 
         let status = match job {
@@ -128,6 +158,25 @@ impl UpdateView {
                             .to_string(),
                         ),
                     )
+                    .into_any_element(),
+            ),
+            Some(JobView::Ready { path }) => Some(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(t!("update.ready", path = path).to_string()),
+                    )
+                    .when(cfg!(target_os = "macos"), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(t!("update.reveal_hint").to_string()),
+                        )
+                    })
                     .into_any_element(),
             ),
             Some(JobView::Installing) => Some(
@@ -152,12 +201,35 @@ impl UpdateView {
             None => None,
         };
 
+        let ready = matches!(state.job().map(|job| &job.phase), Some(Phase::Ready));
         let actions = if downloading {
             h_flex().gap_2().child(
                 Button::new("cancel-update")
                     .label(t!("update.cancel").to_string())
                     .on_click(|_, _, cx| updater::dismiss_job(cx)),
             )
+        } else if ready {
+            #[cfg(target_os = "macos")]
+            let finish = Button::new("update-reveal")
+                .primary()
+                .label(t!("update.reveal").to_string())
+                .on_click(|_, _, cx| updater::reveal_ready(cx));
+            #[cfg(not(target_os = "macos"))]
+            let finish = Button::new("update-install")
+                .primary()
+                .label(t!("update.install_restart").to_string())
+                .on_click(|_, _, cx| updater::install_ready(cx));
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("update-later")
+                        .label(t!("update.later").to_string())
+                        .on_click(|_, window, cx| {
+                            updater::dismiss_job(cx);
+                            window.remove_window();
+                        }),
+                )
+                .child(finish)
         } else if busy {
             h_flex()
         } else {
@@ -174,14 +246,18 @@ impl UpdateView {
                 .child(
                     Button::new("update-now")
                         .primary()
-                        .label(t!("update.now").to_string())
+                        .label(if pre_release {
+                            t!("update.install_pre").to_string()
+                        } else {
+                            t!("update.now").to_string()
+                        })
                         .disabled(!has_asset)
                         .when(has_asset, |this| this.cursor_pointer())
                         .on_click(|_, _, cx| updater::start_update(cx)),
                 )
         };
 
-        v_flex()
+        let content = v_flex()
             .gap_3()
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
             .child(
@@ -197,6 +273,14 @@ impl UpdateView {
                     .overflow_y_scrollbar()
                     .child(notes),
             )
+            .when(pre_release, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.warning)
+                        .child(t!("update.pre_release").to_string()),
+                )
+            })
             .when_some(status, |this, status| this.child(status))
             .when(!has_asset, |this| {
                 this.child(
@@ -214,8 +298,8 @@ impl UpdateView {
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 )
             })
-            .child(h_flex().w_full().justify_end().child(actions))
-            .into_any_element()
+            .into_any_element();
+        Self::dialog(content, Some(actions.into_any_element()))
     }
 }
 
@@ -250,6 +334,6 @@ impl Render for UpdateView {
                             ),
                     ),
             )
-            .child(self.body(cx))
+            .child(div().flex_1().min_h_0().child(self.body(cx)))
     }
 }

@@ -207,8 +207,10 @@ jobs:
           cat dist/latest.json dist/SHA256SUMS.txt
           ls -l dist
 
-      # The updater reads releases/latest, which skips pre-releases (tags
-      # with a `-`, e.g. v1.0.0-beta.1), so those never reach users' apps.
+      # Pre-releases are marked so GitHub does not call them "latest", but the
+      # updater lists releases itself and includes them, so a beta build can
+      # move on to the next beta. The manifest names the macOS disk image
+      # `macos-<arch>-dmg`, which the updater prefers over the zip.
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
