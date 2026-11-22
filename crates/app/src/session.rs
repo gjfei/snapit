@@ -343,6 +343,18 @@ fn bounds_close(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> bool {
         && close(a.size.height.as_f32(), b.size.height.as_f32())
 }
 
+/// Wheel dial: the first tick widens; a reversal toggles the direction and
+/// same-direction ticks keep it. Returns the new "outward" state. Tracking the
+/// direction as state (rather than re-deriving it from two adjacent deltas) is
+/// what lets a continuous scroll keep narrowing after the first reversal.
+fn wheel_dial(last: Option<f32>, outward: bool, delta: f32) -> bool {
+    match last {
+        None => true,
+        Some(previous) if previous.signum() != delta.signum() => !outward,
+        Some(_) => outward,
+    }
+}
+
 /// Index of the frontmost window containing `position`, in monitor units.
 fn window_index_at(
     windows: &[WindowInfo],
@@ -665,9 +677,13 @@ pub struct CaptureSession {
     element_snap: bool,
     /// Element/window rectangle highlighted under the cursor.
     hover: Option<Hover>,
-    /// Sign of the last wheel scroll, so the first scroll in either direction
-    /// widens the preview and reversing it narrows again.
+    /// Sign of the last wheel scroll, paired with `hover_outward` to detect a
+    /// reversal. The first scroll in either direction widens the preview.
     hover_scroll: Option<f32>,
+    /// The dial's current direction: true widens toward the parent, false
+    /// narrows toward the child. A reversal flips it, and it then stays put
+    /// until the wheel reverses again, so scrolling one way keeps narrowing.
+    hover_outward: bool,
     /// Accessibility result for the window currently under the cursor.
     element_cache: Option<ElementCache>,
     /// Accessibility lookup in flight; stale results are dropped by generation.
@@ -854,6 +870,7 @@ impl CaptureSession {
             element_snap,
             hover: None,
             hover_scroll: None,
+            hover_outward: true,
             element_cache: None,
             pending_hover: None,
             hover_generation: 0,
@@ -1193,6 +1210,7 @@ impl CaptureSession {
             });
         self.hover = None;
         self.hover_scroll = None;
+        self.hover_outward = true;
         self.element_cache = None;
         self.pending_hover = None;
         self.hover_provisional = false;
@@ -1454,6 +1472,7 @@ impl CaptureSession {
             cx.notify();
         }
         self.hover_scroll = None;
+        self.hover_outward = true;
     }
 
     /// Start an accessibility lookup. On macOS the AX round-trip is slow and
@@ -1587,6 +1606,7 @@ impl CaptureSession {
             .is_some_and(|hover| hover.window_id == window_id)
         {
             self.hover_scroll = None;
+            self.hover_outward = true;
         }
         let level = if same_chain {
             self.hover
@@ -1619,8 +1639,10 @@ impl CaptureSession {
 
     /// Step the hover preview with the wheel. The wheel acts like a dial: the
     /// first scroll in either direction widens the preview to its parent, and
-    /// reversing it narrows back to the smaller element.
-    /// Returns true when the hover handled the scroll.
+    /// reversing it narrows back toward the smaller element. The chosen
+    /// direction persists across same-direction scrolls, so once reversed the
+    /// wheel keeps narrowing instead of flipping back outward every other
+    /// tick. Returns true when the hover handled the scroll.
     pub fn cycle_hover(&mut self, frame_ix: usize, delta: f32, cx: &mut Context<Self>) -> bool {
         if !self
             .hover
@@ -1629,15 +1651,13 @@ impl CaptureSession {
         {
             return false;
         }
-        let outward = self
-            .hover_scroll
-            .is_none_or(|previous| previous.signum() == delta.signum());
+        self.hover_outward = wheel_dial(self.hover_scroll, self.hover_outward, delta);
         self.hover_scroll = Some(delta);
         let Some(hover) = self.hover.as_mut() else {
             return false;
         };
         let last = hover.levels.len().saturating_sub(1);
-        let next = if outward {
+        let next = if self.hover_outward {
             (hover.level + 1).min(last)
         } else {
             hover.level.saturating_sub(1)
@@ -2054,7 +2074,7 @@ mod tests {
     use super::{
         Hover, HoverElement, ResizeHandle, compose_at_positions, is_snappable, preferred_level,
         preserved_level, region_bounds, resized_bounds, rgba_to_bgra, sample_block,
-        snap_window_region, stitch_vertical, swap_rgba_bgra_chunk, window_index_at,
+        snap_window_region, stitch_vertical, swap_rgba_bgra_chunk, wheel_dial, window_index_at,
         with_fullscreen_level,
     };
     use gpui_kit::{Bounds, Pixels, point, px, size};
@@ -2062,6 +2082,31 @@ mod tests {
 
     fn bounds() -> Bounds<Pixels> {
         Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.)))
+    }
+
+    #[test]
+    fn wheel_dial_keeps_direction_across_same_direction_ticks() {
+        // First tick always widens, whichever way the wheel turns.
+        let mut outward = wheel_dial(None, true, -1.);
+        assert!(outward);
+        let mut last = Some(-1.);
+        // Same-direction ticks keep widening (old code also did this).
+        outward = wheel_dial(last, outward, -1.);
+        assert!(outward);
+        // Reversing flips to narrowing.
+        outward = wheel_dial(last, outward, 1.);
+        assert!(!outward);
+        last = Some(1.);
+        // Key regression: continuing the SAME (now inward) direction must keep
+        // narrowing. The old adjacent-delta comparison flipped back outward
+        // here, so a continuous scroll could only ever widen.
+        outward = wheel_dial(last, outward, 1.);
+        assert!(!outward, "continuous scroll must keep narrowing");
+        outward = wheel_dial(last, outward, 1.);
+        assert!(!outward);
+        // Reversing again widens.
+        outward = wheel_dial(last, outward, -1.);
+        assert!(outward);
     }
 
     #[test]

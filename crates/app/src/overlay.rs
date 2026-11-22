@@ -16,13 +16,14 @@ use gpui_kit::component::{
     toolbar::Toolbar,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context,
-    CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla,
+    AnyElement, App, AppContext as _, AsyncApp, Bounds, BoxShadow, ClickEvent, ClipboardItem,
+    Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point,
-    Render, Rgba, ScrollDelta, ScrollEvent, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, UTF16Selection, WeakEntity, Window, actions,
-    canvas, div, fill, img, point, prelude::FluentBuilder as _, px, rgb, size,
+    Render, RenderImage, Rgba, ScrollDelta, ScrollEvent, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, UTF16Selection,
+    WeakEntity, Window, actions, canvas, div, fill, img, point, prelude::FluentBuilder as _, px,
+    rgb, size,
 };
 
 use crate::annotate::{self, Tool};
@@ -94,6 +95,31 @@ pub fn pre_place(window: &mut Window) {
 #[cfg(target_os = "macos")]
 pub fn hide(window: &mut Window) {
     macos_window::hide(window);
+}
+
+/// Physical state of the Control key, read straight from AppKit rather than
+/// from an event. GPUI rewrites ctrl+left mouse down/up into right mouse
+/// down/up (and clears `control` from the event's modifiers), so a selection
+/// drag started while a Ctrl-based hotkey is still held arrives here as a
+/// right click. `window.modifiers()` is fed from that rewritten event and is
+/// therefore unusable for this check; the live NSEvent flags are not.
+#[cfg(target_os = "macos")]
+fn control_key_held() -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+
+    // NSEventModifierFlagControl = 1 << 18 (NSEventModifierFlagDeviceIndependentFlagsMask).
+    const NS_CONTROL_KEY_MASK: usize = 1 << 18;
+    let Some(class) = AnyClass::get(c"NSEvent") else {
+        return false;
+    };
+    let flags: usize = unsafe { msg_send![class, modifierFlags] };
+    flags & NS_CONTROL_KEY_MASK != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn control_key_held() -> bool {
+    false
 }
 
 pub struct OverlayView {
@@ -819,7 +845,25 @@ impl OverlayView {
             .update(cx, |session, cx| session.end_selection(cx));
     }
 
-    fn on_right_click(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if control_key_held() && !event.modifiers.control {
+            // GPUI rewrites ctrl+left down into a right down and clears the
+            // event's `control` flag. When a Ctrl-based capture hotkey (e.g.
+            // Ctrl+Cmd+A) is still held, the press that should start a
+            // selection drag arrives here instead of `on_mouse_down`, and the
+            // rewrite also forces click_count to 1. Hand it back to the left
+            // press path so dragging works without releasing the hotkey.
+            // A genuine right-click keeps `event.modifiers.control` when Ctrl
+            // is physically down, so it still takes the cancel path below.
+            self.on_mouse_down(event, window, cx);
+            return;
+        }
         self.hover_handle = None;
         self.style_anchor = None;
         if self.session.read(cx).selection().is_some() {
@@ -827,6 +871,20 @@ impl OverlayView {
                 .update(cx, |session, cx| session.clear_selection(cx));
         } else {
             self.request(SessionCommand::Cancel, cx);
+        }
+    }
+
+    /// macOS GPUI also rewrites ctrl+left *up* into a right up, so the regular
+    /// `on_mouse_up(Left)` never closes a drag whose hotkey is still held.
+    fn on_right_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if control_key_held() && !event.modifiers.control {
+            self.on_mouse_up(event, window, cx);
         }
     }
 
@@ -1018,7 +1076,7 @@ impl OverlayView {
         if !dim {
             return Vec::new();
         }
-        let color = cx.theme().overlay;
+        let color = mask_color(cx);
         shade_rects(selections, viewport)
             .into_iter()
             .map(|bounds| {
@@ -1463,6 +1521,95 @@ fn color_to_rgb(color: Hsla) -> u32 {
     (channel(rgba.r) << 16) | (channel(rgba.g) << 8) | channel(rgba.b)
 }
 
+/// Dim-mask color from the configured opacity (0-100). A plain black with the
+/// requested alpha keeps the outside uniformly dark regardless of theme;
+/// higher opacity makes the un-dimmed selection stand out more.
+fn mask_color(cx: &App) -> Hsla {
+    let alpha = (AppSettings::get(cx).capture.mask_opacity as f32 / 100.).clamp(0., 1.);
+    gpui_kit::hsla(0., 0., 0., alpha)
+}
+
+/// A real, gaussian box-shadow. GPUI's drop-shadow shader fills the whole
+/// shadow rect (including the element's interior) because it assumes an opaque
+/// element covers the middle; our selection frame is transparent, so we paint
+/// the shadow layer and then restore the pristine screenshot inside the frame
+/// on top of it. Only the blur that bleeds outside the frame remains visible.
+fn selection_shadow(enabled: bool) -> Vec<BoxShadow> {
+    if !enabled {
+        return Vec::new();
+    }
+    vec![
+        BoxShadow::new(px(0.), px(2.), gpui_kit::hsla(0., 0., 0., 0.5))
+            .blur_radius(px(14.))
+            .spread_radius(px(2.)),
+    ]
+}
+
+/// A frame with a real gaussian shadow whose interior is restored to the
+/// pristine screenshot. The shadow layer fills the whole rect; the image layer
+/// clips the full-screen frame to the selection so only the blur bleeding past
+/// the border is visible, never a dark tint over the pixels being captured.
+fn shadowed_frame(
+    bounds: Bounds<Pixels>,
+    shadows: Vec<BoxShadow>,
+    image: &Arc<RenderImage>,
+    viewport: Bounds<Pixels>,
+    border: Hsla,
+) -> Vec<AnyElement> {
+    if shadows.is_empty() {
+        return vec![
+            div()
+                .absolute()
+                .left(bounds.origin.x)
+                .top(bounds.origin.y)
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .border_1()
+                .border_color(border)
+                .into_any_element(),
+        ];
+    }
+    let mut layers = vec![
+        div()
+            .absolute()
+            .left(bounds.origin.x)
+            .top(bounds.origin.y)
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .shadow(shadows)
+            .into_any_element(),
+        div()
+            .absolute()
+            .left(bounds.origin.x)
+            .top(bounds.origin.y)
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .overflow_hidden()
+            .child(
+                img(image.clone())
+                    .absolute()
+                    .left(-bounds.origin.x)
+                    .top(-bounds.origin.y)
+                    .w(viewport.size.width)
+                    .h(viewport.size.height)
+                    .object_fit(ObjectFit::Fill),
+            )
+            .into_any_element(),
+    ];
+    layers.push(
+        div()
+            .absolute()
+            .left(bounds.origin.x)
+            .top(bounds.origin.y)
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .border_1()
+            .border_color(border)
+            .into_any_element(),
+    );
+    layers
+}
+
 /// A shaded band: top/bottom edges plus the free x-intervals inside it.
 type ShadeBand = (f32, f32, Vec<(f32, f32)>);
 
@@ -1606,7 +1753,7 @@ fn recording_frame(selection: Bounds<Pixels>, viewport: Bounds<Pixels>, cx: &App
                         .top(bounds.origin.y)
                         .w(bounds.size.width)
                         .h(bounds.size.height)
-                        .bg(theme.overlay)
+                        .bg(mask_color(cx))
                         .into_any_element()
                 }),
         )
@@ -1852,6 +1999,7 @@ impl Render for OverlayView {
             format!("{w} × {h}")
         });
         let viewport = Bounds::new(Default::default(), window.viewport_size());
+        let shadows = selection_shadow(AppSettings::get(cx).capture.selection_shadow);
         let theme = cx.theme();
         let (ring, label_bg, label_fg, muted, radius, toast_border, danger) = (
             theme.primary,
@@ -1967,13 +2115,14 @@ impl Render for OverlayView {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_right_mouse_up))
             .on_mouse_exit(cx.listener(|this, _: &MouseExitEvent, _, cx| {
                 if this.pointer.take().is_some() {
                     cx.notify();
                 }
             }))
             .child(
-                img(image)
+                img(image.clone())
                     .absolute()
                     .top_0()
                     .left_0()
@@ -2010,28 +2159,28 @@ impl Render for OverlayView {
                     )
                 },
             )
-            .children(selections_on_frame.into_iter().map(move |bounds| {
-                let removing = remove_bounds == Some(bounds);
-                div()
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y)
-                    .w(bounds.size.width)
-                    .h(bounds.size.height)
-                    .border_1()
-                    .border_color(if removing { danger } else { ring })
+            .children(selections_on_frame.clone().into_iter().flat_map({
+                let image = image.clone();
+                let shadows = shadows.clone();
+                move |bounds| {
+                    let removing = remove_bounds == Some(bounds);
+                    shadowed_frame(
+                        bounds,
+                        shadows.clone(),
+                        &image,
+                        viewport,
+                        if removing { danger } else { ring },
+                    )
+                }
             }))
             .when_some(hover_bounds, |this, bounds| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left(bounds.origin.x)
-                        .top(bounds.origin.y)
-                        .w(bounds.size.width)
-                        .h(bounds.size.height)
-                        .border_1()
-                        .border_color(ring),
-                )
+                this.children(shadowed_frame(
+                    bounds,
+                    shadows.clone(),
+                    &image,
+                    viewport,
+                    ring,
+                ))
             })
             .when_some(preview_bounds, |this, bounds| {
                 let label_top = if bounds.origin.y >= px(28.) {
