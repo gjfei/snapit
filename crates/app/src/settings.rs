@@ -82,9 +82,11 @@ fn apply_changes(prev: &Config, next: &Config, cx: &mut App) {
         Controller::global(cx).update(cx, |controller, _| controller.reset_ocr_engine());
     }
     if prev.history != next.history {
-        HistoryStore::global(cx).update(cx, |history, cx| {
-            history.enforce_limits(cx);
-            cx.notify();
-        });
+        // The limit is not applied here on purpose. Every edit — including each
+        // click of the stepper — would prune immediately, and walking from 200
+        // down to 0 would delete entries at the stops in between (`0` itself
+        // means "keep everything"). Pruning happens when a capture is added and
+        // when the app starts, both of which read the settled limit.
+        HistoryStore::global(cx).update(cx, |_, cx| cx.notify());
     }
 }

@@ -97,17 +97,24 @@ impl HistoryView {
     fn render_header(&self, count: usize, bytes: u64, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let config = &AppSettings::get(cx).history;
-        let summary = if config.enabled {
+        let summary = if !config.enabled {
+            t!("history.summary.disabled", count = count).to_string()
+        } else if config.max_items == 0 {
+            // Zero keeps everything, so quoting a numeric cap would be a lie.
+            t!(
+                "history.summary.unlimited",
+                count = count,
+                size = format_bytes(bytes)
+            )
+            .to_string()
+        } else {
             t!(
                 "history.summary",
                 count = count,
                 size = format_bytes(bytes),
-                items = config.max_items,
-                mb = config.max_total_mb
+                items = config.max_items
             )
             .to_string()
-        } else {
-            t!("history.summary.disabled", count = count).to_string()
         };
         let dir = store.dir().to_path_buf();
         // Clearing wipes every entry, not just the ones the filter shows.
@@ -426,7 +433,9 @@ impl Render for HistoryView {
                 .into_any_element()
         } else {
             v_flex()
-                .id("history-list")
+                // Key the scroll container by filter so switching tabs starts
+                // at the top instead of keeping an offset from a longer list.
+                .id(SharedString::from(format!("history-list-{filter:?}")))
                 .flex_1()
                 .min_h_0()
                 .gap_2()

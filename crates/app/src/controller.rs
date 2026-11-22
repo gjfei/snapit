@@ -1044,9 +1044,15 @@ impl Controller {
             });
         }
         let recording = &AppSettings::get(cx).recording;
+        // GIF and MP4 are tuned separately: a palette container stays small at
+        // a low rate, while a video codec can afford a smoother one.
+        let fps = match format {
+            RecordFormat::Gif => recording.gif_fps,
+            RecordFormat::Mp4 => recording.mp4_fps,
+        };
         let (output, dest) = recording_paths(cx, format);
         let options = RecordOptions::default()
-            .with_fps(recording.fps)
+            .with_fps(fps)
             .with_max_duration(Duration::from_secs(recording.max_duration_secs.into()))
             .with_max_width(Some(selection.size.width.as_f32().round().max(1.0) as u32))
             .with_format(format)

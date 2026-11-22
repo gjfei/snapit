@@ -475,6 +475,37 @@ impl SettingsView {
                             .default_value(defaults.capture.element_snap),
                         )
                         .description(t!("settings.element_snap.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.mask_opacity").to_string(),
+                            SettingField::number_input(
+                                NumberFieldOptions {
+                                    min: 0.,
+                                    max: 100.,
+                                    step: 5.,
+                                },
+                                |cx: &App| AppSettings::get(cx).capture.mask_opacity as f64,
+                                |value: f64, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.capture.mask_opacity = value.round() as u8
+                                    })
+                                },
+                            )
+                            .default_value(defaults.capture.mask_opacity as f64),
+                        )
+                        .description(t!("settings.mask_opacity.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.selection_shadow").to_string(),
+                            SettingField::switch(
+                                |cx: &App| AppSettings::get(cx).capture.selection_shadow,
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.capture.selection_shadow = value
+                                    })
+                                },
+                            )
+                            .default_value(defaults.capture.selection_shadow),
+                        )
+                        .description(t!("settings.selection_shadow.desc").to_string()),
                     ]),
             )
     }
@@ -490,23 +521,41 @@ impl SettingsView {
                     .title(t!("settings.group.recording").to_string())
                     .items([
                         SettingItem::new(
-                            t!("settings.fps").to_string(),
+                            t!("settings.fps.gif").to_string(),
                             SettingField::number_input(
                                 NumberFieldOptions {
                                     min: min_fps as f64,
                                     max: max_fps as f64,
                                     step: 1.,
                                 },
-                                |cx: &App| AppSettings::get(cx).recording.fps as f64,
+                                |cx: &App| AppSettings::get(cx).recording.gif_fps as f64,
                                 |value: f64, cx: &mut App| {
                                     AppSettings::update(cx, |config| {
-                                        config.recording.fps = value.round() as u32
+                                        config.recording.gif_fps = value.round() as u32
                                     })
                                 },
                             )
-                            .default_value(defaults.fps as f64),
+                            .default_value(defaults.gif_fps as f64),
                         )
-                        .description(t!("settings.fps.desc").to_string()),
+                        .description(t!("settings.fps.gif.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.fps.mp4").to_string(),
+                            SettingField::number_input(
+                                NumberFieldOptions {
+                                    min: min_fps as f64,
+                                    max: max_fps as f64,
+                                    step: 1.,
+                                },
+                                |cx: &App| AppSettings::get(cx).recording.mp4_fps as f64,
+                                |value: f64, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.recording.mp4_fps = value.round() as u32
+                                    })
+                                },
+                            )
+                            .default_value(defaults.mp4_fps as f64),
+                        )
+                        .description(t!("settings.fps.mp4.desc").to_string()),
                         SettingItem::new(
                             t!("settings.max_duration").to_string(),
                             SettingField::number_input(
@@ -599,8 +648,8 @@ impl SettingsView {
                             t!("settings.history.max_items").to_string(),
                             SettingField::number_input(
                                 NumberFieldOptions {
-                                    min: 1.,
-                                    max: 10_000.,
+                                    min: 0.,
+                                    max: 100_000.,
                                     step: 10.,
                                 },
                                 |cx: &App| AppSettings::get(cx).history.max_items as f64,
@@ -613,24 +662,6 @@ impl SettingsView {
                             .default_value(defaults.max_items as f64),
                         )
                         .description(t!("settings.history.max_items.desc").to_string()),
-                        SettingItem::new(
-                            t!("settings.history.max_size").to_string(),
-                            SettingField::number_input(
-                                NumberFieldOptions {
-                                    min: 1.,
-                                    max: 100_000.,
-                                    step: 64.,
-                                },
-                                |cx: &App| AppSettings::get(cx).history.max_total_mb as f64,
-                                |value: f64, cx: &mut App| {
-                                    AppSettings::update(cx, |config| {
-                                        config.history.max_total_mb = value.round() as u64
-                                    })
-                                },
-                            )
-                            .default_value(defaults.max_total_mb as f64),
-                        )
-                        .description(t!("settings.history.max_size.desc").to_string()),
                         SettingItem::new(
                             t!("settings.history.view").to_string(),
                             SettingField::render(|options, _, cx| {

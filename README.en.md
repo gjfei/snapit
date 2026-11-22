@@ -31,7 +31,7 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **Text recognition**: recognizes the selection and copies the text when it can; the results panel lets you copy again, and the text is stored in history.
 - **GIF / MP4 recording**: two separate actions with their own shortcut and tray entry — a GIF drops straight into a chat, an MP4 goes through the system hardware encoder and stays small and smooth. Both show a progress bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.
 - **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧O` recognize text, `⌥⇧G` record a GIF, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
-- **History**: copy, save, pin, OCR and recorded GIFs / videos are all saved automatically, pruned by item count and disk usage.
+- **History**: copy, save, pin, OCR and recorded GIFs / videos are all saved automatically, pruned by item count (0 keeps everything).
 - **Permission guidance**: when macOS screen recording or accessibility access is missing, SnapIt opens a permissions panel that explains what each one is for and links to System Settings.
 - **Small and native**: a single executable, light / dark themes that follow the system, Simplified Chinese and English UI.
 
@@ -172,7 +172,7 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 </p>
 <p align="center"><sub>Recorded GIF (fictional demo content): changes inside the selection captured frame by frame</sub></p>
 
-The format comes from the entry point — the GIF shortcut, tray item and film button write a GIF; the video ones write an MP4 — so there is no default format to pick. Recording options live in **Settings → Recording**: 1–30 fps (default 12), 0–600 seconds (default 0, unlimited), whether to record the mouse pointer (off by default, macOS only). Consecutive identical frames are dropped, and output is scaled to the selection's logical width so HiDPI captures stay small.
+The format comes from the entry point — the GIF shortcut, tray item and film button write a GIF; the video ones write an MP4 — so there is no default format to pick. Recording options live in **Settings → Recording**: GIF frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), 0–600 seconds (default 0, unlimited), whether to record the mouse pointer (off by default, macOS only). The two containers keep separate frame rates: a palette-based GIF saves more by staying slow, while MP4 goes through a video encoder and can afford a higher rate. Consecutive identical frames are dropped, and output is scaled to the selection's logical width so HiDPI captures stay small.
 
 Each recording writes exactly one file, but GIF and MP4 entries coexist in history. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows), so no codec has to be installed; GIF is encoded in pure Rust and plays anywhere. Both stream to disk while recording: on macOS ScreenCaptureKit scales physical-pixel frames down to the selection's logical size during capture (Windows and the fallback path use an integer box mean), and a GIF shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. That is why stopping takes almost no time and long recordings do not slow down the way per-frame re-quantisation does. H.264 needs even dimensions, so an MP4 can be up to one pixel narrower or shorter than the selection.
 
@@ -192,7 +192,7 @@ Click Pin in the overlay toolbar, choose Pin Last Capture in the tray, or pick P
 
 ### History
 
-Copying, saving, pinning, OCR and recording all store a copy in history (disable this in **Settings → History**). By default history keeps at most 200 entries and 512 MB; older entries are removed first.
+Copying, saving, pinning, OCR and recording all store a copy in history (disable this in **Settings → History**). By default history keeps at most 200 entries, removing the oldest first; set **Max entries** to 0 to keep everything.
 
 <p align="center">
   <img src="assets/screenshots/en/history.png" width="820" alt="History panel">
@@ -207,10 +207,10 @@ The history panel has **All / Screenshots / Recordings** filters at the top; the
 | --- | --- |
 | General | Language (follow system / Simplified Chinese / English), theme (follow system / light / dark), launch at login |
 | Shortcuts | Global shortcuts for capture, text recognition, GIF and video recording |
-| Capture | Default save directory, image format (PNG / JPEG), JPG quality, window snapping, element snapping |
+| Capture | Default save directory, image format (PNG / JPEG), JPG quality, window snapping, element snapping, dim mask strength, selection drop shadow |
 | Recording | Frame rate, maximum duration, cursor |
 | Text Recognition | Recognition language |
-| History | Enable saving, maximum entries, maximum disk usage, and a button to open the history panel |
+| History | Enable saving, maximum entries (0 = unlimited), and a button to open the history panel |
 | About | Config file path and Reveal in Folder |
 
 <p align="center">

@@ -410,6 +410,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unbounded_count_keeps_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::open(dir.path()).unwrap();
+        let limits = Limits::new(usize::MAX, u64::MAX);
+        for i in 0..20 {
+            add(&mut history, i, limits);
+        }
+        assert_eq!(history.len(), 20);
+    }
+
+    #[test]
     fn prunes_oldest_beyond_count() {
         let dir = tempfile::tempdir().unwrap();
         let mut history = History::open(dir.path()).unwrap();

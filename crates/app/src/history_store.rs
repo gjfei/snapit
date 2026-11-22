@@ -96,12 +96,14 @@ impl HistoryStore {
 
     fn limits(cx: &App) -> Option<Limits> {
         let config = &AppSettings::get(cx).history;
-        config.enabled.then(|| {
-            Limits::new(
-                config.max_items,
-                config.max_total_mb.saturating_mul(1024 * 1024),
-            )
-        })
+        // `0` means "keep every capture"; the store expresses that as an
+        // unbounded count limit rather than a special case of its own.
+        let max_items = if config.max_items == 0 {
+            usize::MAX
+        } else {
+            config.max_items
+        };
+        config.enabled.then(|| Limits::new(max_items, u64::MAX))
     }
 
     pub fn add_image(

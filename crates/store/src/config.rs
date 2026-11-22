@@ -119,6 +119,12 @@ pub struct CaptureConfig {
     pub window_snap: bool,
     /// Prefer the smallest accessibility element under the cursor.
     pub element_snap: bool,
+    /// Opacity (0-100) of the dim mask outside the selection. Higher values
+    /// make the selection stand out more against its surroundings.
+    pub mask_opacity: u8,
+    /// Draw a soft drop shadow around the selection to separate it further
+    /// from the dimmed background.
+    pub selection_shadow: bool,
 }
 
 impl CaptureConfig {
@@ -138,6 +144,8 @@ impl Default for CaptureConfig {
             jpeg_quality: 90,
             window_snap: true,
             element_snap: true,
+            mask_opacity: 45,
+            selection_shadow: true,
         }
     }
 }
@@ -146,7 +154,12 @@ impl Default for CaptureConfig {
 #[serde(default)]
 #[non_exhaustive]
 pub struct RecordingConfig {
-    pub fps: u32,
+    /// Frame rate for GIF recordings: a palette-based container where small
+    /// files matter more than smoothness.
+    pub gif_fps: u32,
+    /// Frame rate for MP4 recordings: a real video codec handles 30 fps well,
+    /// so MP4 is not held back by the GIF-friendly default.
+    pub mp4_fps: u32,
     pub max_duration_secs: u32,
     /// Container recorded last, so the overlay's single record button repeats
     /// it on a plain click. `"gif"` or `"mp4"`; anything else reads as GIF.
@@ -164,7 +177,8 @@ impl RecordingConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            fps: 12,
+            gif_fps: 12,
+            mp4_fps: 30,
             max_duration_secs: 0,
             last_format: "gif".into(),
             captures_cursor: false,
@@ -193,8 +207,8 @@ impl Default for OcrConfig {
 #[non_exhaustive]
 pub struct HistoryConfig {
     pub enabled: bool,
+    /// Entries to keep on disk. `0` keeps every capture.
     pub max_items: usize,
-    pub max_total_mb: u64,
 }
 
 impl Default for HistoryConfig {
@@ -202,7 +216,6 @@ impl Default for HistoryConfig {
         Self {
             enabled: true,
             max_items: 200,
-            max_total_mb: 512,
         }
     }
 }
@@ -473,12 +486,12 @@ impl Config {
     pub fn sanitize(&mut self) {
         let (min_fps, max_fps) = RecordingConfig::FPS_RANGE;
         let (min_secs, max_secs) = RecordingConfig::DURATION_RANGE;
-        self.recording.fps = self.recording.fps.clamp(min_fps, max_fps);
+        self.recording.gif_fps = self.recording.gif_fps.clamp(min_fps, max_fps);
+        self.recording.mp4_fps = self.recording.mp4_fps.clamp(min_fps, max_fps);
         self.recording.max_duration_secs =
             self.recording.max_duration_secs.clamp(min_secs, max_secs);
         self.capture.jpeg_quality = self.capture.jpeg_quality.clamp(1, 100);
-        self.history.max_items = self.history.max_items.max(1);
-        self.history.max_total_mb = self.history.max_total_mb.max(1);
+        self.capture.mask_opacity = self.capture.mask_opacity.min(100);
         if !matches!(self.general.language.as_str(), "auto" | "zh-CN" | "en") {
             self.general.language = GeneralConfig::default().language;
         }
@@ -589,6 +602,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mask_opacity_is_clamped_and_shadow_round_trips() {
+        let mut config =
+            Config::from_toml("[capture]\nmask_opacity = 250\nselection_shadow = false\n").unwrap();
+        assert_eq!(config.capture.mask_opacity, 100);
+        assert!(!config.capture.selection_shadow);
+        config.capture.mask_opacity = 45;
+        config.capture.selection_shadow = true;
+        let written = config.to_toml().unwrap();
+        let reopened = Config::from_toml(&written).unwrap();
+        assert_eq!(reopened.capture.mask_opacity, 45);
+        assert!(reopened.capture.selection_shadow);
+    }
+
+    #[test]
     fn first_run_writes_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/config.toml");
@@ -609,7 +636,8 @@ mod tests {
                 config.hotkeys.screenshot = "Ctrl+Shift+S".into();
                 config.capture.image_format = ImageFormat::Jpg;
                 config.capture.save_dir = Some(dir.path().join("shots"));
-                config.recording.fps = 15;
+                config.recording.gif_fps = 15;
+                config.recording.mp4_fps = 24;
                 config.recording.max_duration_secs = 60;
                 config.ocr.language = "zh-Hans".into();
                 config.history.max_items = 10;
@@ -622,7 +650,8 @@ mod tests {
         assert_eq!(reopened.config(), store.config());
         assert_eq!(reopened.config().general.theme, ThemePreference::Dark);
         assert_eq!(reopened.config().capture.image_format, ImageFormat::Jpg);
-        assert_eq!(reopened.config().recording.fps, 15);
+        assert_eq!(reopened.config().recording.gif_fps, 15);
+        assert_eq!(reopened.config().recording.mp4_fps, 24);
     }
 
     #[test]
@@ -664,13 +693,14 @@ mod tests {
     #[test]
     fn a_bad_colour_only_costs_its_own_field() {
         let config = Config::from_toml(
-            "[recording]\nfps = 20\n\
+            "[recording]\nmp4_fps = 20\n\
              [annotations.rect]\ncolor = \"ff00\"\nsize = 9\n\
              [annotations.arrow]\ncolor = 16711680\n",
         )
         .unwrap();
         // The rest of the file still loads instead of falling back wholesale.
-        assert_eq!(config.recording.fps, 20);
+        assert_eq!(config.recording.mp4_fps, 20);
+        assert_eq!(config.recording.gif_fps, RecordingConfig::default().gif_fps);
         assert_eq!(config.annotations.rect.size, 9);
         assert_eq!(
             config.annotations.rect.color,
@@ -695,8 +725,9 @@ mod tests {
 
     #[test]
     fn partial_file_fills_defaults() {
-        let config = Config::from_toml("[recording]\nfps = 20\n").unwrap();
-        assert_eq!(config.recording.fps, 20);
+        let config = Config::from_toml("[recording]\ngif_fps = 20\n").unwrap();
+        assert_eq!(config.recording.gif_fps, 20);
+        assert_eq!(config.recording.mp4_fps, RecordingConfig::default().mp4_fps);
         assert_eq!(
             config.recording.max_duration_secs,
             RecordingConfig::default().max_duration_secs
@@ -707,12 +738,14 @@ mod tests {
     #[test]
     fn out_of_range_values_are_clamped() {
         let config = Config::from_toml(
-            "[recording]\nfps = 500\nmax_duration_secs = 9999\n[history]\nmax_items = 0\n",
+            "[recording]\ngif_fps = 500\nmp4_fps = 500\nmax_duration_secs = 9999\n[history]\nmax_items = 0\n",
         )
         .unwrap();
-        assert_eq!(config.recording.fps, 30);
+        assert_eq!(config.recording.gif_fps, 30);
+        assert_eq!(config.recording.mp4_fps, 30);
         assert_eq!(config.recording.max_duration_secs, 600);
-        assert_eq!(config.history.max_items, 1);
+        // Zero is meaningful for history: it means "keep every capture".
+        assert_eq!(config.history.max_items, 0);
     }
 
     #[test]
@@ -758,5 +791,21 @@ mod tests {
             Config::from_toml(&written).unwrap().general.theme,
             ThemePreference::Dark
         );
+    }
+
+    #[test]
+    fn gif_and_mp4_frame_rates_are_independent() {
+        let mut config = Config::default();
+        config.recording.gif_fps = 10;
+        config.recording.mp4_fps = 28;
+        let written = config.to_toml().unwrap();
+        let reopened = Config::from_toml(&written).unwrap();
+        assert_eq!(reopened.recording.gif_fps, 10);
+        assert_eq!(reopened.recording.mp4_fps, 28);
+
+        // The pre-split `fps` key is gone for good: it is ignored instead of
+        // being folded into either container.
+        let old = Config::from_toml("[recording]\nfps = 20\n").unwrap();
+        assert_eq!(old.recording, RecordingConfig::default());
     }
 }
