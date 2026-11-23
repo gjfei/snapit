@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result, anyhow};
 pub use image::RgbaImage;
 use image::{ImageEncoder as _, ImageFormat, imageops};
 use xcap::Monitor;
-pub use xcap::{HdrImage, OutputSize};
+pub use xcap::{DynamicRange, HdrImage, OutputSize};
 
 mod elements;
 #[cfg(target_os = "macos")]
@@ -413,9 +413,17 @@ impl RegionCapturer {
 
 /// A frame from [`LiveRecorder`], cropped to the recorded region.
 pub struct LiveFrame {
-    pub image: RgbaImage,
+    pub data: LiveFrameData,
     /// Time since the recorder was created, on the recorder's own clock.
     pub timestamp: Duration,
+}
+
+/// The pixel payload of a live frame. A recorder delivers one variant for its
+/// whole session: HDR when the display and the platform support it and the
+/// caller asked for it, SDR otherwise.
+pub enum LiveFrameData {
+    Sdr(RgbaImage),
+    Hdr(HdrImage),
 }
 
 /// Outcome of waiting for the next frame.
@@ -437,7 +445,14 @@ pub struct LiveRecorder {
 
 impl LiveRecorder {
     pub fn start(monitor_id: u32, region: Region, fps: u32) -> Result<Self> {
-        Self::start_with(monitor_id, region, fps, false, OutputSize::Native)
+        Self::start_with(
+            monitor_id,
+            region,
+            fps,
+            false,
+            OutputSize::Native,
+            DynamicRange::Sdr,
+        )
     }
 
     /// `output_size` states the intent, not a pixel number: `Logical` asks for
@@ -445,12 +460,17 @@ impl LiveRecorder {
     /// `Native` for physical pixels. It is best-effort — DXGI ignores it and
     /// the platform may still deliver native frames — so callers must keep
     /// their own downscale as a fallback.
+    ///
+    /// `dynamic_range` is best-effort the same way: `Hdr` asks for extended
+    /// range frames where the display and platform support them, and the
+    /// recorder silently delivers SDR frames otherwise.
     pub fn start_with(
         monitor_id: u32,
         region: Region,
         fps: u32,
         captures_cursor: bool,
         output_size: OutputSize,
+        dynamic_range: DynamicRange,
     ) -> Result<Self> {
         let (monitor, region) = resolve_region(monitor_id, region)?;
         let options = xcap::VideoRecorderOptions::default()
@@ -465,7 +485,8 @@ impl LiveRecorder {
             // The overlay and the recording bar belong to this process; the
             // platform recorder must leave them out of the frames.
             .excludes_own_windows(true)
-            .output_size(output_size);
+            .output_size(output_size)
+            .dynamic_range(dynamic_range);
         let (recorder, frames) = monitor.video_recorder_with_options(options)?;
         recorder.start()?;
         Ok(Self { recorder, frames })
@@ -473,16 +494,22 @@ impl LiveRecorder {
 
     pub fn recv_timeout(&self, timeout: Duration) -> LiveFrameWait {
         match self.frames.recv_timeout(timeout) {
-            Ok(frame) => match RgbaImage::from_raw(frame.width, frame.height, frame.raw) {
-                Some(image) => LiveFrameWait::Frame(LiveFrame {
-                    image,
+            Ok(frame) => {
+                let data = match frame.hdr {
+                    Some(hdr) => LiveFrameData::Hdr(hdr),
+                    None => match RgbaImage::from_raw(frame.width, frame.height, frame.raw) {
+                        Some(image) => LiveFrameData::Sdr(image),
+                        None => {
+                            log::warn!("recorder delivered a frame with mismatched dimensions");
+                            return LiveFrameWait::Timeout;
+                        }
+                    },
+                };
+                LiveFrameWait::Frame(LiveFrame {
+                    data,
                     timestamp: frame.timestamp,
-                }),
-                None => {
-                    log::warn!("recorder delivered a frame with mismatched dimensions");
-                    LiveFrameWait::Timeout
-                }
-            },
+                })
+            }
             Err(RecvTimeoutError::Timeout) => LiveFrameWait::Timeout,
             Err(RecvTimeoutError::Disconnected) => LiveFrameWait::Disconnected,
         }

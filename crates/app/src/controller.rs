@@ -1068,7 +1068,9 @@ impl Controller {
             .with_max_duration(Duration::from_secs(recording.max_duration_secs.into()))
             .with_max_width(Some(selection.size.width.as_f32().round().max(1.0) as u32))
             .with_format(format)
-            .with_cursor(recording.captures_cursor);
+            .with_cursor(recording.captures_cursor)
+            // The recorder ignores this for GIF, which has no extended range.
+            .with_hdr(recording.hdr);
         // Keep the overlay on screen as the region highlight: drop the frozen
         // frame and the toolbar, keep the dim mask and the selection border.
         // The bar opens right away in its "starting" state; the recorder joins

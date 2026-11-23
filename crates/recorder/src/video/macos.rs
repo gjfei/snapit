@@ -1,6 +1,9 @@
 //! MP4 writing through `AVAssetWriter`, which drives the system H.264 encoder
 //! (VideoToolbox) and muxes the container. Frames are handed over as BGRA
 //! `CVPixelBuffer`s, the format the encoder converts most cheaply.
+//! Extended-range frames go to HEVC instead, as HDR10: 10-bit PQ BT.2020 in
+//! `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` buffers, with the colour
+//! signalling the container needs to tell a player to switch the display.
 
 use std::{
     path::Path,
@@ -16,21 +19,26 @@ use objc2::{AnyThread as _, Message};
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVFileTypeMPEG4,
     AVMediaTypeVideo, AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264,
-    AVVideoCompressionPropertiesKey, AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey,
-    AVVideoWidthKey,
+    AVVideoCodecTypeHEVC, AVVideoColorPrimaries_ITU_R_2020, AVVideoColorPrimariesKey,
+    AVVideoColorPropertiesKey, AVVideoCompressionPropertiesKey, AVVideoExpectedSourceFrameRateKey,
+    AVVideoHeightKey, AVVideoProfileLevelKey, AVVideoTransferFunction_SMPTE_ST_2084_PQ,
+    AVVideoTransferFunctionKey, AVVideoWidthKey, AVVideoYCbCrMatrix_ITU_R_2020,
+    AVVideoYCbCrMatrixKey,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::CMTime;
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-    kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
+    CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
 use objc2_foundation::{NSMutableDictionary, NSNumber, NSString, NSURL};
-use snapit_capture::RgbaImage;
+use snapit_capture::{HdrImage, RgbaImage};
 
-use super::prepare;
-use crate::{FrameSink, RecordOptions};
+use super::{hdr, prepare};
+use crate::{FrameData, FrameSink, RecordOptions};
 
 /// The timescale presentation timestamps are expressed in; 600 is what
 /// AVFoundation uses for the movie itself.
@@ -224,7 +232,13 @@ impl Mp4Sink {
 unsafe impl Send for Mp4Sink {}
 
 impl FrameSink for Mp4Sink {
-    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+        // `open` only routes SDR frames here; tonemapping keeps the sink
+        // correct for a caller that hands it an extended-range frame.
+        let frame = match frame {
+            FrameData::Sdr(image) => image,
+            FrameData::Hdr(hdr) => Arc::new(hdr.to_sdr()),
+        };
         // Keep the scaled frame, not the full-resolution capture: finish()
         // needs one more sample, and cloning the capture (or scaling it again)
         // would mean another pass over four times as many pixels.
@@ -281,6 +295,323 @@ impl FrameSink for Mp4Sink {
     }
 }
 
+/// The MP4 backend for these frames: HEVC Main10 for extended range, H.264 for
+/// 8-bit. A Mac without a working 10-bit HEVC encoder gets the SDR recording it
+/// would have got without the HDR option, from a file recreated from scratch.
+pub(crate) fn open(
+    output: &Path,
+    options: &RecordOptions,
+    first: &FrameData,
+) -> Result<Box<dyn FrameSink>> {
+    match first {
+        FrameData::Sdr(image) => Ok(Box::new(Mp4Sink::new(output, options, image)?)),
+        FrameData::Hdr(hdr) => match HdrMp4Sink::new(output, options, hdr) {
+            Ok(sink) => Ok(Box::new(sink)),
+            Err(err) => {
+                log::warn!("HEVC Main10 encoder unavailable, recording SDR: {err:#}");
+                let _ = std::fs::remove_file(output);
+                Ok(Box::new(Mp4Sink::new(output, options, &hdr.to_sdr())?))
+            }
+        },
+    }
+}
+
+/// HDR10: PQ BT.2020 in 10-bit 4:2:0, encoded by the system HEVC encoder.
+pub(crate) struct HdrMp4Sink {
+    writer: Retained<AVAssetWriter>,
+    input: Retained<AVAssetWriterInput>,
+    adaptor: Retained<AVAssetWriterInputPixelBufferAdaptor>,
+    width: usize,
+    height: usize,
+    max_width: Option<u32>,
+    /// The converter's output buffers. They still hold the frame that was
+    /// encoded last, which is what the closing still sample needs — so, unlike
+    /// the SDR sink, nothing has to be kept per frame.
+    y: Vec<u8>,
+    uv: Vec<u8>,
+    last_at: Option<Duration>,
+    frames: usize,
+    t_scale: Duration,
+    t_convert: Duration,
+    t_buffer: Duration,
+    t_copy: Duration,
+    t_wait: Duration,
+    t_append: Duration,
+}
+
+unsafe impl Send for HdrMp4Sink {}
+
+impl HdrMp4Sink {
+    fn new(path: &Path, options: &RecordOptions, probe: &HdrImage) -> Result<Self> {
+        let first = hdr::prepare(probe, options.max_width);
+        let (width, height) = (first.width(), first.height());
+        let (y_len, uv_len) = hdr::plane_lens(width, height);
+        let (width_usize, height_usize) = (width as usize, height as usize);
+
+        let url = NSString::from_str(&path.to_string_lossy());
+        let url = NSURL::fileURLWithPath(&url);
+        let writer = unsafe {
+            AVAssetWriter::initWithURL_fileType_error(
+                AVAssetWriter::alloc(),
+                &url,
+                AVFileTypeMPEG4.ok_or_else(|| anyhow!("MPEG-4 file type unavailable"))?,
+            )
+        }
+        .map_err(|err| anyhow!("failed to open {}: {err}", path.display()))?;
+
+        let settings = NSMutableDictionary::<NSString, AnyObject>::new();
+        let compression = NSMutableDictionary::<NSString, AnyObject>::new();
+        let color = NSMutableDictionary::<NSString, AnyObject>::new();
+        unsafe {
+            compression.insert(
+                AVVideoAverageBitRateKey.ok_or_else(|| anyhow!("missing bit rate key"))?,
+                any(&*NSNumber::new_u32(bitrate(width, height, options))),
+            );
+            compression.insert(
+                AVVideoExpectedSourceFrameRateKey
+                    .ok_or_else(|| anyhow!("missing frame rate key"))?,
+                any(&*NSNumber::new_u32(options.fps.max(1))),
+            );
+            // Without this the system encoder accepted the 10-bit buffers and
+            // still wrote an 8-bit Main stream (profile_idc 1, both SPS bit
+            // depths 0), which no player treats as HDR. The value is
+            // `kVTProfileLevel_HEVC_Main10_AutoLevel` from
+            // VideoToolbox/VTCompressionProperties.h, which AVFoundation
+            // documents as usable for this key.
+            compression.insert(
+                AVVideoProfileLevelKey.ok_or_else(|| anyhow!("missing profile level key"))?,
+                any(&*NSString::from_str("HEVC_Main10_AutoLevel")),
+            );
+            settings.insert(
+                AVVideoCodecKey.ok_or_else(|| anyhow!("missing codec key"))?,
+                any(AVVideoCodecTypeHEVC.ok_or_else(|| anyhow!("HEVC unavailable"))?),
+            );
+            settings.insert(
+                AVVideoWidthKey.ok_or_else(|| anyhow!("missing width key"))?,
+                any(&*NSNumber::new_u32(width)),
+            );
+            settings.insert(
+                AVVideoHeightKey.ok_or_else(|| anyhow!("missing height key"))?,
+                any(&*NSNumber::new_u32(height)),
+            );
+            settings.insert(
+                AVVideoCompressionPropertiesKey
+                    .ok_or_else(|| anyhow!("missing compression key"))?,
+                any(&*compression),
+            );
+            // The colour signalling is a top-level setting: it is what makes
+            // the muxer write the `colr` box a player needs to switch the
+            // display to HDR mode. VideoToolbox picks the Main10 profile from
+            // the 10-bit buffers, so no profile key is set.
+            color.insert(
+                AVVideoColorPrimariesKey.ok_or_else(|| anyhow!("missing primaries key"))?,
+                any(AVVideoColorPrimaries_ITU_R_2020
+                    .ok_or_else(|| anyhow!("BT.2020 unavailable"))?),
+            );
+            color.insert(
+                AVVideoTransferFunctionKey.ok_or_else(|| anyhow!("missing transfer key"))?,
+                any(AVVideoTransferFunction_SMPTE_ST_2084_PQ
+                    .ok_or_else(|| anyhow!("PQ unavailable"))?),
+            );
+            color.insert(
+                AVVideoYCbCrMatrixKey.ok_or_else(|| anyhow!("missing matrix key"))?,
+                any(AVVideoYCbCrMatrix_ITU_R_2020
+                    .ok_or_else(|| anyhow!("2020 matrix unavailable"))?),
+            );
+            settings.insert(
+                AVVideoColorPropertiesKey.ok_or_else(|| anyhow!("missing color key"))?,
+                any(&*color),
+            );
+        }
+
+        let input = unsafe {
+            AVAssetWriterInput::initWithMediaType_outputSettings_sourceFormatHint(
+                AVAssetWriterInput::alloc(),
+                AVMediaTypeVideo.ok_or_else(|| anyhow!("video media type unavailable"))?,
+                Some(&settings),
+                None,
+            )
+        };
+        unsafe { input.setExpectsMediaDataInRealTime(true) };
+
+        if !unsafe { writer.canAddInput(&input) } {
+            bail!("the HEVC encoder rejected the {width}x{height} input");
+        }
+        unsafe { writer.addInput(&input) };
+
+        let adaptor = unsafe {
+            AVAssetWriterInputPixelBufferAdaptor::initWithAssetWriterInput_sourcePixelBufferAttributes(
+                AVAssetWriterInputPixelBufferAdaptor::alloc(),
+                &input,
+                None,
+            )
+        };
+
+        if !unsafe { writer.startWriting() } {
+            bail!("failed to start writing: {}", status(&writer));
+        }
+        unsafe { writer.startSessionAtSourceTime(CMTime::with_seconds(0.0, TIMESCALE)) };
+
+        Ok(Self {
+            writer,
+            input,
+            adaptor,
+            width: width_usize,
+            height: height_usize,
+            max_width: options.max_width,
+            y: vec![0u8; y_len],
+            uv: vec![0u8; uv_len],
+            last_at: None,
+            frames: 0,
+            t_scale: Duration::ZERO,
+            t_convert: Duration::ZERO,
+            t_buffer: Duration::ZERO,
+            t_copy: Duration::ZERO,
+            t_wait: Duration::ZERO,
+            t_append: Duration::ZERO,
+        })
+    }
+
+    /// Copy the planes into a fresh 10-bit buffer and hand it to the encoder.
+    fn append_planes(&mut self, at: Duration) -> Result<()> {
+        let buffer_started = Instant::now();
+        let buffer = planar_pixel_buffer(self.width, self.height)?;
+        self.t_buffer += buffer_started.elapsed();
+        let copy_started = Instant::now();
+        if unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) } != 0 {
+            bail!("failed to lock the pixel buffer");
+        }
+        let row = self.width * 2;
+        unsafe {
+            for (plane, source) in [(0usize, &self.y[..]), (1, &self.uv[..])] {
+                let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane) as *mut u8;
+                if base.is_null() {
+                    CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0));
+                    bail!("the 10-bit pixel buffer has no plane {plane}");
+                }
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane);
+                for (y, line) in source.chunks_exact(row).enumerate() {
+                    let dst = std::slice::from_raw_parts_mut(base.add(y * stride), row);
+                    dst.copy_from_slice(line);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0));
+        }
+        self.t_copy += copy_started.elapsed();
+
+        let wait_started = Instant::now();
+        let mut spins = 0;
+        while !unsafe { self.input.isReadyForMoreMediaData() } {
+            if spins > 2_000 {
+                bail!("the encoder stopped accepting frames");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            spins += 1;
+        }
+        self.t_wait += wait_started.elapsed();
+
+        let append_started = Instant::now();
+        let time = unsafe { CMTime::with_seconds(at.as_secs_f64(), TIMESCALE) };
+        let appended = unsafe {
+            self.adaptor
+                .appendPixelBuffer_withPresentationTime(&buffer, time)
+        };
+        self.t_append += append_started.elapsed();
+        if !appended {
+            bail!("failed to append a frame: {}", status(&self.writer));
+        }
+        self.frames += 1;
+        self.last_at = Some(at);
+        Ok(())
+    }
+}
+
+impl FrameSink for HdrMp4Sink {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+        let FrameData::Hdr(hdr) = frame else {
+            bail!("the HEVC Main10 sink only accepts extended-range frames");
+        };
+        let scaled_started = Instant::now();
+        let scaled = hdr::prepare(&hdr, self.max_width);
+        self.t_scale += scaled_started.elapsed();
+        // The plane buffers are sized for the first frame; a mid-recording
+        // resolution change must error like the SDR sink, not silently write a
+        // partial frame into them.
+        if scaled.width() as usize != self.width || scaled.height() as usize != self.height {
+            bail!(
+                "frame is {}x{}, encoder expects {}x{}",
+                scaled.width(),
+                scaled.height(),
+                self.width,
+                self.height
+            );
+        }
+        let convert_started = Instant::now();
+        hdr::convert_into(&scaled, &mut self.y, &mut self.uv);
+        self.t_convert += convert_started.elapsed();
+        self.append_planes(at)
+    }
+
+    fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        let closing_started = Instant::now();
+        let mut closing = Duration::ZERO;
+        if let Some(at) = self.last_at
+            && end > at
+        {
+            // CMTime quantizes seconds to 1/600 s, so the closing sample has to
+            // clear the last presentation time by more than a millisecond.
+            let hold = end
+                .saturating_sub(Duration::from_millis(1))
+                .max(at + Duration::from_millis(2));
+            self.append_planes(hold)?;
+            closing = closing_started.elapsed();
+        }
+        unsafe { self.input.markAsFinished() };
+        let finish_started = Instant::now();
+        #[allow(deprecated)]
+        let finished = unsafe { self.writer.finishWriting() };
+        let finished_in = finish_started.elapsed();
+        if !finished {
+            bail!("failed to finish the video: {}", status(&self.writer));
+        }
+        log::info!("encoded {} HDR frames to MP4", self.frames);
+        log::info!(
+            target: "timing",
+            "mp4 hdr sink: {} frames, scale {:.1} ms, convert {:.1} ms, buffer {:.1} ms, copy {:.1} ms, encoder wait {:.1} ms, append {:.1} ms; closing sample {:.1} ms, finishWriting {:.1} ms",
+            self.frames,
+            crate::ms(self.t_scale),
+            crate::ms(self.t_convert),
+            crate::ms(self.t_buffer),
+            crate::ms(self.t_copy),
+            crate::ms(self.t_wait),
+            crate::ms(self.t_append),
+            crate::ms(closing),
+            crate::ms(finished_in)
+        );
+        Ok(())
+    }
+}
+
+/// A 10-bit 4:2:0 video-range buffer, the layout `hdr::convert` produces.
+fn planar_pixel_buffer(width: usize, height: usize) -> Result<CFRetained<CVPixelBuffer>> {
+    let mut raw: *mut CVPixelBuffer = std::ptr::null_mut();
+    let status = unsafe {
+        CVPixelBufferCreate(
+            None,
+            width,
+            height,
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            None,
+            NonNull::from(&mut raw),
+        )
+    };
+    if status != 0 {
+        bail!("CVPixelBufferCreate failed with {status}");
+    }
+    let raw = NonNull::new(raw).ok_or_else(|| anyhow!("CVPixelBufferCreate returned null"))?;
+    Ok(unsafe { CFRetained::from_raw(raw) })
+}
+
 /// Bits per second for a screen recording: screen content compresses far
 /// better than camera footage, so this sits below the usual 0.1 bpp ladder.
 fn bitrate(width: u32, height: u32, options: &RecordOptions) -> u32 {
@@ -328,4 +659,78 @@ fn status(writer: &AVAssetWriter) -> String {
 /// object shares the layout of an opaque pointer, so the cast is a no-op.
 fn any<T: Message>(object: &T) -> &AnyObject {
     unsafe { &*(object as *const T as *const AnyObject) }
+}
+
+#[cfg(test)]
+mod hdr_sink_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::RecordFormat;
+    use crate::video::hdr::synth_solid;
+
+    /// Encode synthetic extended-range frames through the real AVAssetWriter
+    /// pipeline and read the container back. The frames are built by hand, so
+    /// this checks the HEVC Main10 path on a machine whose display need not be
+    /// in HDR mode. Run it with
+    /// `cargo test -p snapit-recorder hdr_sink -- --ignored`, then play the
+    /// file it names.
+    #[test]
+    #[ignore = "encodes with the system HEVC encoder and writes a file"]
+    fn main10_sink_writes_an_hdr10_container() {
+        let path = std::env::temp_dir().join("snapit-main10-macos-test.mp4");
+        let _ = std::fs::remove_file(&path);
+        let options = RecordOptions::default()
+            .with_format(RecordFormat::Mp4)
+            .with_fps(15)
+            .with_hdr(true);
+        // A hard cut between colours each frame, so the encoder has real
+        // motion to encode rather than one infinite-length P frame.
+        let colours = [[1.0, 1.0, 1.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
+        let (width, height) = (320, 200);
+        let first = FrameData::Hdr(Arc::new(synth_solid(width, height, colours[0], 203.0)));
+        let mut sink = open(&path, &options, &first).expect("mp4 sink");
+
+        for (index, colour) in colours.into_iter().cycle().take(10).enumerate() {
+            let frame = FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)));
+            sink.push(frame, Duration::from_millis(index as u64 * 66))
+                .expect("push");
+        }
+        sink.finish(Duration::from_millis(700)).expect("finalize");
+
+        let bytes = std::fs::read(&path).expect("the encoder wrote nothing");
+        println!("{}: {} bytes", path.display(), bytes.len());
+        assert!(
+            bytes.len() > 1024,
+            "a 10-frame clip cannot be {} bytes",
+            bytes.len()
+        );
+        let hvc = find(&bytes, b"hvcC").expect("no hvcC: the file is not HEVC");
+        // `find` lands on the box type; the payload follows it. Byte 1 holds
+        // profile_space (2 bits) | tier (1) | profile_idc (5), and the SPS bit
+        // depths sit 16 and 17 bytes into the payload, biased by 8.
+        assert_eq!(bytes[hvc + 5] & 0x7f, 2, "HEVC profile must be Main 10");
+        assert_eq!(
+            (bytes[hvc + 21] & 0x07, bytes[hvc + 22] & 0x07),
+            (2, 2),
+            "both planes must be 10-bit"
+        );
+
+        // AVFoundation writes this box from AVVideoColorPropertiesKey; without
+        // it a player shows the PQ stream as dull SDR and never switches the
+        // display into HDR mode. `find` lands on the box type, so `nclx`
+        // follows it and the three code points start four bytes later.
+        let colr = find(&bytes, b"colrnclx").expect("no colr/nclx box in the file");
+        let nclx = &bytes[colr + 8..colr + 15];
+        println!("colr nclx payload: {nclx:02x?}");
+        assert_eq!(&nclx[0..2], &[0x00, 0x09], "expected BT.2020 primaries");
+        assert_eq!(&nclx[2..4], &[0x00, 0x10], "expected the PQ transfer");
+        assert_eq!(&nclx[4..6], &[0x00, 0x09], "expected the BT.2020 matrix");
+        // The encoder is told video range, so the full-range flag must be 0.
+        assert_eq!(nclx[6] & 0x80, 0, "expected video range");
+    }
+
+    fn find(bytes: &[u8], tag: &[u8]) -> Option<usize> {
+        bytes.windows(tag.len()).position(|window| window == tag)
+    }
 }

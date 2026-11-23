@@ -165,6 +165,9 @@ pub struct RecordingConfig {
     /// it on a plain click. `"gif"` or `"mp4"`; anything else reads as GIF.
     pub last_format: String,
     pub captures_cursor: bool,
+    /// Capture and encode MP4 in HDR10 when the display is an HDR panel. GIF
+    /// has no extended range, so this only applies to the MP4 container.
+    pub hdr: bool,
 }
 
 impl RecordingConfig {
@@ -182,6 +185,7 @@ impl Default for RecordingConfig {
             max_duration_secs: 0,
             last_format: "gif".into(),
             captures_cursor: false,
+            hdr: true,
         }
     }
 }

@@ -587,6 +587,17 @@ impl SettingsView {
                             .default_value(defaults.captures_cursor),
                         )
                         .description(t!("settings.capture_cursor.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.recording_hdr").to_string(),
+                            SettingField::switch(
+                                |cx: &App| AppSettings::get(cx).recording.hdr,
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| config.recording.hdr = value)
+                                },
+                            )
+                            .default_value(defaults.hdr),
+                        )
+                        .description(t!("settings.recording_hdr.desc").to_string()),
                     ]),
             )
     }

@@ -37,7 +37,10 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use color_quant::NeuQuant;
 use gif::Repeat;
-use snapit_capture::{LiveFrameWait, LiveRecorder, OutputSize, Region, RegionCapturer, RgbaImage};
+use snapit_capture::{
+    DynamicRange, HdrImage, LiveFrameData, LiveFrameWait, LiveRecorder, OutputSize, Region,
+    RegionCapturer, RgbaImage,
+};
 
 mod video;
 
@@ -99,6 +102,9 @@ pub struct RecordOptions {
     pub format: RecordFormat,
     /// Draw the mouse cursor. macOS only; Windows duplication excludes it.
     pub captures_cursor: bool,
+    /// Capture and encode extended-range frames. MP4 only, and best-effort: a
+    /// display without HDR support keeps recording 8-bit SDR as before.
+    pub hdr: bool,
 }
 
 impl Default for RecordOptions {
@@ -110,6 +116,7 @@ impl Default for RecordOptions {
             max_width: None,
             format: RecordFormat::default(),
             captures_cursor: false,
+            hdr: false,
         }
     }
 }
@@ -143,6 +150,11 @@ impl RecordOptions {
 
     pub fn with_cursor(mut self, captures_cursor: bool) -> Self {
         self.captures_cursor = captures_cursor;
+        self
+    }
+
+    pub fn with_hdr(mut self, hdr: bool) -> Self {
+        self.hdr = hdr;
         self
     }
 }
@@ -394,11 +406,63 @@ impl Recorder {
 /// timestamp arrives; sharing the allocation avoids a full-frame copy per frame.
 pub(crate) trait FrameSink: Send {
     /// Encode one frame, shown from `at` until the next one.
-    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()>;
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()>;
 
     /// Flush the container. `end` is the recording's total duration, which is
     /// how long the last frame stays on screen.
     fn finish(self: Box<Self>, end: Duration) -> Result<()>;
+}
+
+/// The pixels of one frame: 8-bit SDR, or the extended-range samples an HDR
+/// display delivered. A recorder stays in one variant for its whole session —
+/// the platform either honours the HDR request or delivers SDR from the first
+/// frame — so a sink picks its encoder from the frame it is opened with and
+/// never has to handle the other kind.
+#[derive(Clone)]
+pub(crate) enum FrameData {
+    Sdr(Arc<RgbaImage>),
+    Hdr(Arc<HdrImage>),
+}
+
+impl From<LiveFrameData> for FrameData {
+    fn from(data: LiveFrameData) -> Self {
+        match data {
+            LiveFrameData::Sdr(image) => Self::Sdr(Arc::new(image)),
+            LiveFrameData::Hdr(hdr) => Self::Hdr(Arc::new(hdr)),
+        }
+    }
+}
+
+impl FrameData {
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Sdr(image) => image.dimensions(),
+            Self::Hdr(image) => (image.width(), image.height()),
+        }
+    }
+
+    /// Exact byte equality, the same rule the SDR path uses: a frame that only
+    /// differs in the low bits of a half-float sample is not a duplicate.
+    fn is_same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Sdr(a), Self::Sdr(b)) => {
+                a.dimensions() == b.dimensions() && a.as_raw() == b.as_raw()
+            }
+            (Self::Hdr(a), Self::Hdr(b)) => {
+                a.width() == b.width() && a.height() == b.height() && a.as_bytes() == b.as_bytes()
+            }
+            _ => false,
+        }
+    }
+
+    /// 8-bit pixels, for the history thumbnail and for a container that has no
+    /// HDR path.
+    fn to_sdr(&self) -> RgbaImage {
+        match self {
+            Self::Sdr(image) => (**image).clone(),
+            Self::Hdr(image) => image.to_sdr(),
+        }
+    }
 }
 
 /// A frame handed to the writer thread: the image plus how long it stays on
@@ -445,7 +509,13 @@ impl GifSink {
 }
 
 impl FrameSink for GifSink {
-    fn push(&mut self, frame: Arc<RgbaImage>, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+        let frame = match frame {
+            FrameData::Sdr(image) => image,
+            // The GIF container has no extended range, so an HDR session
+            // quantizes the tonemapped frames and loses only the highlights.
+            FrameData::Hdr(hdr) => Arc::new(hdr.to_sdr()),
+        };
         let sender = self
             .sender
             .as_ref()
@@ -866,11 +936,13 @@ fn past_duration_limit(elapsed: Duration, max: Duration) -> bool {
 fn open_sink(
     output: &Path,
     options: &RecordOptions,
-    first_frame: &RgbaImage,
+    first_frame: &FrameData,
 ) -> Result<Box<dyn FrameSink>> {
     Ok(match options.format {
         RecordFormat::Gif => Box::new(GifSink::new(output, options)?),
-        RecordFormat::Mp4 => Box::new(video::Mp4Sink::new(output, options, first_frame)?),
+        // The MP4 backend picks the container profile from the frames it is
+        // handed: HEVC Main10 for extended range, H.264 otherwise.
+        RecordFormat::Mp4 => video::open(output, options, first_frame)?,
     })
 }
 
@@ -923,12 +995,21 @@ fn capture_loop(
     } else {
         OutputSize::Logical
     };
+    // Extended range only pays for itself where the container can store it:
+    // a GIF has no HDR, so asking the compositor for half-float frames would
+    // only add tonemapping work on the capture thread.
+    let dynamic_range = if options.hdr && matches!(options.format, RecordFormat::Mp4) {
+        DynamicRange::Hdr
+    } else {
+        DynamicRange::Sdr
+    };
     let live = match LiveRecorder::start_with(
         monitor_id,
         region,
         options.fps,
         options.captures_cursor,
         output_size,
+        dynamic_range,
     ) {
         Ok(live) => live,
         Err(err) => {
@@ -941,7 +1022,7 @@ fn capture_loop(
     let mut sink: Option<Box<dyn FrameSink>> = None;
     let mut origin: Option<Duration> = None;
     let mut first: Option<RgbaImage> = None;
-    let mut previous: Option<Arc<RgbaImage>> = None;
+    let mut previous: Option<FrameData> = None;
     let mut pending_duplicate_at: Option<Duration> = None;
     // Presentation times must strictly increase: AVFoundation rejects two
     // samples sharing a time, and a resume can land a millisecond before the
@@ -951,7 +1032,7 @@ fn capture_loop(
 
     let mut push = |sink: &mut Box<dyn FrameSink>,
                     frames: &Arc<AtomicUsize>,
-                    image: Arc<RgbaImage>,
+                    image: FrameData,
                     at: Duration|
      -> Result<()> {
         sink.push(image, at)?;
@@ -986,33 +1067,34 @@ fn capture_loop(
                     last_at + Duration::from_millis(1)
                 };
                 last_at = at;
-                let image = Arc::new(frame.image);
+                let image = FrameData::from(frame.data);
                 if sink.is_none() {
                     // A/B evidence: the delivered size next to the selection's
                     // logical size shows whether the compositor honoured the
                     // hint. A mismatch only costs performance — `prepare`
                     // still scales native frames before they reach the sink.
+                    let (width, height) = image.dimensions();
+                    let range = match &image {
+                        FrameData::Hdr(_) => "hdr",
+                        FrameData::Sdr(_) => "sdr",
+                    };
                     log::debug!(
-                        "capture frame {}x{} (output size hint {:?}, logical selection {}x{})",
-                        image.width(),
-                        image.height(),
-                        output_size,
-                        logical_width,
-                        logical_height
+                        "capture frame {width}x{height} ({range}, output size hint \
+                         {output_size:?}, logical selection {logical_width}x{logical_height})"
                     );
                     sink = Some(open_sink(&output, &options, &image)?);
                 }
                 let sink = sink.as_mut().expect("sink was just created");
-                let is_duplicate = previous.as_ref().is_some_and(|prev| {
-                    prev.dimensions() == image.dimensions() && prev.as_raw() == image.as_raw()
-                });
+                let is_duplicate = previous
+                    .as_ref()
+                    .is_some_and(|prev| prev.is_same_as(&image));
                 if is_duplicate {
                     pending_duplicate_at = Some(at);
                 } else {
-                    push(sink, &frames, Arc::clone(&image), at)?;
+                    push(sink, &frames, image.clone(), at)?;
                     pending_duplicate_at = None;
                     if first.is_none() {
-                        first = Some((*image).clone());
+                        first = Some(image.to_sdr());
                     }
                     signal_ready(&mut ready, Ok(()));
                     previous = Some(image);
@@ -1033,21 +1115,23 @@ fn capture_loop(
     if sink.is_none() {
         // Windows duplication only reports changes, so a static screen can
         // yield no frame at all. Capture one now, only on this rare path: doing
-        // it at `start` cost ~10 ms on every recording for no benefit.
-        let probe = Arc::new(
+        // it at `start` cost ~10 ms on every recording for no benefit. The
+        // still screenshot is SDR, so this also decides an HDR session that
+        // never delivered a frame as an ordinary H.264 file.
+        let probe = FrameData::Sdr(Arc::new(
             RegionCapturer::new(monitor_id, region)?
                 .capture()
                 .context("failed to capture region")?,
-        );
+        ));
         let mut created = open_sink(&output, &options, &probe)?;
-        push(&mut created, &frames, Arc::clone(&probe), Duration::ZERO)?;
-        first = Some((*probe).clone());
+        push(&mut created, &frames, probe.clone(), Duration::ZERO)?;
+        first = Some(probe.to_sdr());
         sink = Some(created);
     } else if let (Some(image), Some(timestamp), Some(created)) =
         (&previous, pending_duplicate_at, sink.as_mut())
     {
         // Keep the final still stretch visible for its real duration.
-        push(created, &frames, Arc::clone(image), timestamp)?;
+        push(created, &frames, image.clone(), timestamp)?;
     }
     let last_frame = closing.elapsed();
 
@@ -1104,6 +1188,11 @@ mod tests {
 
     use super::*;
     use std::sync::mpsc;
+
+    /// A frame as the capture loop hands it to a sink.
+    fn sdr(image: RgbaImage) -> FrameData {
+        FrameData::Sdr(Arc::new(image))
+    }
 
     #[test]
     fn zero_duration_never_expires() {
@@ -1227,11 +1316,8 @@ mod tests {
             }
         }
         for i in 0..8u64 {
-            sink.push(
-                Arc::new(frame.clone()),
-                Duration::from_secs_f64(i as f64 * 0.1),
-            )
-            .unwrap();
+            sink.push(sdr(frame.clone()), Duration::from_secs_f64(i as f64 * 0.1))
+                .unwrap();
         }
 
         let (tx, rx) = mpsc::channel();
@@ -1266,7 +1352,7 @@ mod tests {
         for i in 0..24u64 {
             let color = if i < 10 { 12 } else { 240 };
             sink.push(
-                Arc::new(RgbaImage::from_pixel(
+                sdr(RgbaImage::from_pixel(
                     64,
                     48,
                     image::Rgba([color, color, color, 255]),
@@ -1314,11 +1400,10 @@ mod tests {
                 lit.put_pixel(x, y, image::Rgba([240, 100, 5, 255]));
             }
         }
-        sink.push(Arc::new(base), Duration::ZERO).unwrap();
-        sink.push(Arc::new(lit.clone()), Duration::from_millis(100))
+        sink.push(sdr(base), Duration::ZERO).unwrap();
+        sink.push(sdr(lit.clone()), Duration::from_millis(100))
             .unwrap();
-        sink.push(Arc::new(lit), Duration::from_millis(200))
-            .unwrap();
+        sink.push(sdr(lit), Duration::from_millis(200)).unwrap();
         Box::new(sink).finish(Duration::from_millis(300)).unwrap();
 
         let file = File::open(&output).unwrap();

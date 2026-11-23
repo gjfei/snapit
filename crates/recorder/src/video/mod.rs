@@ -1,22 +1,32 @@
 //! MP4 encoding, one backend per platform.
 //!
-//! Each backend exposes a `Mp4Sink` with the same construction signature and
-//! implements the recorder's `FrameSink`, so the capture loop never learns which
-//! encoder it is feeding.
+//! Each backend exposes `open`, which returns the recorder's `FrameSink` for
+//! the frames it is handed — H.264 for 8-bit SDR, HEVC Main10 for the
+//! extended-range frames an HDR display delivers — so the capture loop never
+//! learns which encoder it is feeding.
 
 use std::borrow::Cow;
 
 use snapit_capture::RgbaImage;
 
+mod hdr;
+
+/// Media Foundation writes no `colr` box, so the finished file needs its HDR
+/// tagging added by hand. AVFoundation does it from `AVVideoColorPropertiesKey`.
+#[cfg(target_os = "windows")]
+mod mp4_colour;
+#[cfg(target_os = "windows")]
+pub(crate) use mp4_colour::Nclx;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub(crate) use macos::Mp4Sink;
+pub(crate) use macos::open;
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub(crate) use windows::Mp4Sink;
+pub(crate) use windows::open;
 
 /// Shrink a frame to `max_width`, keeping the aspect ratio, and crop it to even
 /// dimensions: H.264 subsamples chroma by two, so every encoder rejects odd
