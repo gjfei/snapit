@@ -103,6 +103,7 @@ pub fn hide(window: &mut Window) {
 /// drag started while a Ctrl-based hotkey is still held arrives here as a
 /// right click. `window.modifiers()` is fed from that rewritten event and is
 /// therefore unusable for this check; the live NSEvent flags are not.
+/// Only the macOS right-click paths call it, so it exists only on macOS.
 #[cfg(target_os = "macos")]
 fn control_key_held() -> bool {
     use objc2::msg_send;
@@ -115,11 +116,6 @@ fn control_key_held() -> bool {
     };
     let flags: usize = unsafe { msg_send![class, modifierFlags] };
     flags & NS_CONTROL_KEY_MASK != 0
-}
-
-#[cfg(not(target_os = "macos"))]
-fn control_key_held() -> bool {
-    false
 }
 
 pub struct OverlayView {
@@ -845,6 +841,9 @@ impl OverlayView {
             .update(cx, |session, cx| session.end_selection(cx));
     }
 
+    /// The ctrl+left rewrite is a macOS thing, so only macOS reads the event
+    /// and the window.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn on_right_click(
         &mut self,
         event: &MouseDownEvent,
@@ -876,6 +875,8 @@ impl OverlayView {
 
     /// macOS GPUI also rewrites ctrl+left *up* into a right up, so the regular
     /// `on_mouse_up(Left)` never closes a drag whose hotkey is still held.
+    /// Nothing to rewrite anywhere else, which leaves the parameters unread.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn on_right_mouse_up(
         &mut self,
         event: &MouseUpEvent,
