@@ -43,4 +43,10 @@ impl AppDirs {
     pub fn history_dir(&self) -> PathBuf {
         self.data_dir.join("history")
     }
+
+    /// Persistent diagnostic log. Kept beside history so `SNAPIT_HOME` and the
+    /// per-platform data root both contain everything needed to file a report.
+    pub fn log_file(&self) -> PathBuf {
+        self.data_dir.join("logs").join("snapit.log")
+    }
 }

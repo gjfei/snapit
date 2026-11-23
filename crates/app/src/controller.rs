@@ -90,18 +90,25 @@ struct ActiveRecording {
 }
 
 /// A cropped selection and its physical-to-logical pixel ratio.
+///
+/// `image` is the 8-bit SDR tone map used for the overlay, pins, OCR and the
+/// history thumbnail. `hdr` is the untouched 16-bit source behind it; when
+/// present, every durable export (Save, Copy, history) writes that HDR data so
+/// the three stay consistent. Both are `Arc` so cloning a capture is cheap.
 #[derive(Clone)]
 pub struct Captured {
     pub image: Arc<RgbaImage>,
+    pub hdr: Option<Arc<HdrImage>>,
     pub scale: f32,
 }
 
 impl Captured {
-    fn new(image: RgbaImage, selection: Bounds<Pixels>) -> Self {
+    fn new(image: RgbaImage, hdr: Option<HdrImage>, selection: Bounds<Pixels>) -> Self {
         let logical_width = selection.size.width.as_f32().max(1.0);
         Self {
             scale: (image.width() as f32 / logical_width).max(0.1),
             image: Arc::new(image),
+            hdr: hdr.map(Arc::new),
         }
     }
 }
@@ -453,6 +460,8 @@ impl Controller {
         if self.is_busy() {
             return;
         }
+        crate::logging::begin_capture();
+        log::info!("capture start: intent={intent:?}");
         self.busy = Some(Busy::Capturing);
         cx.notify();
 
@@ -463,6 +472,7 @@ impl Controller {
         let hdr_started = Instant::now();
         let hdr = snapit_capture::hdr_candidates();
         let hdr_ms = ms(hdr_started.elapsed());
+        log::info!("HDR candidates: {:?} ({} ms)", hdr, hdr_ms);
         let capture = cx.background_spawn(async move {
             let capture_started = Instant::now();
             let shots = session::capture_shots(&hdr)?;
@@ -732,18 +742,27 @@ impl Controller {
             command,
             SessionCommand::Copy | SessionCommand::Save | SessionCommand::Pin
         );
-        let want_hdr = matches!(command, SessionCommand::Save);
-        let (image, hdr, record_target) = active.session.update(cx, |session, _| {
+        // Every durable export (Save, Copy, history via remember, and Pin) plus
+        // OCR (which also indexes into history) must see the same HDR frame so
+        // all outputs stay consistent. Cancel/Record need no still HDR crop.
+        let want_hdr = matches!(
+            command,
+            SessionCommand::Copy
+                | SessionCommand::Save
+                | SessionCommand::Pin
+                | SessionCommand::Recognize
+        );
+        let (image, record_target) = active.session.update(cx, |session, _| {
             if bake {
                 session.finish_annotations();
             }
+            let hdr = if want_hdr { session.export_hdr() } else { None };
             let image = if bake {
                 session.export_selections()
             } else {
                 session.crop_selections()
             }
-            .map(|(image, bounds)| Captured::new(image, bounds));
-            let hdr = if want_hdr { session.export_hdr() } else { None };
+            .map(|(image, bounds)| Captured::new(image, hdr, bounds));
             let record_target = session.selected_frame().map(|(frame, bounds)| {
                 (
                     frame.monitor_id(),
@@ -753,7 +772,7 @@ impl Controller {
                     bounds,
                 )
             });
-            (image, hdr, record_target)
+            (image, record_target)
         });
         if let Some((_, _, display_id, _, _)) = record_target.as_ref() {
             self.last_display_id = *display_id;
@@ -779,11 +798,11 @@ impl Controller {
             (SessionCommand::Cancel, _) => {}
             (SessionCommand::Copy, Some(captured)) => {
                 self.remember(&captured, cx);
-                self.copy_image(captured.image, cx)
+                self.copy_image(captured, cx)
             }
             (SessionCommand::Save, Some(captured)) => {
                 self.remember(&captured, cx);
-                self.save_image(captured.image, hdr, cx)
+                self.save_image(captured, cx)
             }
             (SessionCommand::Pin, Some(captured)) => {
                 self.remember(&captured, cx);
@@ -853,9 +872,10 @@ impl Controller {
     /// Keep a capture for "pin last capture" and auto-save it to history.
     fn remember(&mut self, captured: &Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let (image, scale) = (captured.image.clone(), captured.scale);
-        HistoryStore::global(cx)
-            .update(cx, |history, cx| history.add_image(image, scale, None, cx));
+        let (image, hdr, scale) = (captured.image.clone(), captured.hdr.clone(), captured.scale);
+        HistoryStore::global(cx).update(cx, |history, cx| {
+            history.add_image(image, hdr, scale, None, cx)
+        });
     }
 
     /// Pin the most recent capture of this session, else the newest image in history.
@@ -870,15 +890,30 @@ impl Controller {
         }
     }
 
-    pub(crate) fn copy_image(&mut self, image: Arc<RgbaImage>, cx: &mut Context<Self>) {
-        let (width, height) = image.dimensions();
+    pub(crate) fn copy_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        let (width, height) = captured.image.dimensions();
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
             let encoded = Instant::now();
             let png = cx
                 .background_spawn(async move {
                     let started = Instant::now();
-                    let png = snapit_capture::encode_png(&image);
+                    // Put the same HDR data on the clipboard that Save and the
+                    // history original use. GPUI writes PNG bytes verbatim on
+                    // both platforms, so the 16-bit + cICP payload survives.
+                    let png = match captured.hdr.as_deref() {
+                        Some(hdr) => match snapit_capture::encode_png_hdr(hdr) {
+                            Ok(bytes) => {
+                                log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
+                                Ok(bytes)
+                            }
+                            Err(err) => {
+                                log::warn!("copy: HDR encode failed, falling back to SDR: {err:#}");
+                                snapit_capture::encode_png(&captured.image)
+                            }
+                        },
+                        None => snapit_capture::encode_png(&captured.image),
+                    };
                     log::info!(
                         target: "timing",
                         "copy: {width}x{height} PNG encode {:.1} ms",
@@ -924,12 +959,8 @@ impl Controller {
         .detach();
     }
 
-    pub(crate) fn save_image(
-        &mut self,
-        image: Arc<RgbaImage>,
-        hdr: Option<HdrImage>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn save_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        let Captured { image, hdr, .. } = captured;
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
         let name = format!("SnapIt {}.{}", timestamp(), format.extension());
@@ -943,26 +974,42 @@ impl Controller {
                     .ok();
                 return;
             };
-            let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
-                path.set_extension(format.extension());
-                format
-            });
-            let saved = cx
-                .background_spawn(async move {
-                    let writing = Instant::now();
-                    let result = match (format, hdr) {
-                        (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
-                        (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
-                        (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
-                    };
-                    log::info!(
-                        target: "timing",
-                        "save: encode+write {:.1} ms",
-                        ms(writing.elapsed())
-                    );
-                    result.map(|_| path)
-                })
-                .await;
+        let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
+            path.set_extension(format.extension());
+            format
+        });
+        let hdr_available = hdr.is_some();
+        log::info!(
+            "save image: format={format:?} hdr_available={hdr_available} path={}",
+            path.display()
+        );
+        let saved = cx
+            .background_spawn(async move {
+                let writing = Instant::now();
+                let branch = match (format, &hdr) {
+                    (SaveFormat::Png, Some(_)) => "HDR PNG (16-bit + cICP)",
+                    (SaveFormat::Png, None) => "SDR PNG (8-bit)",
+                    (SaveFormat::Jpg, _) => "JPEG (8-bit)",
+                };
+                log::info!("save branch: {branch}");
+                let result = match (format, hdr) {
+                    (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
+                    (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
+                    (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
+                };
+                log::info!(
+                    "save result: {} ({:.1} ms) {}",
+                    if result.is_ok() { "ok" } else { "FAILED" },
+                    ms(writing.elapsed()),
+                    if let Err(err) = &result {
+                        format!("error={err:#}")
+                    } else {
+                        String::new()
+                    }
+                );
+                result.map(|_| path)
+            })
+            .await;
             this.update(cx, |this, cx| {
                 match saved {
                     Ok(path) => this.inform(
@@ -983,7 +1030,11 @@ impl Controller {
 
     fn recognize(&mut self, captured: Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let Captured { image, scale } = captured;
+        let Captured {
+            image,
+            hdr,
+            scale,
+        } = captured;
         let history_image = image.clone();
         self.ocr = OcrState::Running;
         self.ocr_revision += 1;
@@ -1010,7 +1061,7 @@ impl Controller {
                     .ok()
                     .map(|(_, blocks)| snapit_ocr::blocks_to_text(blocks));
                 HistoryStore::global(cx).update(cx, |history, cx| {
-                    history.add_image(history_image, scale, text.clone(), cx)
+                    history.add_image(history_image, hdr, scale, text.clone(), cx)
                 });
                 if this.ocr_revision != revision {
                     return;
@@ -1047,6 +1098,8 @@ impl Controller {
         format: RecordFormat,
         cx: &mut Context<Self>,
     ) {
+        crate::logging::begin_recording();
+        log::info!("recording start: format={format:?} display={monitor_id} region={region:?}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
         // Remember the choice so the overlay's record button repeats it.
@@ -1071,6 +1124,7 @@ impl Controller {
             .with_cursor(recording.captures_cursor)
             // The recorder ignores this for GIF, which has no extended range.
             .with_hdr(recording.hdr);
+        log::info!("recording options: fps={fps} hdr_requested={}", recording.hdr);
         // Keep the overlay on screen as the region highlight: drop the frozen
         // frame and the toolbar, keep the dim mask and the selection border.
         // The bar opens right away in its "starting" state; the recorder joins

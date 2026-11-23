@@ -53,6 +53,10 @@ pub struct HistoryEntry {
     pub scale_factor: f32,
     #[serde(default)]
     pub ocr_text: Option<String>,
+    /// `file` holds a 16-bit BT.2020/PQ PNG (cICP 9,16,0,1), not an 8-bit
+    /// sRGB one. The thumbnail stays 8-bit SDR for the UI and pin preview.
+    #[serde(default)]
+    pub hdr: bool,
 }
 
 fn default_scale() -> f32 {
@@ -79,6 +83,15 @@ impl Limits {
 #[derive(Debug)]
 pub struct NewEntry(HistoryEntry);
 
+/// Metadata for the original file backing a new entry, shared by the three
+/// constructors so `finish` stays a small function.
+struct FinishSpec {
+    id: String,
+    kind: EntryKind,
+    file: String,
+    hdr: bool,
+}
+
 impl NewEntry {
     pub fn image(
         dir: &Path,
@@ -93,10 +106,49 @@ impl NewEntry {
             .with_context(|| format!("failed to write {file}"))?;
         let written = writing.elapsed();
         let previewing = Instant::now();
-        let entry = Self::finish(dir, id, EntryKind::Png, file, image, scale_factor, ocr_text)?;
+        let spec = FinishSpec {
+            id,
+            kind: EntryKind::Png,
+            file,
+            hdr: false,
+        };
+        let entry = Self::finish(dir, spec, image, scale_factor, ocr_text)?;
         log::info!(
             target: "timing",
             "history: image write {:.1} ms, thumbnail {:.1} ms",
+            written.as_secs_f64() * 1e3,
+            previewing.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(entry)
+    }
+
+    /// Store a 16-bit BT.2020/PQ PNG (already encoded by the capture crate) as
+    /// the original file, keeping an 8-bit SDR `preview` for the UI thumbnail
+    /// and pin window. `store` deliberately takes encoded bytes so it does not
+    /// depend on the capture crate or on HDR colour math.
+    pub fn image_hdr(
+        dir: &Path,
+        png_bytes: &[u8],
+        preview: &RgbaImage,
+        scale_factor: f32,
+        ocr_text: Option<String>,
+    ) -> Result<Self> {
+        let (id, file) = reserve(dir, EntryKind::Png)?;
+        let writing = Instant::now();
+        std::fs::write(dir.join(&file), png_bytes)
+            .with_context(|| format!("failed to write {file}"))?;
+        let written = writing.elapsed();
+        let previewing = Instant::now();
+        let spec = FinishSpec {
+            id,
+            kind: EntryKind::Png,
+            file,
+            hdr: true,
+        };
+        let entry = Self::finish(dir, spec, preview, scale_factor, ocr_text)?;
+        log::info!(
+            target: "timing",
+            "history: HDR PNG write {:.1} ms, thumbnail {:.1} ms",
             written.as_secs_f64() * 1e3,
             previewing.elapsed().as_secs_f64() * 1e3
         );
@@ -117,7 +169,13 @@ impl NewEntry {
             .with_context(|| format!("failed to copy {}", source.display()))?;
         let copied = copying.elapsed();
         let previewing = Instant::now();
-        let entry = Self::finish(dir, id, kind, file, preview, scale_factor, None)?;
+        let spec = FinishSpec {
+            id,
+            kind,
+            file,
+            hdr: false,
+        };
+        let entry = Self::finish(dir, spec, preview, scale_factor, None)?;
         log::info!(
             target: "timing",
             "history: copy {:.1} ms, thumbnail {:.1} ms",
@@ -129,13 +187,17 @@ impl NewEntry {
 
     fn finish(
         dir: &Path,
-        id: String,
-        kind: EntryKind,
-        file: String,
+        spec: FinishSpec,
         preview: &RgbaImage,
         scale_factor: f32,
         ocr_text: Option<String>,
     ) -> Result<Self> {
+        let FinishSpec {
+            id,
+            kind,
+            file,
+            hdr,
+        } = spec;
         let thumbnail = format!("{id}.thumb.png");
         let (width, height) = preview.dimensions();
         let scale = (THUMBNAIL_SIZE as f32 / width.max(height).max(1) as f32).min(1.0);
@@ -163,6 +225,7 @@ impl NewEntry {
                 1.0
             },
             ocr_text: ocr_text.filter(|text| !text.is_empty()),
+            hdr,
         }))
     }
 
@@ -385,6 +448,38 @@ mod tests {
         assert!(reopened.file_path(entry).exists());
         assert!(reopened.thumbnail_path(entry).exists());
         assert!(entry.bytes > 0);
+    }
+
+    #[test]
+    fn hdr_flag_round_trips_and_older_entries_default_to_sdr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::open(dir.path()).unwrap();
+        let preview = image(64, 48);
+        // Pretend HDR bytes; the store treats them as opaque and only records
+        // the flag, so a short byte slice is enough for this persistence test.
+        let hdr_entry = NewEntry::image_hdr(history.dir(), b"fake-hdr-png", &preview, 1.0, None)
+            .unwrap();
+        let hdr_id = hdr_entry.entry().id.clone();
+        history.insert(hdr_entry, UNLIMITED).unwrap();
+        // A normal SDR entry alongside it.
+        let (sdr_id, _) = add(&mut history, 1, UNLIMITED);
+
+        let reopened = History::open(dir.path()).unwrap();
+        assert!(reopened.get(&hdr_id).unwrap().hdr);
+        assert!(!reopened.get(&sdr_id).unwrap().hdr);
+        assert!(reopened.file_path(reopened.get(&hdr_id).unwrap()).exists());
+
+        // An index entry without the field (older build) reads as SDR.
+        let mut index: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap()).unwrap();
+        index[0].as_object_mut().unwrap().remove("hdr");
+        std::fs::write(
+            dir.path().join(INDEX_FILE),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let reopened = History::open(dir.path()).unwrap();
+        assert!(reopened.entries().all(|entry| !entry.hdr));
     }
 
     #[test]

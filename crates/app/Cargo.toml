@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-env_logger.workspace = true
 futures.workspace = true
 gpui-kit.workspace = true
 image.workspace = true

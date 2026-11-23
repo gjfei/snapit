@@ -5,6 +5,7 @@
 //! images are always in physical pixels; [`Screenshot::pixels_per_unit`] maps
 //! between the two.
 
+
 use std::{
     path::Path,
     sync::{
@@ -23,9 +24,11 @@ pub use xcap::{DynamicRange, HdrImage, OutputSize};
 mod elements;
 #[cfg(target_os = "macos")]
 mod freeze;
+mod hdr_decode;
 mod windows;
 
 pub use elements::{ElementHit, ElementRole, accessibility_available, request_accessibility};
+pub use hdr_decode::decode_hdr_png_preview;
 pub use windows::WindowInfo;
 
 /// A rectangle in monitor units, relative to the monitor's top-left corner.
@@ -178,10 +181,15 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
 
 /// Monitors worth trying in HDR, by monitor id.
 ///
-/// macOS reads the panel's current EDR headroom through AppKit, so call this
-/// on the main thread. Displays left out keep the ordinary 8-bit freeze, and
-/// the list is empty on Intel Macs and below macOS 15, where the system has
-/// no public API for extended-range pixels.
+/// Use the display's *potential* EDR headroom, not the current one.
+/// `maximumExtendedDynamicRangeColorComponentValue` is process-scoped: it is
+/// 1.0 unless the process opts into EDR via `NSHighDynamicRangeEnabled`, which
+/// SnapIt does not, even on a fully HDR desktop. ScreenCaptureKit's HDR
+/// capture reads the display directly and needs no such opt-in, so the screen
+/// capability (`maximumPotentialExtendedDynamicRangeColorComponentValue`) is
+/// the right predicate. Call on the main thread (AppKit requirement). Displays
+/// left out keep the ordinary 8-bit freeze; the list is empty on Intel Macs
+/// and below macOS 15, where the system has no public HDR capture API.
 #[cfg(target_os = "macos")]
 pub fn hdr_candidates() -> Vec<u32> {
     use objc2::MainThreadMarker;
@@ -189,15 +197,28 @@ pub fn hdr_candidates() -> Vec<u32> {
     use objc2_foundation::{NSNumber, NSString};
 
     if !cfg!(target_arch = "aarch64") || !objc2::available!(macos = 15.0) {
+        log::info!(
+            "HDR candidates: gated out (aarch64={} macOS15={})",
+            cfg!(target_arch = "aarch64"),
+            objc2::available!(macos = 15.0)
+        );
         return Vec::new();
     }
     let Some(mtm) = MainThreadMarker::new() else {
         log::warn!("hdr_candidates must run on the main thread");
         return Vec::new();
     };
-    NSScreen::screens(mtm)
+    let result: Vec<u32> = NSScreen::screens(mtm)
         .iter()
-        .filter(|screen| screen.maximumExtendedDynamicRangeColorComponentValue() > 1.0)
+        .filter(|screen| {
+            let potential = screen.maximumPotentialExtendedDynamicRangeColorComponentValue();
+            let current = screen.maximumExtendedDynamicRangeColorComponentValue();
+            let pass = potential > 1.0;
+            log::info!(
+                "HDR candidate display: potential_edr={potential:.3} current_edr={current:.3} pass={pass}"
+            );
+            pass
+        })
         .filter_map(|screen| {
             let number = screen
                 .deviceDescription()
@@ -207,21 +228,25 @@ pub fn hdr_candidates() -> Vec<u32> {
                 .ok()
                 .map(|number| number.unsignedIntValue())
         })
-        .collect()
+        .collect();
+    log::info!("HDR candidate displays: {result:?}");
+    result
 }
 
 /// Windows decides for itself once it asks the output for its color space, so
 /// every monitor is a candidate and an SDR output costs only that query.
 #[cfg(target_os = "windows")]
 pub fn hdr_candidates() -> Vec<u32> {
-    Monitor::all()
+    let result = Monitor::all()
         .map(|monitors| {
             monitors
                 .iter()
                 .filter_map(|monitor| monitor.id().ok())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    log::info!("HDR candidate displays (all, Windows probes colorspace): {result:?}");
+    result
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -326,8 +351,16 @@ impl MonitorCapture {
     /// Keep the HDR frame only when it actually carries highlights; otherwise
     /// the SDR view is the whole capture and a 16-bit file would only be larger.
     fn from_hdr(hdr: HdrImage) -> Self {
+        let highlights = hdr.has_highlights();
+        log::info!(
+            "HDR frame: {}x{} white={:.1}nit sdr_white={:.1}nit has_highlights={highlights}",
+            hdr.width(),
+            hdr.height(),
+            hdr.reference_white_nits(),
+            hdr.sdr_white_nits()
+        );
         let image = hdr.to_sdr();
-        let hdr = hdr.has_highlights().then_some(hdr);
+        let hdr = highlights.then_some(hdr);
         Self { image, hdr }
     }
 }
@@ -336,14 +369,21 @@ fn capture_one(monitor: &Monitor, try_hdr: bool) -> Result<MonitorCapture> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = try_hdr;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if try_hdr {
-        match monitor.capture_image_hdr() {
-            Ok(hdr) => {
-                log::debug!("captured HDR frame {}x{}", hdr.width(), hdr.height());
-                return Ok(MonitorCapture::from_hdr(hdr));
+    {
+        let display = monitor.id().unwrap_or(0);
+        if try_hdr {
+            match monitor.capture_image_hdr() {
+                Ok(hdr) => {
+                    log::info!("display {display}: HDR capture OK {}x{}", hdr.width(), hdr.height());
+                    return Ok(MonitorCapture::from_hdr(hdr));
+                }
+                Err(xcap::XCapError::NotSupported) => {
+                    log::info!("display {display}: HDR capture NotSupported (system/panel reported no HDR) -> SDR");
+                }
+                Err(err) => log::warn!("display {display}: HDR capture failed ({err:#}); falling back to SDR"),
             }
-            Err(xcap::XCapError::NotSupported) => {}
-            Err(err) => log::warn!("HDR capture failed ({err:#}); falling back to SDR"),
+        } else {
+            log::info!("display {display}: not an HDR candidate -> SDR");
         }
     }
     capture_sdr(monitor)
@@ -605,6 +645,13 @@ pub fn encode_png_hdr(hdr: &HdrImage) -> Result<Vec<u8>> {
 }
 
 pub fn save_png_hdr(hdr: &HdrImage, path: &Path) -> Result<()> {
+    log::info!(
+        "encoding HDR PNG: {}x{} 16-bit RGB cICP={:?} -> {}",
+        hdr.width(),
+        hdr.height(),
+        HDR_CICP,
+        path.display()
+    );
     let data = pq_bt2020_samples(hdr);
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
@@ -760,6 +807,36 @@ mod tests {
         // PQ(203 nits) and PQ(812 nits).
         assert!((channel(0) - 0.58069).abs() < 0.002, "{}", channel(0));
         assert!((channel(3) - 0.72914).abs() < 0.002, "{}", channel(3));
+    }
+
+    #[test]
+    fn hdr_png_decodes_back_to_sdr_preview() {
+        // 1.0 scRGB == 203 nits == SDR white -> 255; black -> 0.
+        // f16 bits: 0.0 = 0x0000, 1.0 = 0x3C00, 4.0 = 0x4400 (little-endian).
+        let mut raw = Vec::new();
+        for pixel in [[0u16; 3], [0x3C00; 3], [0x4400; 3]] {
+            for component in pixel {
+                raw.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let hdr = HdrImage::new(3, 1, raw, 203.0);
+        let encoded = encode_png_hdr(&hdr).unwrap();
+        let preview = decode_hdr_png_preview(&encoded).unwrap().unwrap();
+        assert_eq!(preview.dimensions(), (3, 1));
+        let white_channel = preview.get_pixel(1, 0)[0];
+        assert!(white_channel >= 254, "SDR white should map to ~255, got {white_channel}");
+        let black_channel = preview.get_pixel(0, 0)[0];
+        assert!(black_channel <= 1, "black should map to ~0, got {black_channel}");
+        // Highlights clip to the same white, matching HdrImage::to_sdr().
+        assert_eq!(preview.get_pixel(2, 0)[0], white_channel);
+
+        // Ordinary SDR PNGs are reported as non-HDR for the generic decoder.
+        let sdr = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(sdr)
+            .write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        assert!(decode_hdr_png_preview(&buf).unwrap().is_none());
     }
 
     #[test]

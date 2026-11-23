@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
-use snapit_capture::RgbaImage;
+use snapit_capture::{HdrImage, RgbaImage, encode_png_hdr};
 use snapit_store::{EntryKind, History, HistoryEntry, Limits, NewEntry};
 
 use crate::settings::AppSettings;
@@ -106,9 +106,13 @@ impl HistoryStore {
         config.enabled.then(|| Limits::new(max_items, u64::MAX))
     }
 
+    /// `hdr` is the 16-bit source of `image`; when present it is encoded and
+    /// becomes the stored original so history matches what Save/Copy produce.
+    /// Encoding happens on the background task, never on the UI thread.
     pub fn add_image(
         &mut self,
         image: Arc<RgbaImage>,
+        hdr: Option<Arc<HdrImage>>,
         scale_factor: f32,
         ocr_text: Option<String>,
         cx: &mut Context<Self>,
@@ -117,8 +121,30 @@ impl HistoryStore {
             return;
         }
         let dir = self.dir.clone();
-        let task = cx
-            .background_spawn(async move { NewEntry::image(&dir, &image, scale_factor, ocr_text) });
+        let task = cx.background_spawn(async move {
+            match hdr {
+                Some(hdr) => {
+                    log::info!(
+                        "history: storing HDR original {}x{} (16-bit BT.2020/PQ)",
+                        hdr.width(),
+                        hdr.height()
+                    );
+                    match encode_png_hdr(&hdr) {
+                        Ok(bytes) => {
+                            NewEntry::image_hdr(&dir, &bytes, &image, scale_factor, ocr_text)
+                        }
+                        Err(err) => {
+                            log::warn!("failed to encode HDR PNG for history, storing SDR: {err:#}");
+                            NewEntry::image(&dir, &image, scale_factor, ocr_text)
+                        }
+                    }
+                }
+                None => {
+                    log::info!("history: storing SDR original (no HDR frame)");
+                    NewEntry::image(&dir, &image, scale_factor, ocr_text)
+                }
+            }
+        });
         self.insert_when_ready(task, cx).detach();
     }
 

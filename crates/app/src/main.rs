@@ -25,6 +25,7 @@ mod history_view;
 mod hotkey;
 mod i18n;
 mod instance;
+mod logging;
 mod ocr_view;
 mod overlay;
 mod permission_view;
@@ -86,15 +87,18 @@ pub(crate) fn install_menus(cx: &mut gpui_kit::App) {
 fn main() {
     #[cfg(target_os = "windows")]
     updater::run_update_installer_helper();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let launch_request = instance::LaunchRequest::from_args(&args);
     // `--background` is still accepted for launch-at-login; tray-only either way.
     let background = args.iter().any(|arg| arg == autostart::BACKGROUND_ARG);
     let dirs = AppDirs::discover().unwrap_or_else(|err| {
-        log::error!("{err:#}; keeping data in the temp directory");
+        // Logger may not be up yet; this line is best-effort.
+        eprintln!("{err:#}; keeping data in the temp directory");
         AppDirs::at(std::env::temp_dir().join("snapit"))
     });
+    // Persistent, correlation-tagged logging: stderr + rotating file. Must come
+    // after `dirs` so the log lands in the same root as config/history.
+    logging::init(&dirs.log_file());
     let _instance = match instance::acquire(&dirs) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {

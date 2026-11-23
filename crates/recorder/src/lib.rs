@@ -1003,6 +1003,11 @@ fn capture_loop(
     } else {
         DynamicRange::Sdr
     };
+    log::info!(
+        "recorder dynamic_range={dynamic_range:?} (hdr_option={} format={:?})",
+        options.hdr,
+        options.format
+    );
     let live = match LiveRecorder::start_with(
         monitor_id,
         region,
@@ -1078,8 +1083,8 @@ fn capture_loop(
                         FrameData::Hdr(_) => "hdr",
                         FrameData::Sdr(_) => "sdr",
                     };
-                    log::debug!(
-                        "capture frame {width}x{height} ({range}, output size hint \
+                    log::info!(
+                        "first capture frame {width}x{height} ({range}, output size hint \
                          {output_size:?}, logical selection {logical_width}x{logical_height})"
                     );
                     sink = Some(open_sink(&output, &options, &image)?);

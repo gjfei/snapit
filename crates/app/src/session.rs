@@ -1979,13 +1979,27 @@ impl CaptureSession {
     /// not combined, and no annotations (the baked overlay is 8-bit).
     pub fn export_hdr(&self) -> Option<HdrImage> {
         if self.composed.is_some() || !self.extra_selections.is_empty() {
+            log::info!("HDR export declined: combined or multi-region selection");
             return None;
         }
         if !self.annotations.committed().is_empty() {
+            log::info!("HDR export declined: annotations present (baked layer is 8-bit)");
             return None;
         }
-        let (frame, bounds) = self.selected_frame()?;
-        frame.frame.shot.crop_hdr(frame.to_region(bounds))
+        let Some((frame, bounds)) = self.selected_frame() else {
+            log::info!("HDR export declined: no selected frame");
+            return None;
+        };
+        let region = frame.to_region(bounds);
+        let result = frame.frame.shot.crop_hdr(region);
+        log::info!(
+            "HDR export: crop region={region:?} -> {}",
+            result
+                .as_ref()
+                .map(|hdr| format!("{}x{}", hdr.width(), hdr.height()))
+                .unwrap_or_else(|| "no HDR frame in this shot".into())
+        );
+        result
     }
 
     /// Crop plus baked annotations (Copy / Save / Pin). A combined selection is

@@ -92,9 +92,25 @@ pub fn open(captured: Captured, placement: Option<Placement>, cx: &mut App) {
 /// Pin an image file, e.g. from history.
 pub fn open_file(path: PathBuf, scale: f32, cx: &mut App) {
     let load = cx.background_spawn(async move {
-        image::open(&path)
-            .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
-            .map(|image| image.to_rgba8())
+        // History originals are 16-bit BT.2020/PQ HDR PNGs. Decode those with
+        // the PQ-aware path so a pinned history capture shows the same SDR
+        // preview as the live capture; ordinary PNG/GIF use the generic decoder.
+        let bytes = std::fs::read(&path)
+            .with_context(|| t!("pin.read_failed", path = path.display()).to_string())?;
+        match snapit_capture::decode_hdr_png_preview(&bytes) {
+            Ok(Some(preview)) => Ok(preview),
+            Ok(None) => {
+                image::load_from_memory(&bytes)
+                    .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
+                    .map(|image| image.to_rgba8())
+            }
+            Err(err) => {
+                log::warn!("failed to decode HDR PNG for pin, trying generic decoder: {err:#}");
+                image::load_from_memory(&bytes)
+                    .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
+                    .map(|image| image.to_rgba8())
+            }
+        }
     });
     cx.spawn(async move |cx| {
         let image = load.await;
@@ -102,6 +118,7 @@ pub fn open_file(path: PathBuf, scale: f32, cx: &mut App) {
             Ok(image) => open(
                 Captured {
                     image: Arc::new(image),
+                    hdr: None,
                     scale: scale.max(0.1),
                 },
                 None,
@@ -229,13 +246,13 @@ impl PinView {
     }
 
     fn copy(&mut self, _: &CopyPin, _: &mut Window, cx: &mut Context<Self>) {
-        let image = self.captured.image.clone();
-        Controller::global(cx).update(cx, |controller, cx| controller.copy_image(image, cx));
+        let captured = self.captured.clone();
+        Controller::global(cx).update(cx, |controller, cx| controller.copy_image(captured, cx));
     }
 
     fn save(&mut self, _: &SavePin, _: &mut Window, cx: &mut Context<Self>) {
-        let image = self.captured.image.clone();
-        Controller::global(cx).update(cx, |controller, cx| controller.save_image(image, None, cx));
+        let captured = self.captured.clone();
+        Controller::global(cx).update(cx, |controller, cx| controller.save_image(captured, cx));
     }
 }
 
