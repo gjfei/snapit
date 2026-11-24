@@ -399,10 +399,8 @@ impl HdrMp4Sink {
                     .ok_or_else(|| anyhow!("missing compression key"))?,
                 any(&*compression),
             );
-            // The colour signalling is a top-level setting: it is what makes
-            // the muxer write the `colr` box a player needs to switch the
-            // display to HDR mode. VideoToolbox picks the Main10 profile from
-            // the 10-bit buffers, so no profile key is set.
+            // Top-level colour signalling makes the muxer write the `colr` box
+            // a player needs to switch the display to HDR mode.
             color.insert(
                 AVVideoColorPrimariesKey.ok_or_else(|| anyhow!("missing primaries key"))?,
                 any(AVVideoColorPrimaries_ITU_R_2020

@@ -946,12 +946,51 @@ fn open_sink(
     })
 }
 
+fn open_first_sink(
+    output: &Path,
+    options: &RecordOptions,
+    first_frame: &FrameData,
+    at: Duration,
+) -> Result<(Box<dyn FrameSink>, RgbaImage)> {
+    let thumbnail = first_frame.to_sdr();
+    let mut sink = open_sink(output, options, first_frame)?;
+    if let Err(err) = sink.push(first_frame.clone(), at) {
+        if matches!(options.format, RecordFormat::Mp4) && matches!(first_frame, FrameData::Hdr(_)) {
+            log::warn!("HEVC Main10 rejected the first frame, recording SDR: {err:#}");
+            drop(sink);
+            if let Err(remove_err) = std::fs::remove_file(output)
+                && remove_err.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("failed to remove the rejected HDR container: {remove_err}");
+            }
+            let sdr = FrameData::Sdr(Arc::new(thumbnail.clone()));
+            let mut sink = open_sink(output, options, &sdr)?;
+            sink.push(sdr, at)?;
+            return Ok((sink, thumbnail));
+        }
+        return Err(err);
+    }
+    Ok((sink, thumbnail))
+}
+
 fn signal_ready(
     ready: &mut Option<SyncSender<std::result::Result<(), String>>>,
     result: std::result::Result<(), String>,
 ) {
     if let Some(ready) = ready.take() {
         let _ = ready.send(result);
+    }
+}
+
+struct StopOnDrop(Option<LiveRecorder>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(live) = self.0.take()
+            && let Err(err) = live.stop()
+        {
+            log::warn!("failed to stop the platform recorder during cleanup: {err:#}");
+        }
     }
 }
 
@@ -1022,6 +1061,7 @@ fn capture_loop(
             return Err(err);
         }
     };
+    let mut live = StopOnDrop(Some(live));
     // The encoder's size is fixed when it is created, so it is opened on the
     // first frame the platform recorder actually delivers.
     let mut sink: Option<Box<dyn FrameSink>> = None;
@@ -1035,14 +1075,15 @@ fn capture_loop(
     let mut last_at = Duration::ZERO;
     let mut pushed = 0usize;
 
-    let mut push = |sink: &mut Box<dyn FrameSink>,
-                    frames: &Arc<AtomicUsize>,
-                    image: FrameData,
-                    at: Duration|
+    let push = |sink: &mut Box<dyn FrameSink>,
+                frames: &Arc<AtomicUsize>,
+                pushed: &mut usize,
+                image: FrameData,
+                at: Duration|
      -> Result<()> {
         sink.push(image, at)?;
-        pushed += 1;
-        frames.store(pushed, Ordering::Relaxed);
+        *pushed += 1;
+        frames.store(*pushed, Ordering::Relaxed);
         Ok(())
     };
 
@@ -1054,7 +1095,12 @@ fn capture_loop(
     {
         // Bounds how long a stop request waits for this thread to notice it
         // without busy-waiting: 4 ms costs ~0.1% of a core, 0 ms pegs one.
-        match live.recv_timeout(Duration::from_millis(4)) {
+        match live
+            .0
+            .as_ref()
+            .expect("recorder is active")
+            .recv_timeout(Duration::from_millis(4))
+        {
             LiveFrameWait::Frame(frame) => {
                 if paused.is_paused() {
                     // Keep draining the platform recorder, but do not encode
@@ -1087,21 +1133,24 @@ fn capture_loop(
                         "first capture frame {width}x{height} ({range}, output size hint \
                          {output_size:?}, logical selection {logical_width}x{logical_height})"
                     );
-                    sink = Some(open_sink(&output, &options, &image)?);
+                    let (created, thumbnail) = open_first_sink(&output, &options, &image, at)?;
+                    sink = Some(created);
+                    pushed = 1;
+                    frames.store(pushed, Ordering::Relaxed);
+                    first = Some(thumbnail);
+                    signal_ready(&mut ready, Ok(()));
+                    previous = Some(image);
+                    continue;
                 }
-                let sink = sink.as_mut().expect("sink was just created");
-                let is_duplicate = previous
+                let sink = sink.as_mut().expect("sink was created on the first frame");
+                if previous
                     .as_ref()
-                    .is_some_and(|prev| prev.is_same_as(&image));
-                if is_duplicate {
+                    .is_some_and(|prev| prev.is_same_as(&image))
+                {
                     pending_duplicate_at = Some(at);
                 } else {
-                    push(sink, &frames, image.clone(), at)?;
+                    push(sink, &frames, &mut pushed, image.clone(), at)?;
                     pending_duplicate_at = None;
-                    if first.is_none() {
-                        first = Some(image.to_sdr());
-                    }
-                    signal_ready(&mut ready, Ok(()));
                     previous = Some(image);
                 }
             }
@@ -1128,15 +1177,16 @@ fn capture_loop(
                 .capture()
                 .context("failed to capture region")?,
         ));
-        let mut created = open_sink(&output, &options, &probe)?;
-        push(&mut created, &frames, probe.clone(), Duration::ZERO)?;
-        first = Some(probe.to_sdr());
+        let (created, thumbnail) = open_first_sink(&output, &options, &probe, Duration::ZERO)?;
+        pushed += 1;
+        frames.store(pushed, Ordering::Relaxed);
+        first = Some(thumbnail);
         sink = Some(created);
     } else if let (Some(image), Some(timestamp), Some(created)) =
         (&previous, pending_duplicate_at, sink.as_mut())
     {
         // Keep the final still stretch visible for its real duration.
-        push(created, &frames, image.clone(), timestamp)?;
+        push(created, &frames, &mut pushed, image.clone(), timestamp)?;
     }
     let last_frame = closing.elapsed();
 
@@ -1158,7 +1208,12 @@ fn capture_loop(
             })
         });
         let flushing = Instant::now();
-        let stop_error = live.stop().err();
+        let stop_error = live
+            .0
+            .take()
+            .expect("recorder is still active")
+            .stop()
+            .err();
         let platform = flushing.elapsed();
         let mut finish = Ok(());
         let mut finish_ms = Duration::ZERO;
