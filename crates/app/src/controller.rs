@@ -974,42 +974,42 @@ impl Controller {
                     .ok();
                 return;
             };
-        let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
-            path.set_extension(format.extension());
-            format
-        });
-        let hdr_available = hdr.is_some();
-        log::info!(
-            "save image: format={format:?} hdr_available={hdr_available} path={}",
-            path.display()
-        );
-        let saved = cx
-            .background_spawn(async move {
-                let writing = Instant::now();
-                let branch = match (format, &hdr) {
-                    (SaveFormat::Png, Some(_)) => "HDR PNG (16-bit + cICP)",
-                    (SaveFormat::Png, None) => "SDR PNG (8-bit)",
-                    (SaveFormat::Jpg, _) => "JPEG (8-bit)",
-                };
-                log::info!("save branch: {branch}");
-                let result = match (format, hdr) {
-                    (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
-                    (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
-                    (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
-                };
-                log::info!(
-                    "save result: {} ({:.1} ms) {}",
-                    if result.is_ok() { "ok" } else { "FAILED" },
-                    ms(writing.elapsed()),
-                    if let Err(err) = &result {
-                        format!("error={err:#}")
-                    } else {
-                        String::new()
-                    }
-                );
-                result.map(|_| path)
-            })
-            .await;
+            let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
+                path.set_extension(format.extension());
+                format
+            });
+            let hdr_available = hdr.is_some();
+            log::info!(
+                "save image: format={format:?} hdr_available={hdr_available} path={}",
+                path.display()
+            );
+            let saved = cx
+                .background_spawn(async move {
+                    let writing = Instant::now();
+                    let branch = match (format, &hdr) {
+                        (SaveFormat::Png, Some(_)) => "HDR PNG (16-bit + cICP)",
+                        (SaveFormat::Png, None) => "SDR PNG (8-bit)",
+                        (SaveFormat::Jpg, _) => "JPEG (8-bit)",
+                    };
+                    log::info!("save branch: {branch}");
+                    let result = match (format, hdr) {
+                        (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
+                        (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
+                        (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
+                    };
+                    log::info!(
+                        "save result: {} ({:.1} ms) {}",
+                        if result.is_ok() { "ok" } else { "FAILED" },
+                        ms(writing.elapsed()),
+                        if let Err(err) = &result {
+                            format!("error={err:#}")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    result.map(|_| path)
+                })
+                .await;
             this.update(cx, |this, cx| {
                 match saved {
                     Ok(path) => this.inform(
@@ -1030,11 +1030,7 @@ impl Controller {
 
     fn recognize(&mut self, captured: Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let Captured {
-            image,
-            hdr,
-            scale,
-        } = captured;
+        let Captured { image, hdr, scale } = captured;
         let history_image = image.clone();
         self.ocr = OcrState::Running;
         self.ocr_revision += 1;
@@ -1124,7 +1120,10 @@ impl Controller {
             .with_cursor(recording.captures_cursor)
             // The recorder ignores this for GIF, which has no extended range.
             .with_hdr(recording.hdr);
-        log::info!("recording options: fps={fps} hdr_requested={}", recording.hdr);
+        log::info!(
+            "recording options: fps={fps} hdr_requested={}",
+            recording.hdr
+        );
         // Keep the overlay on screen as the region highlight: drop the frozen
         // frame and the toolbar, keep the dim mask and the selection border.
         // The bar opens right away in its "starting" state; the recorder joins

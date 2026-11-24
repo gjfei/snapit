@@ -99,11 +99,9 @@ pub fn open_file(path: PathBuf, scale: f32, cx: &mut App) {
             .with_context(|| t!("pin.read_failed", path = path.display()).to_string())?;
         match snapit_capture::decode_hdr_png_preview(&bytes) {
             Ok(Some(preview)) => Ok(preview),
-            Ok(None) => {
-                image::load_from_memory(&bytes)
-                    .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
-                    .map(|image| image.to_rgba8())
-            }
+            Ok(None) => image::load_from_memory(&bytes)
+                .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
+                .map(|image| image.to_rgba8()),
             Err(err) => {
                 log::warn!("failed to decode HDR PNG for pin, trying generic decoder: {err:#}");
                 image::load_from_memory(&bytes)

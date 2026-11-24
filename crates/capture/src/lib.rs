@@ -5,7 +5,6 @@
 //! images are always in physical pixels; [`Screenshot::pixels_per_unit`] maps
 //! between the two.
 
-
 use std::{
     path::Path,
     sync::{
@@ -374,13 +373,21 @@ fn capture_one(monitor: &Monitor, try_hdr: bool) -> Result<MonitorCapture> {
         if try_hdr {
             match monitor.capture_image_hdr() {
                 Ok(hdr) => {
-                    log::info!("display {display}: HDR capture OK {}x{}", hdr.width(), hdr.height());
+                    log::info!(
+                        "display {display}: HDR capture OK {}x{}",
+                        hdr.width(),
+                        hdr.height()
+                    );
                     return Ok(MonitorCapture::from_hdr(hdr));
                 }
                 Err(xcap::XCapError::NotSupported) => {
-                    log::info!("display {display}: HDR capture NotSupported (system/panel reported no HDR) -> SDR");
+                    log::info!(
+                        "display {display}: HDR capture NotSupported (system/panel reported no HDR) -> SDR"
+                    );
                 }
-                Err(err) => log::warn!("display {display}: HDR capture failed ({err:#}); falling back to SDR"),
+                Err(err) => log::warn!(
+                    "display {display}: HDR capture failed ({err:#}); falling back to SDR"
+                ),
             }
         } else {
             log::info!("display {display}: not an HDR candidate -> SDR");
@@ -824,9 +831,15 @@ mod tests {
         let preview = decode_hdr_png_preview(&encoded).unwrap().unwrap();
         assert_eq!(preview.dimensions(), (3, 1));
         let white_channel = preview.get_pixel(1, 0)[0];
-        assert!(white_channel >= 254, "SDR white should map to ~255, got {white_channel}");
+        assert!(
+            white_channel >= 254,
+            "SDR white should map to ~255, got {white_channel}"
+        );
         let black_channel = preview.get_pixel(0, 0)[0];
-        assert!(black_channel <= 1, "black should map to ~0, got {black_channel}");
+        assert!(
+            black_channel <= 1,
+            "black should map to ~0, got {black_channel}"
+        );
         // Highlights clip to the same white, matching HdrImage::to_sdr().
         assert_eq!(preview.get_pixel(2, 0)[0], white_channel);
 

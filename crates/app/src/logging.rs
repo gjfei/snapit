@@ -126,7 +126,12 @@ impl log::Log for StderrLogger {
             return;
         }
         let stamp = tag().unwrap_or_else(|| "-".to_string());
-        eprintln!("[{stamp}] {:5} {}: {}", record.level(), record.target(), record.args());
+        eprintln!(
+            "[{stamp}] {:5} {}: {}",
+            record.level(),
+            record.target(),
+            record.args()
+        );
     }
 
     fn flush(&self) {}

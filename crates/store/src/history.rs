@@ -457,8 +457,8 @@ mod tests {
         let preview = image(64, 48);
         // Pretend HDR bytes; the store treats them as opaque and only records
         // the flag, so a short byte slice is enough for this persistence test.
-        let hdr_entry = NewEntry::image_hdr(history.dir(), b"fake-hdr-png", &preview, 1.0, None)
-            .unwrap();
+        let hdr_entry =
+            NewEntry::image_hdr(history.dir(), b"fake-hdr-png", &preview, 1.0, None).unwrap();
         let hdr_id = hdr_entry.entry().id.clone();
         history.insert(hdr_entry, UNLIMITED).unwrap();
         // A normal SDR entry alongside it.

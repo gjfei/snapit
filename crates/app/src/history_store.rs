@@ -134,7 +134,9 @@ impl HistoryStore {
                             NewEntry::image_hdr(&dir, &bytes, &image, scale_factor, ocr_text)
                         }
                         Err(err) => {
-                            log::warn!("failed to encode HDR PNG for history, storing SDR: {err:#}");
+                            log::warn!(
+                                "failed to encode HDR PNG for history, storing SDR: {err:#}"
+                            );
                             NewEntry::image(&dir, &image, scale_factor, ocr_text)
                         }
                     }
