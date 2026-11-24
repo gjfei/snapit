@@ -27,7 +27,7 @@ use crate::{
     settings::AppSettings,
 };
 
-/// Which entries the list shows. Screenshots are PNGs; recordings are GIF / MP4.
+/// Which entries the list shows. Screenshots are PNGs; recordings are GIF / APNG / MP4.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HistoryFilter {
     #[default]
@@ -266,6 +266,7 @@ impl HistoryView {
                                     .child(match kind {
                                         EntryKind::Png => "PNG",
                                         EntryKind::Gif => "GIF",
+                                        EntryKind::Apng => "APNG",
                                         EntryKind::Mp4 => "MP4",
                                     }),
                             )
@@ -369,7 +370,7 @@ fn open_with_system(path: &Path) {
 
 fn copy_file(path: &Path, kind: EntryKind, window: &mut Window, cx: &mut App) {
     let format = match kind {
-        EntryKind::Png => ImageFormat::Png,
+        EntryKind::Png | EntryKind::Apng => ImageFormat::Png,
         EntryKind::Gif => ImageFormat::Gif,
         // Filtered out at the call site: only images reach the clipboard.
         EntryKind::Mp4 => return,

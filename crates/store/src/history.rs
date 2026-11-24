@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use image::RgbaImage;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::fs::write_atomic;
 
@@ -16,23 +16,58 @@ const THUMBNAIL_SIZE: u32 = 320;
 pub enum EntryKind {
     Png,
     Gif,
+    Apng,
     Mp4,
 }
 
 impl EntryKind {
     pub fn extension(self) -> &'static str {
         match self {
-            Self::Png => "png",
+            Self::Png | Self::Apng => "png",
             Self::Gif => "gif",
             Self::Mp4 => "mp4",
         }
     }
 
-    /// Whether the entry is a video container that needs a still thumbnail
-    /// instead of being decodable as an image.
+    /// Whether the entry needs a still thumbnail instead of a full decode.
     pub fn is_media(self) -> bool {
-        matches!(self, Self::Gif | Self::Mp4)
+        matches!(self, Self::Gif | Self::Apng | Self::Mp4)
     }
+}
+
+fn validate_file_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("history file name must not be empty, . or ..");
+    }
+    // Backslash is not a separator on Unix, but rejecting it on every platform
+    // keeps an index portable and prevents Windows paths from slipping through.
+    if name.contains('/') || name.contains('\\') {
+        bail!("history file name must not contain path separators: {name:?}");
+    }
+    let path = Path::new(name);
+    if path.is_absolute()
+        || path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        bail!("history file name must be one ordinary path component: {name:?}");
+    }
+    Ok(())
+}
+
+fn deserialize_file_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    validate_file_name(&name).map_err(D::Error::custom)?;
+    Ok(name)
+}
+
+fn deserialize_optional_file_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = Option::<String>::deserialize(deserializer)?;
+    if let Some(name) = &name {
+        validate_file_name(name).map_err(D::Error::custom)?;
+    }
+    Ok(name)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -41,8 +76,10 @@ pub struct HistoryEntry {
     pub id: String,
     pub kind: EntryKind,
     pub created_at: DateTime<Utc>,
-    /// File name inside the history directory.
+    /// Ordinary file name inside the history directory, never a path.
+    #[serde(deserialize_with = "deserialize_file_name")]
     pub file: String,
+    #[serde(default, deserialize_with = "deserialize_optional_file_name")]
     pub thumbnail: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -155,7 +192,7 @@ impl NewEntry {
         Ok(entry)
     }
 
-    /// Copy an existing file (e.g. a finished GIF) into the history directory.
+    /// Copy an existing file into history, preserving its name unless it collides.
     pub fn file(
         dir: &Path,
         source: &Path,
@@ -163,10 +200,23 @@ impl NewEntry {
         preview: &RgbaImage,
         scale_factor: f32,
     ) -> Result<Self> {
-        let (id, file) = reserve(dir, kind)?;
+        let (id, file) = reserve_import(dir, source, kind)?;
         let copying = Instant::now();
-        std::fs::copy(source, dir.join(&file))
-            .with_context(|| format!("failed to copy {}", source.display()))?;
+        let destination = dir.join(&file);
+        let mut source_file = std::fs::File::open(source)
+            .with_context(|| format!("failed to open {}", source.display()))?;
+        (|| -> Result<()> {
+            let mut destination_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .with_context(|| format!("failed to create {}", destination.display()))?;
+            if let Err(err) = std::io::copy(&mut source_file, &mut destination_file) {
+                let _ = std::fs::remove_file(&destination);
+                return Err(err).with_context(|| format!("failed to copy {}", source.display()));
+            }
+            Ok(())
+        })()?;
         let copied = copying.elapsed();
         let previewing = Instant::now();
         let spec = FinishSpec {
@@ -253,8 +303,77 @@ fn reserve(dir: &Path, kind: EntryKind) -> Result<(String, String)> {
     Ok((id, file))
 }
 
+fn reserve_import(dir: &Path, source: &Path, kind: EntryKind) -> Result<(String, String)> {
+    let (id, fallback) = reserve(dir, kind)?;
+    let Some(preferred) = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| validate_file_name(name).is_ok())
+    else {
+        return Ok((id, fallback));
+    };
+    if !dir.join(preferred).exists() {
+        return Ok((id, preferred.to_string()));
+    }
+
+    let path = Path::new(preferred);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(preferred);
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for n in 2.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem}-{n}.{extension}"),
+            None => format!("{stem}-{n}"),
+        };
+        if !dir.join(&candidate).exists() {
+            return Ok((id, candidate));
+        }
+    }
+    unreachable!("file-name collision search is unbounded")
+}
+
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn validate_entry(entry: &HistoryEntry) -> Result<()> {
+    validate_file_name(&entry.file)?;
+    if let Some(thumbnail) = &entry.thumbnail {
+        validate_file_name(thumbnail)?;
+    }
+    Ok(())
+}
+
+/// Resolve one indexed name without allowing `..`, absolute paths, separators,
+/// or a symlink whose target escapes the history directory.
+fn resolve_path(dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_file_name(name)?;
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve history directory {}", dir.display()))?;
+    let candidate = root.join(name);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let resolved = candidate
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", candidate.display()))?;
+            if !resolved.starts_with(&root) {
+                bail!(
+                    "history path {} escapes {}",
+                    resolved.display(),
+                    root.display()
+                );
+            }
+            // Keep the directory entry itself rather than the symlink target so
+            // deleting an indexed symlink never deletes another history file.
+            Ok(candidate)
+        }
+        Ok(_) => Ok(candidate),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+        Err(err) => Err(err).with_context(|| format!("failed to resolve {}", candidate.display())),
+    }
 }
 
 /// The capture history: files in one directory plus a JSON index, oldest first.
@@ -281,7 +400,19 @@ impl History {
             }
         };
         let before = entries.len();
-        entries.retain(|entry| dir.join(&entry.file).exists());
+        entries.retain(|entry| {
+            if let Err(err) = validate_entry(entry) {
+                log::warn!("ignoring unsafe history entry {}: {err:#}", entry.id);
+                return false;
+            }
+            match resolve_path(&dir, &entry.file) {
+                Ok(path) => path.exists(),
+                Err(err) => {
+                    log::warn!("ignoring history entry {}: {err:#}", entry.id);
+                    false
+                }
+            }
+        });
         entries.sort_by_key(|entry| entry.created_at);
         let history = Self { dir, entries };
         if history.entries.len() != before {
@@ -319,55 +450,60 @@ impl History {
         self.entries().find(|entry| entry.kind == kind)
     }
 
-    pub fn file_path(&self, entry: &HistoryEntry) -> PathBuf {
-        self.dir.join(&entry.file)
+    pub fn file_path(&self, entry: &HistoryEntry) -> Result<PathBuf> {
+        resolve_path(&self.dir, &entry.file)
     }
 
-    pub fn thumbnail_path(&self, entry: &HistoryEntry) -> PathBuf {
-        self.dir
-            .join(entry.thumbnail.as_deref().unwrap_or(&entry.file))
+    pub fn thumbnail_path(&self, entry: &HistoryEntry) -> Result<PathBuf> {
+        resolve_path(&self.dir, entry.thumbnail.as_deref().unwrap_or(&entry.file))
     }
 
     /// Index a new entry and prune to `limits`. Returns the pruned entries.
+    /// The candidate index is persisted before memory changes or file deletion.
     pub fn insert(&mut self, entry: NewEntry, limits: Limits) -> Result<Vec<HistoryEntry>> {
-        self.entries.push(entry.0);
-        self.entries.sort_by_key(|entry| entry.created_at);
-        let pruned = self.prune_entries(limits);
-        self.save()?;
+        validate_entry(entry.entry())?;
+        let mut next = self.entries.clone();
+        next.push(entry.0);
+        next.sort_by_key(|entry| entry.created_at);
+        let pruned = Self::prune_entries(&mut next, limits);
+        self.save_entries(&next)?;
+        self.entries = next;
+        self.delete_pruned_files(&pruned);
         Ok(pruned)
     }
 
     /// Drop the oldest entries until both caps hold. The newest entry is always kept.
     pub fn prune(&mut self, limits: Limits) -> Result<Vec<HistoryEntry>> {
-        let pruned = self.prune_entries(limits);
+        let mut next = self.entries.clone();
+        let pruned = Self::prune_entries(&mut next, limits);
         if !pruned.is_empty() {
-            self.save()?;
+            self.save_entries(&next)?;
+            self.entries = next;
+            self.delete_pruned_files(&pruned);
         }
         Ok(pruned)
     }
 
-    fn prune_entries(&mut self, limits: Limits) -> Vec<HistoryEntry> {
-        let mut total = self.total_bytes();
+    fn prune_entries(entries: &mut Vec<HistoryEntry>, limits: Limits) -> Vec<HistoryEntry> {
+        let mut total = entries.iter().map(|entry| entry.bytes).sum::<u64>();
         let mut remove = 0;
-        while self.entries.len() - remove > 1
-            && (self.entries.len() - remove > limits.max_items || total > limits.max_bytes)
+        while entries.len() - remove > 1
+            && (entries.len() - remove > limits.max_items || total > limits.max_bytes)
         {
-            total -= self.entries[remove].bytes;
+            total -= entries[remove].bytes;
             remove += 1;
         }
-        let pruned: Vec<_> = self.entries.drain(..remove).collect();
-        for entry in &pruned {
-            self.delete_files(entry);
-        }
-        pruned
+        entries.drain(..remove).collect()
     }
 
     pub fn set_ocr_text(&mut self, id: &str, text: String) -> Result<bool> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+        let Some(ix) = self.entries.iter().position(|entry| entry.id == id) else {
             return Ok(false);
         };
-        entry.ocr_text = Some(text).filter(|text| !text.is_empty());
-        self.save()?;
+        let mut next = self.entries.clone();
+        next[ix].ocr_text = Some(text).filter(|text| !text.is_empty());
+        self.save_entries(&next)?;
+        self.entries = next;
         Ok(true)
     }
 
@@ -375,22 +511,39 @@ impl History {
         let Some(ix) = self.entries.iter().position(|entry| entry.id == id) else {
             return Ok(None);
         };
-        let entry = self.entries.remove(ix);
+        let mut next = self.entries.clone();
+        let entry = next.remove(ix);
+        self.save_entries(&next)?;
+        self.entries = next;
         self.delete_files(&entry);
-        self.save()?;
         Ok(Some(entry))
     }
 
     pub fn clear(&mut self) -> Result<()> {
-        for entry in std::mem::take(&mut self.entries) {
-            self.delete_files(&entry);
-        }
-        self.save()
+        self.save_entries(&[])?;
+        let removed = std::mem::take(&mut self.entries);
+        self.delete_pruned_files(&removed);
+        Ok(())
     }
 
-    fn delete_files(&self, entry: &HistoryEntry) {
+    /// Delete the files backing an entry that is not (or is no longer) indexed.
+    /// Unsafe names and symlinks escaping the history directory are ignored.
+    pub fn delete_files(&self, entry: &HistoryEntry) {
+        if let Err(err) = validate_entry(entry) {
+            log::warn!(
+                "refusing to delete unsafe history entry {}: {err:#}",
+                entry.id
+            );
+            return;
+        }
         for name in std::iter::once(&entry.file).chain(entry.thumbnail.as_ref()) {
-            let path = self.dir.join(name);
+            let path = match resolve_path(&self.dir, name) {
+                Ok(path) => path,
+                Err(err) => {
+                    log::warn!("refusing to delete history file {name:?}: {err:#}");
+                    continue;
+                }
+            };
             if let Err(err) = std::fs::remove_file(&path)
                 && err.kind() != std::io::ErrorKind::NotFound
             {
@@ -399,9 +552,19 @@ impl History {
         }
     }
 
-    fn save(&self) -> Result<()> {
-        let json = serde_json::to_vec_pretty(&self.entries)?;
+    fn delete_pruned_files(&self, entries: &[HistoryEntry]) {
+        for entry in entries {
+            self.delete_files(entry);
+        }
+    }
+
+    fn save_entries(&self, entries: &[HistoryEntry]) -> Result<()> {
+        let json = serde_json::to_vec_pretty(entries)?;
         write_atomic(&self.dir.join(INDEX_FILE), &json)
+    }
+
+    fn save(&self) -> Result<()> {
+        self.save_entries(&self.entries)
     }
 }
 
@@ -445,9 +608,122 @@ mod tests {
         assert_eq!(entry.ocr_text.as_deref(), Some("hello"));
         assert_eq!((entry.width, entry.height), (64, 48));
         assert_eq!(entry.scale_factor, 2.0);
-        assert!(reopened.file_path(entry).exists());
-        assert!(reopened.thumbnail_path(entry).exists());
+        assert!(reopened.file_path(entry).unwrap().exists());
+        assert!(reopened.thumbnail_path(entry).unwrap().exists());
         assert!(entry.bytes > 0);
+    }
+
+    #[test]
+    fn imported_recording_keeps_its_clipboard_file_name() {
+        let root = tempfile::tempdir().unwrap();
+        let history_dir = root.path().join("history");
+        let source_dir = root.path().join("save");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("SnapIt 2026-11-24 10.30.00.123-42-1.mp4");
+        std::fs::write(&source, b"recorded video").unwrap();
+        let history = History::open(&history_dir).unwrap();
+
+        let entry = NewEntry::file(&history_dir, &source, EntryKind::Mp4, &image(64, 48), 1.0)
+            .unwrap()
+            .entry()
+            .clone();
+
+        assert_eq!(entry.file, source.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            std::fs::read(history.file_path(&entry).unwrap()).unwrap(),
+            b"recorded video"
+        );
+    }
+
+    #[test]
+    fn apng_and_still_png_imports_with_the_same_name_do_not_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let history_dir = root.path().join("history");
+        let first_source = root.path().join("still/clip.png");
+        let second_source = root.path().join("animation/clip.png");
+        std::fs::create_dir_all(first_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second_source.parent().unwrap()).unwrap();
+        std::fs::write(&first_source, b"still").unwrap();
+        std::fs::write(&second_source, b"animation").unwrap();
+        let history = History::open(&history_dir).unwrap();
+
+        let still = NewEntry::file(
+            &history_dir,
+            &first_source,
+            EntryKind::Png,
+            &image(8, 8),
+            1.0,
+        )
+        .unwrap()
+        .entry()
+        .clone();
+        let animation = NewEntry::file(
+            &history_dir,
+            &second_source,
+            EntryKind::Apng,
+            &image(8, 8),
+            1.0,
+        )
+        .unwrap()
+        .entry()
+        .clone();
+
+        assert_eq!(still.file, "clip.png");
+        assert_eq!(animation.file, "clip-2.png");
+        assert!(animation.kind.is_media());
+        assert_eq!(animation.kind.extension(), "png");
+        assert_eq!(
+            std::fs::read(history.file_path(&still).unwrap()).unwrap(),
+            b"still"
+        );
+        assert_eq!(
+            std::fs::read(history.file_path(&animation).unwrap()).unwrap(),
+            b"animation"
+        );
+    }
+
+    #[test]
+    fn imported_recordings_with_the_same_name_do_not_overwrite_each_other() {
+        let root = tempfile::tempdir().unwrap();
+        let history_dir = root.path().join("history");
+        let first_source = root.path().join("first/clip.gif");
+        let second_source = root.path().join("second/clip.gif");
+        std::fs::create_dir_all(first_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second_source.parent().unwrap()).unwrap();
+        std::fs::write(&first_source, b"first").unwrap();
+        std::fs::write(&second_source, b"second").unwrap();
+
+        let first = NewEntry::file(
+            &history_dir,
+            &first_source,
+            EntryKind::Gif,
+            &image(8, 8),
+            1.0,
+        )
+        .unwrap()
+        .entry()
+        .clone();
+        let second = NewEntry::file(
+            &history_dir,
+            &second_source,
+            EntryKind::Gif,
+            &image(8, 8),
+            1.0,
+        )
+        .unwrap()
+        .entry()
+        .clone();
+
+        assert_eq!(first.file, "clip.gif");
+        assert_eq!(second.file, "clip-2.gif");
+        assert_eq!(
+            std::fs::read(history_dir.join(&first.file)).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(history_dir.join(&second.file)).unwrap(),
+            b"second"
+        );
     }
 
     #[test]
@@ -467,7 +743,12 @@ mod tests {
         let reopened = History::open(dir.path()).unwrap();
         assert!(reopened.get(&hdr_id).unwrap().hdr);
         assert!(!reopened.get(&sdr_id).unwrap().hdr);
-        assert!(reopened.file_path(reopened.get(&hdr_id).unwrap()).exists());
+        assert!(
+            reopened
+                .file_path(reopened.get(&hdr_id).unwrap())
+                .unwrap()
+                .exists()
+        );
 
         // An index entry without the field (older build) reads as SDR.
         let mut index: Vec<serde_json::Value> =
@@ -567,7 +848,7 @@ mod tests {
         add(&mut history, 1, UNLIMITED);
 
         let removed = history.remove(&first).unwrap().unwrap();
-        assert!(!history.file_path(&removed).exists());
+        assert!(!history.file_path(&removed).unwrap().exists());
         assert_eq!(history.len(), 1);
 
         history.clear().unwrap();
@@ -579,6 +860,153 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(History::open(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_names_resolve_but_traversing_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_dir = dir.path().join("history");
+        let mut history = History::open(&history_dir).unwrap();
+        let (id, _) = add(&mut history, 0, UNLIMITED);
+        let entry = history.get(&id).unwrap().clone();
+        let root = history_dir.canonicalize().unwrap();
+        assert_eq!(history.file_path(&entry).unwrap(), root.join(&entry.file));
+        assert_eq!(
+            history.thumbnail_path(&entry).unwrap(),
+            root.join(entry.thumbnail.as_deref().unwrap())
+        );
+
+        let mut nullable = serde_json::to_value(&entry).unwrap();
+        nullable["thumbnail"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<HistoryEntry>(nullable)
+                .unwrap()
+                .thumbnail
+                .is_none()
+        );
+
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, b"outside").unwrap();
+        let unsafe_names = [
+            "",
+            ".",
+            "..",
+            "../outside.png",
+            "nested/file.png",
+            "nested\\file.png",
+            "/absolute.png",
+            "C:\\absolute.png",
+            "C:/absolute.png",
+        ];
+        for name in unsafe_names {
+            assert!(validate_file_name(name).is_err(), "accepted {name:?}");
+            let mut value = serde_json::to_value(&entry).unwrap();
+            value["file"] = name.into();
+            assert!(
+                serde_json::from_value::<HistoryEntry>(value).is_err(),
+                "deserialized unsafe file name {name:?}"
+            );
+
+            let mut value = serde_json::to_value(&entry).unwrap();
+            value["thumbnail"] = name.into();
+            assert!(
+                serde_json::from_value::<HistoryEntry>(value).is_err(),
+                "deserialized unsafe thumbnail name {name:?}"
+            );
+        }
+
+        let mut unsafe_entry = entry.clone();
+        unsafe_entry.file = "../outside.png".into();
+        unsafe_entry.thumbnail = Some(outside.to_string_lossy().into_owned());
+        assert!(history.file_path(&unsafe_entry).is_err());
+        assert!(history.thumbnail_path(&unsafe_entry).is_err());
+        history.delete_files(&unsafe_entry);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+        // Loading an index containing an unsafe name rejects the corrupt index
+        // instead of exposing a path outside the history directory.
+        let mut value = serde_json::to_value(&entry).unwrap();
+        value["file"] = "../outside.png".into();
+        std::fs::write(
+            history_dir.join(INDEX_FILE),
+            serde_json::to_vec(&[value]).unwrap(),
+        )
+        .unwrap();
+        assert!(History::open(&history_dir).unwrap().is_empty());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected_and_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_dir = dir.path().join("history");
+        let history = History::open(&history_dir).unwrap();
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = history_dir.join("linked.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let new_entry = NewEntry::image(history.dir(), &image(8, 8), 1.0, None).unwrap();
+        let mut entry = new_entry.entry().clone();
+        entry.file = "linked.png".into();
+        entry.thumbnail = None;
+        assert!(history.file_path(&entry).is_err());
+        history.delete_files(&entry);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(link.is_symlink());
+    }
+
+    #[test]
+    fn failed_saves_roll_back_memory_and_keep_indexed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::open(dir.path()).unwrap();
+        let (first, _) = add(&mut history, 0, UNLIMITED);
+        add(&mut history, 1, UNLIMITED);
+        let pending = NewEntry::image(history.dir(), &image(64, 48), 2.0, None).unwrap();
+        let pending_id = pending.entry().id.clone();
+        let before: Vec<_> = history.entries().cloned().collect();
+        let index_before = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        let original_paths: Vec<_> = before
+            .iter()
+            .map(|entry| {
+                (
+                    history.file_path(entry).unwrap(),
+                    history.thumbnail_path(entry).unwrap(),
+                )
+            })
+            .collect();
+
+        // Atomic writes use index.tmp; a directory there makes every save fail
+        // without disturbing the existing index or capture files.
+        std::fs::create_dir(dir.path().join("index.tmp")).unwrap();
+        assert!(history.insert(pending, Limits::new(1, 1)).is_err());
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+        assert!(history.prune(Limits::new(1, 1)).is_err());
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+        assert!(history.remove(&first).is_err());
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+        assert!(history.clear().is_err());
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+        assert!(
+            history
+                .set_ocr_text(&first, "not persisted".into())
+                .is_err()
+        );
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+
+        assert_eq!(
+            std::fs::read(dir.path().join(INDEX_FILE)).unwrap(),
+            index_before
+        );
+        for (file, thumbnail) in original_paths {
+            assert!(file.exists());
+            assert!(thumbnail.exists());
+        }
+        // A failed insert did not delete the newly written, still-unindexed
+        // entry, nor any old files that the candidate prune would have removed.
+        assert!(dir.path().join(format!("{pending_id}.png")).exists());
+        assert!(dir.path().join(format!("{pending_id}.thumb.png")).exists());
     }
 
     #[test]

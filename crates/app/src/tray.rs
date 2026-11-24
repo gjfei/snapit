@@ -21,7 +21,7 @@ const ICON_SIZE: u32 = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayCommand {
     Screenshot,
-    Gif,
+    Animation,
     Video,
     Ocr,
     Pin,
@@ -34,7 +34,7 @@ enum TrayCommand {
 impl TrayCommand {
     const ITEMS: [(Self, &'static str); 9] = [
         (Self::Screenshot, "screenshot"),
-        (Self::Gif, "gif"),
+        (Self::Animation, "animation"),
         (Self::Video, "video"),
         (Self::Ocr, "ocr"),
         (Self::Pin, "pin"),
@@ -42,6 +42,18 @@ impl TrayCommand {
         (Self::Settings, "settings"),
         (Self::Update, "update"),
         (Self::Quit, "quit"),
+    ];
+
+    const TOP_LEVEL: [Self; 9] = [
+        Self::Screenshot,
+        Self::Animation,
+        Self::Video,
+        Self::Ocr,
+        Self::Pin,
+        Self::History,
+        Self::Settings,
+        Self::Update,
+        Self::Quit,
     ];
 
     fn from_id(id: &str) -> Option<Self> {
@@ -54,7 +66,7 @@ impl TrayCommand {
     fn label(self) -> String {
         match self {
             Self::Screenshot => t!("action.screenshot").to_string(),
-            Self::Gif => t!("action.gif").to_string(),
+            Self::Animation => t!("action.gif").to_string(),
             Self::Video => t!("action.video").to_string(),
             Self::Ocr => t!("action.ocr").to_string(),
             Self::Pin => t!("action.pin").to_string(),
@@ -68,13 +80,15 @@ impl TrayCommand {
     fn hotkey_action(self) -> Option<HotkeyAction> {
         match self {
             Self::Screenshot => Some(HotkeyAction::Screenshot),
-            Self::Gif => Some(HotkeyAction::Gif),
+            Self::Animation => Some(HotkeyAction::Gif),
             Self::Video => Some(HotkeyAction::Video),
             Self::Ocr => Some(HotkeyAction::Ocr),
             _ => None,
         }
     }
 }
+
+type BuiltTray = (TrayIcon, Vec<(TrayCommand, MenuItem)>);
 
 struct TrayService {
     /// Dropping this removes the status item, so it must outlive the app.
@@ -144,8 +158,11 @@ fn handle(command: TrayCommand, cx: &mut App) {
         TrayCommand::Screenshot => Controller::global(cx).update(cx, |controller, cx| {
             controller.start_capture(CaptureIntent::Choose, cx)
         }),
-        TrayCommand::Gif => Controller::global(cx).update(cx, |controller, cx| {
-            controller.start_capture(CaptureIntent::Record(RecordFormat::Gif), cx)
+        TrayCommand::Animation => Controller::global(cx).update(cx, |controller, cx| {
+            controller.start_capture(
+                CaptureIntent::Record(crate::controller::last_animation_format(cx)),
+                cx,
+            )
         }),
         TrayCommand::Video => Controller::global(cx).update(cx, |controller, cx| {
             controller.start_capture(CaptureIntent::Record(RecordFormat::Mp4), cx)
@@ -167,17 +184,21 @@ fn handle(command: TrayCommand, cx: &mut App) {
     }
 }
 
-fn attach(hotkeys: &Hotkeys) -> Result<(TrayIcon, Vec<(TrayCommand, MenuItem)>)> {
+fn attach(hotkeys: &Hotkeys) -> Result<BuiltTray> {
     let menu = Menu::new();
     let mut items = Vec::new();
-    for (command, id) in TrayCommand::ITEMS.iter() {
+    for command in TrayCommand::TOP_LEVEL {
         // Separators before the "act on a capture" group and before Quit.
         if matches!(command, TrayCommand::Pin | TrayCommand::Quit) {
             menu.append(&PredefinedMenuItem::separator())
                 .context("failed to build tray menu")?;
         }
-        let item = MenuItem::with_id(*id, item_text(*command, hotkeys), true, None);
-        items.push((*command, item.clone()));
+        let id = TrayCommand::ITEMS
+            .iter()
+            .find_map(|(candidate, id)| (*candidate == command).then_some(*id))
+            .expect("top-level tray command has an id");
+        let item = MenuItem::with_id(id, item_text(command, hotkeys), true, None);
+        items.push((command, item.clone()));
         menu.append(&item).context("failed to build tray menu")?;
     }
 
@@ -246,6 +267,17 @@ mod tests {
         assert_eq!(rgba.len(), (width * height * 4) as usize);
         assert!(rgba.chunks(4).any(|px| px[3] > 0));
         assert!(Icon::from_rgba(rgba, width, height).is_ok());
+    }
+
+    #[test]
+    fn animation_is_one_command_without_format_choices() {
+        assert!(TrayCommand::TOP_LEVEL.contains(&TrayCommand::Animation));
+        assert_eq!(
+            TrayCommand::from_id("animation"),
+            Some(TrayCommand::Animation)
+        );
+        assert_eq!(TrayCommand::from_id("gif"), None);
+        assert_eq!(TrayCommand::from_id("apng"), None);
     }
 
     #[test]

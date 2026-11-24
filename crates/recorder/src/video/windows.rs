@@ -24,13 +24,14 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateSinkWriterFromURL, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_LITE,
     MFShutdown, MFStartup, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_P010,
-    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFVideoPrimaries_BT2020,
-    MFVideoTransFunc_2084, MFVideoTransferMatrix_BT2020_10, eAVEncH265VProfile_Main_420_10,
+    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
+    MFVideoPrimaries_BT2020, MFVideoTransFunc_709, MFVideoTransFunc_2084,
+    MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10, eAVEncH265VProfile_Main_420_10,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::core::HSTRING;
 
-use super::{Nclx, hdr, mp4_colour, prepare};
+use super::{Nclx, bitrate, hdr, mp4_colour, prepare_video};
 use crate::{FrameData, FrameSink, RecordOptions};
 
 /// Media Foundation counts time in 100 ns units.
@@ -72,7 +73,7 @@ pub(crate) struct Mp4Sink {
     max_width: Option<u32>,
     /// Nominal frame duration, used when a still stretch has to guess.
     frame_ticks: i64,
-    last: Option<(RgbaImage, Duration)>,
+    last: Option<(Arc<RgbaImage>, Duration)>,
     frames: usize,
     t_scale: Duration,
     t_buffer: Duration,
@@ -89,7 +90,7 @@ impl Mp4Sink {
         ensure_com()?;
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.context("Media Foundation unavailable")?;
 
-        let first = prepare(probe, options.max_width);
+        let first = prepare_video(probe, options.max_width);
         let (width, height) = first.dimensions();
         let fps = options.fps.max(1);
         let bitrate = bitrate(width, height, options);
@@ -110,6 +111,10 @@ impl Mp4Sink {
             output.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             output.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
+            output.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+            output.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+            output.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            output.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
         }
         let stream = unsafe { writer.AddStream(&output) }?;
 
@@ -201,7 +206,7 @@ impl Mp4Sink {
 }
 
 impl FrameSink for Mp4Sink {
-    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
         // The capture thread has to be in the MTA as well; the call is a no-op
         // when it already is.
         ensure_com()?;
@@ -215,11 +220,17 @@ impl FrameSink for Mp4Sink {
         // the full-resolution capture (or scaling it again) would mean another
         // pass over four times as many pixels.
         let scaled_started = Instant::now();
-        let scaled = prepare(&frame, self.max_width).into_owned();
+        let scaled = prepare_video(&frame, self.max_width);
         self.t_scale += scaled_started.elapsed();
         self.append_scaled(&scaled, at, self.frame_ticks)?;
-        self.last = Some((scaled, at));
-        Ok(())
+        self.last = Some((
+            match scaled {
+                std::borrow::Cow::Borrowed(_) => Arc::clone(&frame),
+                std::borrow::Cow::Owned(image) => Arc::new(image),
+            },
+            at,
+        ));
+        Ok(true)
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -424,7 +435,7 @@ impl HdrMp4Sink {
 }
 
 impl FrameSink for HdrMp4Sink {
-    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
         ensure_com()?;
         let FrameData::Hdr(hdr) = frame else {
             bail!("the HEVC Main10 sink only accepts extended-range frames");
@@ -447,7 +458,8 @@ impl FrameSink for HdrMp4Sink {
         let convert_started = Instant::now();
         hdr::convert_into(&scaled, &mut self.y, &mut self.uv);
         self.t_convert += convert_started.elapsed();
-        self.append_planes(at, self.frame_ticks)
+        self.append_planes(at, self.frame_ticks)?;
+        Ok(true)
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -471,9 +483,9 @@ impl FrameSink for HdrMp4Sink {
         // byte stream, the write-open below can fail with a sharing violation
         // and leave the recording untagged.
         drop(self.writer);
-        // The muxer writes no colour box and the encoder no VUI description, so
-        // a Main10 PQ file would play back as a dull SDR clip. A recording must
-        // not be thrown away over metadata, hence the warning.
+        // The muxer may omit the colour box and the encoder may omit the VUI
+        // description, so a Main10 PQ file could play back as a dull SDR clip.
+        // A recording must not be thrown away over metadata, hence the warning.
         if let Err(err) = mp4_colour::insert(&self.path, &Nclx::HDR10) {
             log::warn!("failed to tag {} as HDR10: {err:#}", self.path.display());
         }
@@ -492,15 +504,6 @@ impl FrameSink for HdrMp4Sink {
         );
         Ok(())
     }
-}
-
-/// Bits per second for a screen recording: screen content compresses far
-/// better than camera footage, so this sits below the usual 0.1 bpp ladder.
-fn bitrate(width: u32, height: u32, options: &RecordOptions) -> u32 {
-    let pixels = width as f64 * height as f64;
-    let quality = (options.quality.max(1) as f64) / 90.0;
-    let bits = pixels * options.fps.max(1) as f64 * 0.06 * quality;
-    bits.clamp(500_000.0, 25_000_000.0) as u32
 }
 
 /// Media Foundation packs two 32-bit attributes (size, ratio) into one
@@ -611,9 +614,12 @@ mod hdr_sink_tests {
             (moov..moov + 64 * 1024).contains(&colr),
             "the box belongs in the moov"
         );
+        let entry = find(&bytes, b"hvc1").expect("no hvc1 sample entry") - 4;
+        let entry_size = u32::from_be_bytes(bytes[entry..entry + 4].try_into().unwrap()) as usize;
+        let colr_box = colr - 4;
         assert!(
-            colr < hvc,
-            "a colr after the codec configuration is out of order"
+            entry <= colr_box && colr_box + 19 <= entry + entry_size,
+            "the colour box must be inside the video sample entry"
         );
         // The sizes the patch grew must still walk the file to its exact end.
         let mut at = 0usize;

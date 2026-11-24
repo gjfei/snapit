@@ -1,7 +1,9 @@
 //! Fullscreen, borderless, topmost window showing one monitor's frozen frame.
 
 use std::{
+    cell::RefCell,
     ops::Range,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -11,7 +13,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     h_flex,
-    native_menu::NativeMenu,
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     toolbar::Toolbar,
 };
@@ -38,6 +39,22 @@ use snapit_store::AnnotationTool;
 
 const CONTEXT: &str = "SnapItOverlay";
 
+/// Run after the window has presented a frame with its current content.
+pub(crate) fn after_presented_frame(
+    window: &mut Window,
+    callback: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
+    let pending = Rc::new(RefCell::new(Some(callback)));
+    window.on_next_frame(move |window, _| {
+        let pending = pending.clone();
+        window.on_next_frame(move |window, cx| {
+            if let Some(callback) = pending.borrow_mut().take() {
+                callback(window, cx);
+            }
+        });
+    });
+}
+
 /// Color magnifier: a 13 × 13 block of physical pixels at 9 px per cell.
 const MAGNIFIER_CELLS: u32 = 13;
 const MAGNIFIER_CELL: f32 = 9.0;
@@ -58,7 +75,7 @@ actions!(
         SaveSelection,
         PinSelection,
         RecognizeSelection,
-        RecordGif,
+        RecordAnimation,
         RecordVideo,
         UndoAnnotations,
         ClearAnnotations,
@@ -440,7 +457,7 @@ impl OverlayView {
             // 预建时窗口是零 alpha、还没有画过冻结帧；这时直接恢复 alpha 会先露出
             // 未渲染图层的黑色，等 GPUI 再画一帧才正常。等首帧合成完再置前。
             let asked = Instant::now();
-            window.on_next_frame(move |window, _| {
+            after_presented_frame(window, move |window, _| {
                 let showing = Instant::now();
                 macos_window::reveal(window);
                 window.activate_window();
@@ -1412,50 +1429,32 @@ impl OverlayView {
                         .content(div().w(px(1.)).h(px(16.)).bg(border).mx_1())
                     })
                     .child({
-                        // One button repeats the last container; the caret
-                        // next to it picks the other one.
-                        let last = crate::controller::last_record_format(cx);
-                        let label = match last {
-                            RecordFormat::Gif => t!("overlay.record.gif").to_string(),
-                            RecordFormat::Mp4 => t!("overlay.record.video").to_string(),
-                        };
-                        Button::new("record")
+                        let format = crate::controller::last_animation_format(cx);
+                        let label = t!(
+                            "overlay.record.animation_hint",
+                            format = crate::controller::format_label(format)
+                        )
+                        .to_string();
+                        Button::new("record-animation")
                             .ghost()
-                            .icon(match last {
-                                RecordFormat::Gif => LucideIcon::Film,
-                                RecordFormat::Mp4 => LucideIcon::Video,
-                            })
+                            .icon(LucideIcon::Film)
                             .tooltip(label.clone())
                             .accessibility_label(label)
                             .disabled(multi || composed)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.request(SessionCommand::Record(last), cx)
+                                this.request(SessionCommand::Record(format), cx)
                             }))
                     })
                     .child(
-                        Button::new("record-format")
+                        Button::new("record-video")
                             .ghost()
-                            .icon(LucideIcon::ChevronDown)
-                            .tooltip(t!("overlay.record.menu").to_string())
-                            .accessibility_label(t!("overlay.record.menu").to_string())
+                            .icon(LucideIcon::Video)
+                            .tooltip(t!("overlay.record.video").to_string())
+                            .accessibility_label(t!("overlay.record.video").to_string())
                             .disabled(multi || composed)
-                            .on_mouse_down(MouseButton::Left, |event, window, cx| {
-                                cx.stop_propagation();
-                                let current = AppSettings::get(cx).recording.last_format.clone();
-                                let current = RecordFormat::parse(&current).unwrap_or_default();
-                                NativeMenu::new()
-                                    .menu_with_check(
-                                        t!("overlay.record.gif").to_string(),
-                                        current == RecordFormat::Gif,
-                                        Box::new(RecordGif),
-                                    )
-                                    .menu_with_check(
-                                        t!("overlay.record.video").to_string(),
-                                        current == RecordFormat::Mp4,
-                                        Box::new(RecordVideo),
-                                    )
-                                    .show(event.position, window, cx);
-                            }),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request(SessionCommand::Record(RecordFormat::Mp4), cx)
+                            })),
                     )
                     .child(
                         Button::new("recognize")
@@ -2076,11 +2075,14 @@ impl Render for OverlayView {
             .on_action(cx.listener(|this, _: &RecognizeSelection, _, cx| {
                 this.request(SessionCommand::Recognize, cx)
             }))
-            .on_action(cx.listener(|this, _: &RecordGif, _, cx| {
+            .on_action(cx.listener(|this, _: &RecordAnimation, _, cx| {
                 if this.session.read(cx).is_composed() {
                     return;
                 }
-                this.request(SessionCommand::Record(RecordFormat::Gif), cx)
+                this.request(
+                    SessionCommand::Record(crate::controller::last_animation_format(cx)),
+                    cx,
+                )
             }))
             .on_action(cx.listener(|this, _: &RecordVideo, _, cx| {
                 if this.session.read(cx).is_composed() {

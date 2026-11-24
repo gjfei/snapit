@@ -1,12 +1,10 @@
 //! The container half of the HDR signalling.
 //!
-//! Media Foundation's MPEG-4 muxer writes no `colr` box — not for HEVC, and a
-//! probe shows it does not for H.264 either — and the HEVC encoder leaves the
-//! colour description out of the bitstream's VUI. The result is a Main10 PQ
-//! stream nothing can identify: a player defaults to BT.709 gamma, shows it as
-//! a dark, washed-out SDR clip and never asks the display to switch modes. So
-//! the box is added to the finished file by hand instead of being negotiated
-//! with the writer, which does not negotiate it.
+//! Media Foundation's MPEG-4 muxer may omit `colr`, and the HEVC encoder may
+//! leave the colour description out of the bitstream's VUI. The result can be a
+//! Main10 PQ stream nothing can identify: a player defaults to BT.709 gamma,
+//! shows it as a dark, washed-out SDR clip and never asks the display to switch
+//! modes. The finished file is inspected and tagged by hand when necessary.
 //!
 //! Only the tail of the file is rewritten. The writer puts `mdat` before
 //! `moov`, so a box inserted inside `moov` moves no sample data and the

@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(any(target_os = "windows", test))]
+use anyhow::Context as _;
 use anyhow::Result;
 use gpui_kit::{App, Global};
 use rust_i18n::t;
@@ -278,6 +280,7 @@ fn expanded_manifest_url(html: &str, tag: &str) -> Option<String> {
     }
 }
 
+#[cfg(debug_assertions)]
 fn release_page(repo: &str) -> String {
     format!("https://github.com/{repo}/releases/latest")
 }
@@ -596,19 +599,69 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Check a downloaded archive against the manifest.
 fn verify(size: u64, sha256: &str, asset: &Asset) -> Result<()> {
-    if size != asset.size {
-        let detail = format!("size {size}, expected {}", asset.size);
+    verify_values(size, sha256, asset.size, &asset.sha256)
+}
+
+fn verify_values(size: u64, sha256: &str, expected_size: u64, expected_sha256: &str) -> Result<()> {
+    if size != expected_size {
+        let detail = format!("size {size}, expected {expected_size}");
         return Err(UpdateError::new("update.error.checksum")
             .detail(detail)
             .into());
     }
-    if !sha256.eq_ignore_ascii_case(&asset.sha256) {
-        let detail = format!("sha256 {sha256}, expected {}", asset.sha256);
+    if !sha256.eq_ignore_ascii_case(expected_sha256) {
+        let detail = format!("sha256 {sha256}, expected {expected_sha256}");
         return Err(UpdateError::new("update.error.checksum")
             .detail(detail)
             .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn verify_file(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<()> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    verify_open_file(file, expected_size, expected_sha256).map(|_| ())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn verify_open_file(
+    mut file: fs::File,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<fs::File> {
+    let size = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    verify_values(
+        size,
+        &hex(&hasher.finalize()),
+        expected_size,
+        expected_sha256,
+    )?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+#[cfg(target_os = "windows")]
+fn verify_and_lock(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    // Keep the verified object open without write/delete sharing until UAC has
+    // created the installer process; reopening by path after hashing is a TOCTOU.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(path)
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    verify_open_file(file, expected_size, expected_sha256)
 }
 
 /// Download `asset` to `dest`, counting bytes in `progress`, then verify it.
@@ -781,13 +834,19 @@ fn reveal(path: &Path) {
 }
 
 #[cfg(target_os = "windows")]
-fn install(archive: &Path, work: &Path, _version: &str) -> Result<Command> {
+fn install(
+    archive: &Path,
+    work: &Path,
+    _version: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<Command> {
     let exe = std::env::current_exe().localize("update.error.install")?;
     if archive
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
-        return install_from_setup(archive, work, &exe);
+        return install_from_setup(archive, work, &exe, expected_sha256, expected_size);
     }
     let dir = exe
         .parent()
@@ -810,7 +869,7 @@ fn install(archive: &Path, work: &Path, _version: &str) -> Result<Command> {
 }
 
 /// Argument that marks the detached helper started by `install_from_setup`:
-/// `--install-update <setup> <exe> <pid>`.
+/// `--install-update <setup> <exe> <pid> <sha256> <size>`.
 #[cfg(any(windows, test))]
 const UPDATE_INSTALL_ARG: &str = "--install-update";
 
@@ -827,10 +886,12 @@ enum InstallerArgs {
         setup: PathBuf,
         exe: PathBuf,
         pid: u32,
+        sha256: String,
+        size: u64,
     },
 }
 
-/// Only exactly the flag and its three values count, so an ordinary launch
+/// Only exactly the flag and its five values count, so an ordinary launch
 /// never installs an update.
 #[cfg(any(windows, test))]
 fn installer_args<I, S>(args: I) -> InstallerArgs
@@ -846,14 +907,27 @@ where
         return InstallerArgs::Normal;
     }
     match args.as_slice() {
-        [_, _, setup, exe, pid] => match pid.to_str().and_then(|pid| pid.parse().ok()) {
-            Some(pid) => InstallerArgs::Install {
+        [_, _, setup, exe, pid, sha256, size] => {
+            let Some(pid) = pid.to_str().and_then(|pid| pid.parse().ok()) else {
+                return InstallerArgs::Invalid;
+            };
+            let Some(sha256) = sha256.to_str() else {
+                return InstallerArgs::Invalid;
+            };
+            if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return InstallerArgs::Invalid;
+            }
+            let Some(size) = size.to_str().and_then(|size| size.parse().ok()) else {
+                return InstallerArgs::Invalid;
+            };
+            InstallerArgs::Install {
                 setup: PathBuf::from(setup),
                 exe: PathBuf::from(exe),
                 pid,
-            },
-            None => InstallerArgs::Invalid,
-        },
+                sha256: sha256.to_string(),
+                size,
+            }
+        }
         _ => InstallerArgs::Invalid,
     }
 }
@@ -862,7 +936,13 @@ where
 /// installed exe cannot be overwritten while it runs, so the helper must not be
 /// the installed image; it waits for `pid` to exit first.
 #[cfg(target_os = "windows")]
-fn install_from_setup(setup: &Path, work: &Path, exe: &Path) -> Result<Command> {
+fn install_from_setup(
+    setup: &Path,
+    work: &Path,
+    exe: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<Command> {
     let helper = work.join("snapit-update-helper.exe");
     let _ = fs::remove_file(&helper);
     fs::copy(exe, &helper).localize("update.error.install")?;
@@ -871,7 +951,9 @@ fn install_from_setup(setup: &Path, work: &Path, exe: &Path) -> Result<Command> 
         .arg(UPDATE_INSTALL_ARG)
         .arg(setup)
         .arg(exe)
-        .arg(std::process::id().to_string());
+        .arg(std::process::id().to_string())
+        .arg(expected_sha256)
+        .arg(expected_size.to_string());
     Ok(command)
 }
 
@@ -886,10 +968,49 @@ pub fn run_update_installer_helper() {
             eprintln!("update helper: expected {UPDATE_INSTALL_ARG} <setup> <exe> <pid>");
             std::process::exit(1);
         }
-        InstallerArgs::Install { setup, exe, pid } => {
+        InstallerArgs::Install {
+            setup,
+            exe,
+            pid,
+            sha256,
+            size,
+        } => {
+            let helper = match std::env::current_exe().and_then(fs::canonicalize) {
+                Ok(helper) => helper,
+                Err(err) => {
+                    eprintln!("update helper: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let setup = match fs::canonicalize(&setup) {
+                Ok(setup) => setup,
+                Err(err) => {
+                    eprintln!("update helper: cannot resolve installer: {err}");
+                    std::process::exit(1);
+                }
+            };
+            if helper
+                .file_name()
+                .is_none_or(|name| name != "snapit-update-helper.exe")
+                || helper.parent() != setup.parent()
+                || setup
+                    .extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("exe"))
+            {
+                eprintln!("update helper: package is outside the authorised work directory");
+                std::process::exit(1);
+            }
             wait_for_exit(pid);
+            let package = match verify_and_lock(&setup, size, &sha256) {
+                Ok(package) => package,
+                Err(err) => {
+                    eprintln!("update helper: package verification failed: {err:#}");
+                    std::process::exit(1);
+                }
+            };
             let installed =
                 run_elevated_process(&setup, std::ffi::OsStr::new("/S"), "update.error.install");
+            drop(package);
             if let Err(err) = &installed {
                 eprintln!("update helper: {err:#}");
             }
@@ -1125,6 +1246,10 @@ pub(crate) struct Job {
     archive: Option<PathBuf>,
     /// Scratch directory a Windows install needs while it runs.
     work: Option<PathBuf>,
+    #[cfg(target_os = "windows")]
+    expected_sha256: String,
+    #[cfg(target_os = "windows")]
+    expected_size: u64,
 }
 
 pub(crate) enum Phase {
@@ -1305,14 +1430,23 @@ pub fn check(manual: bool, cx: &mut App) {
     .detach();
 }
 
-/// Stop a running download, or forget a failed update.
+/// Stop a running download, or forget a finished/failed update and its package.
 pub fn dismiss_job(cx: &mut App) {
     let state = cx.global_mut::<UpdateState>();
-    match &state.job {
+    match state.job.as_ref() {
         Some(job) if matches!(job.phase, Phase::Downloading) => {
-            job.cancel.store(true, Ordering::Relaxed)
+            job.cancel.store(true, Ordering::Relaxed);
         }
-        Some(job) if matches!(job.phase, Phase::Failed(_)) => state.job = None,
+        Some(job) if matches!(job.phase, Phase::Ready | Phase::Failed(_)) => {
+            if let Some(job) = state.job.take() {
+                if let Some(archive) = job.archive {
+                    let _ = fs::remove_file(archive);
+                }
+                if let Some(work) = job.work {
+                    let _ = fs::remove_dir_all(work);
+                }
+            }
+        }
         _ => {}
     }
     cx.refresh_windows();
@@ -1356,6 +1490,10 @@ pub fn start_update(cx: &mut App) {
         phase: Phase::Downloading,
         archive: None,
         work: None,
+        #[cfg(target_os = "windows")]
+        expected_sha256: asset.sha256.clone(),
+        #[cfg(target_os = "windows")]
+        expected_size: asset.size,
     });
     cx.refresh_windows();
 
@@ -1422,10 +1560,12 @@ pub fn install_ready(cx: &mut App) {
     if !matches!(job.phase, Phase::Ready) {
         return;
     }
-    let (Some(archive), Some(work), version) = (
+    let (Some(archive), Some(work), version, expected_sha256, expected_size) = (
         job.archive.clone(),
         job.work.clone(),
         cx.global::<UpdateState>().job_version(),
+        job.expected_sha256.clone(),
+        job.expected_size,
     ) else {
         return;
     };
@@ -1438,7 +1578,7 @@ pub fn install_ready(cx: &mut App) {
         let installed = cx
             .background_executor()
             .spawn(async move {
-                let relaunch = install(&archive, &work, &version);
+                let relaunch = install(&archive, &work, &version, &expected_sha256, expected_size);
                 // The Windows helper needs the work directory until it runs.
                 if relaunch.is_err() {
                     let _ = fs::remove_dir_all(&work);
@@ -1719,6 +1859,24 @@ mod tests {
         assert!(verify(3, &digest, &asset).is_ok());
         assert!(verify(4, &digest, &asset).is_err());
         assert!(verify(3, &hex(&Sha256::digest(b"abd")), &asset).is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "snapit-updater-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let package = dir.join("setup.exe");
+        fs::write(&package, b"abc").unwrap();
+        assert!(verify_file(&package, 3, &digest).is_ok());
+        assert!(verify_file(&package, 4, &digest).is_err());
+        assert!(verify_file(&package, 3, &"0".repeat(64)).is_err());
+        fs::write(&package, b"abd").unwrap();
+        assert!(verify_file(&package, 3, &digest).is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1752,13 +1910,28 @@ mod tests {
         );
         let setup = r"C:\Temp\setup.exe";
         let exe = r"C:\Program Files\SnapIt\SnapIt.exe";
+        let sha = "00".repeat(32);
         assert_eq!(
-            installer_args(["app", UPDATE_INSTALL_ARG, setup, exe, "42"]),
+            installer_args([
+                "app",
+                UPDATE_INSTALL_ARG,
+                setup,
+                exe,
+                "42",
+                sha.as_str(),
+                "123"
+            ]),
             InstallerArgs::Install {
                 setup: PathBuf::from(setup),
                 exe: PathBuf::from(exe),
-                pid: 42
+                pid: 42,
+                sha256: sha.clone(),
+                size: 123,
             }
+        );
+        assert_eq!(
+            installer_args(["app", UPDATE_INSTALL_ARG, setup, exe, "42", "bad", "123"]),
+            InstallerArgs::Invalid
         );
         assert_eq!(
             installer_args(["app", UPDATE_INSTALL_ARG]),

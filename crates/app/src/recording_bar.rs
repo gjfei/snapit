@@ -1,4 +1,4 @@
-//! Small topmost control window shown next to the region while a GIF / MP4 is
+//! Small topmost control window shown next to the region while a GIF / APNG / MP4 is
 //! recording: timer, pause / resume, cancel (discard) and stop (save).
 
 use std::time::Duration;

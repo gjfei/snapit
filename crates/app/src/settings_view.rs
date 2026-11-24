@@ -1,24 +1,31 @@
 //! The settings window, built on gpui-kit's `Settings` component.
 
+use std::{cell::Cell, rc::Rc, time::Duration};
+
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     kbd::Kbd,
+    label::Label,
     setting::{
         NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings,
     },
+    switch::Switch,
+    v_flex,
 };
 use gpui_kit::{
-    App, Axis, Context, ElementId, Entity, FocusHandle, IntoElement, Keystroke, Modifiers,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window,
-    div,
+    Animation, AnimationExt as _, AnyElement, App, AsyncApp, Axis, Bounds, Context, Div, ElementId,
+    Entity, FocusHandle, Hsla, IntoElement, Keystroke, Modifiers, ParentElement as _,
+    PathPromptOptions, Pixels, Point, Render, SharedString, Styled as _, Subscription, Window,
+    canvas, div, fill, point,
     prelude::FluentBuilder as _,
     prelude::{InteractiveElement as _, StatefulInteractiveElement as _},
-    px,
+    px, rgb, size,
 };
+use snapit_recorder::{CLICK_DURATION, ClickEffect, ClickEffectGroup};
 use snapit_store::{Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ThemePreference};
 
 use crate::{
@@ -30,6 +37,56 @@ use crate::{
     settings::AppSettings,
     updater,
 };
+
+const ANIMATION_FORMATS: &[(&str, &str)] = &[("gif", "format.gif"), ("apng", "format.apng")];
+
+const CLICK_EFFECT_GROUPS: &[(ClickEffectGroup, &str)] = &[
+    (ClickEffectGroup::Basic, "settings.click_effect.group.basic"),
+    (
+        ClickEffectGroup::Dynamic,
+        "settings.click_effect.group.dynamic",
+    ),
+    (
+        ClickEffectGroup::Particles,
+        "settings.click_effect.group.particles",
+    ),
+    (ClickEffectGroup::Glow, "settings.click_effect.group.glow"),
+];
+const CLICK_PREVIEW_SIZE: f32 = 56.0;
+const CLICK_PREVIEW_RESTORE_DELAY: Duration = Duration::from_millis(1200);
+
+const CLICK_EFFECT_LABELS: &[(ClickEffect, &str)] = &[
+    (ClickEffect::Ring, "settings.click_effect.ring"),
+    (ClickEffect::Dot, "settings.click_effect.dot"),
+    (ClickEffect::Outline, "settings.click_effect.outline"),
+    (ClickEffect::Cross, "settings.click_effect.cross"),
+    (ClickEffect::Burst, "settings.click_effect.burst"),
+    (ClickEffect::Ripple, "settings.click_effect.ripple"),
+    (ClickEffect::Pulse, "settings.click_effect.pulse"),
+    (ClickEffect::Sparkle, "settings.click_effect.sparkle"),
+    (ClickEffect::Firework, "settings.click_effect.firework"),
+    (ClickEffect::Comet, "settings.click_effect.comet"),
+    (ClickEffect::Confetti, "settings.click_effect.confetti"),
+    (ClickEffect::Bloom, "settings.click_effect.bloom"),
+    (ClickEffect::Aurora, "settings.click_effect.aurora"),
+    (ClickEffect::Prism, "settings.click_effect.prism"),
+    (ClickEffect::Diamond, "settings.click_effect.diamond"),
+    (ClickEffect::Corners, "settings.click_effect.corners"),
+    (ClickEffect::Orbit, "settings.click_effect.orbit"),
+    (ClickEffect::Radar, "settings.click_effect.radar"),
+    (ClickEffect::Stardust, "settings.click_effect.stardust"),
+    (ClickEffect::Rocket, "settings.click_effect.rocket"),
+    (ClickEffect::Nebula, "settings.click_effect.nebula"),
+    (ClickEffect::Rainbow, "settings.click_effect.rainbow"),
+];
+
+fn click_effect_label(effect: ClickEffect) -> String {
+    let (_, key) = CLICK_EFFECT_LABELS
+        .iter()
+        .find(|(candidate, _)| *candidate == effect)
+        .expect("every click effect has a label");
+    t!(*key).to_string()
+}
 
 const OCR_LANGUAGES: &[(&str, &str)] = &[
     ("auto", "settings.ocr_language.auto"),
@@ -66,6 +123,8 @@ pub struct SettingsView {
     /// Modifiers held right now, shown live while recording.
     held_modifiers: Modifiers,
     hotkey_errors: [Option<SharedString>; HotkeyAction::COUNT],
+    click_effect_group: ClickEffectGroup,
+    click_preview_trigger: Option<(ClickEffect, u64, Point<Pixels>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -119,11 +178,15 @@ impl SettingsView {
             }));
         }
 
+        let click_effect =
+            ClickEffect::parse(&AppSettings::get(cx).recording.click_effect).unwrap_or_default();
         Self {
             hotkey_focus,
             recording: None,
             held_modifiers: Modifiers::none(),
             hotkey_errors: Default::default(),
+            click_effect_group: click_effect.group(),
+            click_preview_trigger: None,
             _subscriptions: subscriptions,
         }
     }
@@ -441,6 +504,7 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.capture.jpeg_quality as f64),
                         ),
                     ]),
@@ -490,6 +554,7 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.capture.mask_opacity as f64),
                         )
                         .description(t!("settings.mask_opacity.desc").to_string()),
@@ -510,7 +575,7 @@ impl SettingsView {
             )
     }
 
-    fn recording_page(&self) -> SettingPage {
+    fn recording_page(&self, view: &Entity<SettingsView>) -> SettingPage {
         let defaults = RecordingConfig::default();
         let (min_fps, max_fps) = RecordingConfig::FPS_RANGE;
         let (min_secs, max_secs) = RecordingConfig::DURATION_RANGE;
@@ -520,6 +585,31 @@ impl SettingsView {
                 SettingGroup::new()
                     .title(t!("settings.group.recording").to_string())
                     .items([
+                        SettingItem::new(
+                            t!("settings.animation_format").to_string(),
+                            SettingField::dropdown(
+                                ANIMATION_FORMATS
+                                    .iter()
+                                    .map(|(value, key)| {
+                                        ((*value).into(), t!(*key).to_string().into())
+                                    })
+                                    .collect(),
+                                |cx: &App| {
+                                    AppSettings::get(cx)
+                                        .recording
+                                        .animation_format
+                                        .clone()
+                                        .into()
+                                },
+                                |value: SharedString, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.recording.animation_format = value.to_string()
+                                    })
+                                },
+                            )
+                            .default_value("gif"),
+                        )
+                        .description(t!("settings.animation_format.desc").to_string()),
                         SettingItem::new(
                             t!("settings.fps.gif").to_string(),
                             SettingField::number_input(
@@ -535,6 +625,7 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.gif_fps as f64),
                         )
                         .description(t!("settings.fps.gif.desc").to_string()),
@@ -553,9 +644,33 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.mp4_fps as f64),
                         )
                         .description(t!("settings.fps.mp4.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.mp4_bitrate").to_string(),
+                            SettingField::number_input(
+                                NumberFieldOptions {
+                                    min: 0.,
+                                    max: u32::MAX as f64,
+                                    step: 1.,
+                                },
+                                |cx: &App| {
+                                    AppSettings::get(cx).recording.mp4_bitrate_kbps.unwrap_or(0)
+                                        as f64
+                                },
+                                |value: f64, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.recording.mp4_bitrate_kbps =
+                                            Some(value.round() as u32);
+                                    });
+                                },
+                            )
+                            .w_48()
+                            .default_value(0.),
+                        )
+                        .description(t!("settings.mp4_bitrate.desc").to_string()),
                         SettingItem::new(
                             t!("settings.max_duration").to_string(),
                             SettingField::number_input(
@@ -571,6 +686,7 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.max_duration_secs as f64),
                         )
                         .description(t!("settings.max_duration.desc").to_string()),
@@ -587,6 +703,27 @@ impl SettingsView {
                             .default_value(defaults.captures_cursor),
                         )
                         .description(t!("settings.capture_cursor.desc").to_string()),
+                        SettingItem::render({
+                            let view = view.clone();
+                            move |options, _, cx| click_effect_setting(&view, options, cx)
+                        })
+                        .on_reset(
+                            |cx: &App| {
+                                let recording = &AppSettings::get(cx).recording;
+                                !recording.click_effects || recording.click_effect != "ring"
+                            },
+                            |_, cx: &mut App| {
+                                AppSettings::update(cx, |config| {
+                                    config.recording.click_effects = true;
+                                    config.recording.click_effect = "ring".to_string();
+                                })
+                            },
+                        )
+                        .keywords([
+                            t!("settings.click_effects").to_string(),
+                            t!("settings.click_effect").to_string(),
+                            t!("settings.click_effects.desc").to_string(),
+                        ]),
                         SettingItem::new(
                             t!("settings.recording_hdr").to_string(),
                             SettingField::switch(
@@ -670,6 +807,7 @@ impl SettingsView {
                                     })
                                 },
                             )
+                            .w_48()
                             .default_value(defaults.max_items as f64),
                         )
                         .description(t!("settings.history.max_items.desc").to_string()),
@@ -790,6 +928,333 @@ impl SettingsView {
     }
 }
 
+fn click_effect_setting(
+    view: &Entity<SettingsView>,
+    options: &RenderOptions,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let recording = &AppSettings::get(cx).recording;
+    let enabled = recording.click_effects;
+    let theme = cx.theme();
+    let title = t!("settings.click_effects").to_string();
+
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_start()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .max_w_3_5()
+                        .gap_1()
+                        .child(Label::new(title.clone()).text_sm())
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("settings.click_effects.desc").to_string()),
+                        ),
+                )
+                .child(
+                    Switch::new("click-effects")
+                        .accessibility_label(title)
+                        .checked(enabled)
+                        .disabled(options.is_disabled())
+                        .with_size(options.size())
+                        .on_click(move |value: &bool, _, cx: &mut App| {
+                            AppSettings::update(cx, |config| {
+                                config.recording.click_effects = *value;
+                            });
+                        }),
+                ),
+        )
+        .when(enabled && recording.captures_cursor, |this| {
+            this.child(click_effect_picker(view, options, cx))
+        })
+}
+
+fn click_effect_picker(
+    view: &Entity<SettingsView>,
+    options: &RenderOptions,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let recording = &AppSettings::get(cx).recording;
+    let selected = ClickEffect::parse(&recording.click_effect).unwrap_or_default();
+    let selected_group = view.read(cx).click_effect_group;
+    let interactive = recording.captures_cursor && !options.is_disabled();
+    let preview_trigger = view.read(cx).click_preview_trigger;
+    let theme = cx.theme();
+
+    v_flex()
+        .id("click-effect-picker")
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .id("click-effect-groups")
+                .w_full()
+                .gap_1()
+                .flex_nowrap()
+                .overflow_x_scroll()
+                .children(CLICK_EFFECT_GROUPS.iter().map(|(group, group_key)| {
+                    let group = *group;
+                    let label = t!(*group_key).to_string();
+                    let view = view.clone();
+                    Button::new(ElementId::named_usize(
+                        "click-effect-group-tab",
+                        group as usize,
+                    ))
+                    .small()
+                    .ghost()
+                    .selected(group == selected_group)
+                    .toggled(group == selected_group)
+                    .label(label.clone())
+                    .accessibility_label(label)
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |view, cx| {
+                            if view.click_effect_group != group {
+                                view.click_effect_group = group;
+                                cx.notify();
+                            }
+                        });
+                    })
+                })),
+        )
+        .child(
+            h_flex()
+                .id(ElementId::named_usize(
+                    "click-effect-group",
+                    selected_group as usize,
+                ))
+                .w_full()
+                .gap_1()
+                .flex_nowrap()
+                .overflow_x_scroll()
+                .children(selected_group.effects().iter().map(|effect| {
+                    let effect = *effect;
+                    let label = click_effect_label(effect);
+                    let trigger = preview_trigger
+                        .filter(|(triggered, _, _)| *triggered == effect)
+                        .map(|(_, trigger, position)| (trigger, position));
+                    let preview_bounds = Rc::new(Cell::new(None));
+                    let click_bounds = preview_bounds.clone();
+                    let view = view.clone();
+                    Button::new(ElementId::named_usize("click-effect", effect as usize))
+                        .ghost()
+                        .selected(effect == selected)
+                        .disabled(!interactive)
+                        .flex_shrink_0()
+                        .w(px(72.))
+                        .h(px(84.))
+                        .p_1()
+                        .relative()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(if effect == selected {
+                            theme.selection
+                        } else {
+                            theme.background
+                        })
+                        .cursor_pointer()
+                        .accessibility_label(label.clone())
+                        .on_click(move |event, _, cx| {
+                            let position = event
+                                .mouse_position()
+                                .and_then(|position| {
+                                    preview_local_position(position, click_bounds.get())
+                                })
+                                .unwrap_or_else(click_preview_center);
+                            let trigger = view
+                                .read(cx)
+                                .click_preview_trigger
+                                .map_or(1, |(_, trigger, _)| trigger.wrapping_add(1));
+                            let preview_view = view.downgrade();
+                            view.update(cx, |view, cx| {
+                                view.click_effect_group = effect.group();
+                                view.click_preview_trigger = Some((effect, trigger, position));
+                                cx.notify();
+                            });
+                            cx.spawn(async move |cx: &mut AsyncApp| {
+                                cx.background_executor()
+                                    .timer(CLICK_PREVIEW_RESTORE_DELAY)
+                                    .await;
+                                preview_view
+                                    .update(cx, |this, cx| {
+                                        if click_preview_is_current(
+                                            this.click_preview_trigger,
+                                            effect,
+                                            trigger,
+                                        ) {
+                                            this.click_preview_trigger = None;
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                            })
+                            .detach();
+                            AppSettings::update(cx, |config| {
+                                config.recording.click_effect = effect.config_name().to_string();
+                            })
+                        })
+                        .when(effect == selected, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top_1()
+                                    .right_1()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(theme.primary),
+                            )
+                        })
+                        .child(
+                            v_flex()
+                                .size_full()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .child(click_effect_preview(
+                                    effect,
+                                    interactive,
+                                    trigger,
+                                    preview_bounds,
+                                    theme.muted,
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_center()
+                                        .max_w_full()
+                                        .whitespace_normal()
+                                        .text_color(if effect == selected {
+                                            theme.primary
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(label),
+                                ),
+                        )
+                })),
+        )
+}
+
+fn click_effect_preview(
+    effect: ClickEffect,
+    interactive: bool,
+    trigger: Option<(u64, Point<Pixels>)>,
+    preview_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    background: Hsla,
+) -> AnyElement {
+    let animation_bounds = preview_bounds.clone();
+    let animation = trigger.filter(|_| interactive).map(|(nonce, center)| {
+        click_effect_canvas(effect, 0.0, center, animation_bounds.clone()).with_animation(
+            ElementId::named_usize("click-effect-animation", nonce as usize),
+            Animation::new(CLICK_DURATION).with_max_fps(30.0),
+            move |_canvas, phase| {
+                click_effect_canvas(
+                    effect,
+                    click_preview_progress(phase),
+                    center,
+                    animation_bounds.clone(),
+                )
+            },
+        )
+    });
+    let playing = animation.is_some();
+
+    div()
+        .relative()
+        .w(px(CLICK_PREVIEW_SIZE))
+        .h(px(CLICK_PREVIEW_SIZE))
+        .rounded_md()
+        .overflow_hidden()
+        .bg(background)
+        .when(!playing, |this| {
+            this.child(click_effect_canvas(
+                effect,
+                0.0,
+                click_preview_center(),
+                preview_bounds,
+            ))
+        })
+        .when_some(animation, |this, animation| {
+            this.child(div().absolute().inset_0().child(animation))
+        })
+        .into_any_element()
+}
+
+fn click_preview_is_current(
+    current: Option<(ClickEffect, u64, Point<Pixels>)>,
+    effect: ClickEffect,
+    trigger: u64,
+) -> bool {
+    current.is_some_and(|(current_effect, current_trigger, _)| {
+        current_effect == effect && current_trigger == trigger
+    })
+}
+
+fn click_preview_center() -> Point<Pixels> {
+    point(px(CLICK_PREVIEW_SIZE / 2.0), px(CLICK_PREVIEW_SIZE / 2.0))
+}
+
+fn preview_local_position(
+    position: Point<Pixels>,
+    bounds: Option<Bounds<Pixels>>,
+) -> Option<Point<Pixels>> {
+    let bounds = bounds?;
+    bounds
+        .contains(&position)
+        .then(|| point(position.x - bounds.origin.x, position.y - bounds.origin.y))
+}
+
+fn click_preview_progress(phase: f32) -> f64 {
+    phase.clamp(0.0, 1.0) as f64
+}
+
+fn click_effect_canvas(
+    effect: ClickEffect,
+    progress: f64,
+    center: Point<Pixels>,
+    preview_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+) -> Div {
+    div()
+        .w(px(CLICK_PREVIEW_SIZE))
+        .h(px(CLICK_PREVIEW_SIZE))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    preview_bounds.set(Some(bounds));
+                    let cell = bounds.size.width.as_f32() / 64.0;
+                    let offset_x = center.x.as_f32() - 32.0 * cell;
+                    let offset_y = center.y.as_f32() - 32.0 * cell;
+                    effect.visit_preview(progress, 1.0, |x, y, color, opacity| {
+                        let paint = Hsla {
+                            a: opacity as f32,
+                            ..Hsla::from(rgb((u32::from(color[0]) << 16)
+                                | (u32::from(color[1]) << 8)
+                                | u32::from(color[2])))
+                        };
+                        let origin = point(
+                            bounds.origin.x + px(x as f32 * cell + offset_x),
+                            bounds.origin.y + px(y as f32 * cell + offset_y),
+                        );
+                        window.paint_quad(fill(
+                            Bounds::new(origin, size(px(cell + 0.15), px(cell + 0.15))),
+                            paint,
+                        ));
+                    });
+                },
+            )
+            .size_full(),
+        )
+}
+
 /// Records a shortcut by pressing it; `Kbd` renders the caps for this platform.
 fn hotkey_recorder(
     view: &Entity<SettingsView>,
@@ -908,11 +1373,88 @@ impl Render for SettingsView {
                         self.general_page(),
                         self.hotkey_page(&view, cx),
                         self.capture_page(),
-                        self.recording_page(),
+                        self.recording_page(&view),
                         self.ocr_page(),
                         self.history_page(),
                         self.about_page(),
                     ]),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_grouped_click_effect_has_one_card_label() {
+        let labels = CLICK_EFFECT_GROUPS
+            .iter()
+            .flat_map(|(group, _)| group.effects().iter())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), ClickEffect::ALL.len());
+        for effect in ClickEffect::ALL {
+            assert_eq!(
+                CLICK_EFFECT_LABELS
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == effect)
+                    .count(),
+                1
+            );
+            assert!(labels.contains(&effect));
+        }
+    }
+
+    #[test]
+    fn click_preview_starts_immediately_and_plays_one_full_effect() {
+        assert_eq!(click_preview_progress(0.0), 0.0);
+        assert!((click_preview_progress(0.18) - 0.18).abs() < 1e-6);
+        assert_eq!(click_preview_progress(0.5), 0.5);
+        assert_eq!(click_preview_progress(1.0), 1.0);
+    }
+
+    #[test]
+    fn click_preview_thumbnail_returns_to_a_centered_rest_state() {
+        assert_eq!(click_preview_center(), point(px(28.), px(28.)));
+        assert!(CLICK_PREVIEW_RESTORE_DELAY > CLICK_DURATION);
+    }
+
+    #[test]
+    fn only_the_latest_click_can_restore_the_idle_thumbnail() {
+        let center = click_preview_center();
+        assert!(!click_preview_is_current(None, ClickEffect::Ring, 1));
+        assert!(click_preview_is_current(
+            Some((ClickEffect::Ring, 1, center)),
+            ClickEffect::Ring,
+            1,
+        ));
+        assert!(!click_preview_is_current(
+            Some((ClickEffect::Ring, 2, center)),
+            ClickEffect::Ring,
+            1,
+        ));
+        assert!(!click_preview_is_current(
+            Some((ClickEffect::Dot, 1, center)),
+            ClickEffect::Ring,
+            1,
+        ));
+    }
+
+    #[test]
+    fn click_preview_maps_each_click_to_its_position_in_the_canvas() {
+        let bounds = Bounds::new(point(px(100.), px(200.)), size(px(64.), px(64.)));
+        assert_eq!(
+            preview_local_position(point(px(112.), px(233.)), Some(bounds)),
+            Some(point(px(12.), px(33.)))
+        );
+        assert_eq!(
+            preview_local_position(point(px(150.), px(210.)), Some(bounds)),
+            Some(point(px(50.), px(10.)))
+        );
+        assert_eq!(
+            preview_local_position(point(px(99.), px(210.)), Some(bounds)),
+            None
+        );
     }
 }

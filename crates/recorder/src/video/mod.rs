@@ -9,10 +9,13 @@ use std::borrow::Cow;
 
 use snapit_capture::RgbaImage;
 
+use crate::RecordOptions;
+
 mod hdr;
 
-/// Media Foundation writes no `colr` box, so the finished file needs its HDR
-/// tagging added by hand. AVFoundation does it from `AVVideoColorPropertiesKey`.
+/// Media Foundation may omit the `colr` box, so the finished file needs its HDR
+/// tagging inspected and added by hand when necessary. AVFoundation writes it
+/// from `AVVideoColorPropertiesKey`.
 #[cfg(target_os = "windows")]
 mod mp4_colour;
 #[cfg(target_os = "windows")]
@@ -28,33 +31,53 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::open;
 
-/// Shrink a frame to `max_width`, keeping the aspect ratio, and crop it to even
-/// dimensions: H.264 subsamples chroma by two, so every encoder rejects odd
-/// sizes. Cropping a pixel is invisible, resizing is not.
-///
-/// Retina displays deliver frames in physical pixels while the selection is in
-/// logical points, so this halves each axis. That is why both sinks share it.
+/// Shrink a frame to `max_width`, keeping its physical pixels and aspect ratio
+/// when no limit is supplied. GIF accepts odd dimensions and keeps them.
 pub(crate) fn prepare(frame: &RgbaImage, max_width: Option<u32>) -> Cow<'_, RgbaImage> {
-    let (width, height) = frame.dimensions();
-    let scaled = match max_width.filter(|limit| *limit > 0 && *limit < width) {
+    let (width, _) = frame.dimensions();
+    match max_width.filter(|limit| *limit > 0 && *limit < width) {
         Some(limit) => {
             let limit = limit.max(2);
             let scale = limit as f32 / width as f32;
             let width = ((width as f32 * scale).round() as u32).max(2);
-            let height = ((height as f32 * scale).round() as u32).max(2);
+            let height = ((frame.height() as f32 * scale).round() as u32).max(2);
             Cow::Owned(box_downscale(frame, width, height))
         }
         None => Cow::Borrowed(frame),
-    };
+    }
+}
+
+/// H.264 and HEVC subsample chroma by two, so their input must be even-sized.
+pub(crate) fn prepare_video(frame: &RgbaImage, max_width: Option<u32>) -> Cow<'_, RgbaImage> {
+    let scaled = prepare(frame, max_width);
     let (width, height) = scaled.dimensions();
     let (even_width, even_height) = (width & !1, height & !1);
     if (even_width, even_height) == (width, height) {
         return scaled;
     }
-    let mut cropped = scaled.into_owned();
-    cropped =
-        image::imageops::crop_imm(&cropped, 0, 0, even_width.max(2), even_height.max(2)).to_image();
-    Cow::Owned(cropped)
+    Cow::Owned(
+        image::imageops::crop_imm(scaled.as_ref(), 0, 0, even_width.max(2), even_height.max(2))
+            .to_image(),
+    )
+}
+
+/// Screen content needs enough headroom for small text and one-pixel edges.
+pub(crate) fn bitrate(width: u32, height: u32, options: &RecordOptions) -> u32 {
+    if let Some(kbps) = options.mp4_bitrate_kbps.filter(|value| *value > 0) {
+        let bits = kbps.saturating_mul(1000);
+        log::info!("MP4 target bitrate: {bits} bit/s (configured {kbps} Kbps)");
+        return bits;
+    }
+
+    let pixels = width as f64 * height as f64;
+    let quality = (options.quality.max(1) as f64) / 90.0;
+    let bits = pixels * options.fps.max(1) as f64 * 0.1 * quality;
+    let bits = bits.clamp(500_000.0, 50_000_000.0) as u32;
+    log::info!(
+        "MP4 target bitrate: {bits} bit/s (automatic, {width}x{height} at {} fps)",
+        options.fps
+    );
+    bits
 }
 
 /// Area-average downscale in one sequential pass over the source.
@@ -132,15 +155,45 @@ mod tests {
     #[test]
     fn downscaling_keeps_the_aspect_ratio() {
         let wide = prepare(&frame(1800, 1000), Some(901)).into_owned();
-        assert_eq!(wide.dimensions(), (900, 500));
+        assert_eq!(wide.dimensions(), (901, 501));
+        let video = prepare_video(&frame(1800, 1000), Some(901)).into_owned();
+        assert_eq!(video.dimensions(), (900, 500));
     }
 
     #[test]
-    fn odd_sizes_are_cropped_to_even() {
-        let cropped = prepare(&frame(1001, 501), None).into_owned();
+    fn odd_sizes_are_preserved_for_animation_and_cropped_for_video() {
+        let image = frame(1001, 501);
+        assert_eq!(prepare(&image, None).dimensions(), (1001, 501));
+        let cropped = prepare_video(&image, None).into_owned();
         assert_eq!(cropped.dimensions(), (1000, 500));
-        let after_scale = prepare(&frame(1001, 501), Some(501)).into_owned();
+        let after_scale = prepare_video(&image, Some(501)).into_owned();
         assert_eq!(after_scale.dimensions(), (500, 250));
+    }
+
+    #[test]
+    fn native_frame_rate_and_resolution_keep_text_headroom() {
+        let options = RecordOptions::default().with_fps(30);
+        assert_eq!(bitrate(1920, 1080, &options), 6_220_800);
+        assert_eq!(bitrate(3840, 2160, &options), 24_883_200);
+        assert_eq!(bitrate(5120, 2880, &options), 44_236_800);
+        assert_eq!(bitrate(6144, 3456, &options), 50_000_000);
+    }
+
+    #[test]
+    fn configured_bitrate_overrides_automatic_target() {
+        let automatic = RecordOptions::default().with_fps(15);
+        let zero = RecordOptions::default()
+            .with_fps(15)
+            .with_mp4_bitrate_kbps(Some(0));
+        assert_eq!(bitrate(1920, 1080, &zero), bitrate(1920, 1080, &automatic));
+
+        let configured = automatic.clone().with_mp4_bitrate_kbps(Some(12_345));
+        for (width, height) in [(320, 240), (3840, 2160), (6144, 3456)] {
+            assert_eq!(bitrate(width, height, &configured), 12_345_000);
+        }
+
+        let unlimited = configured.with_mp4_bitrate_kbps(Some(u32::MAX));
+        assert_eq!(bitrate(1920, 1080, &unlimited), u32::MAX);
     }
 
     #[test]

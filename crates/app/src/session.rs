@@ -2001,17 +2001,6 @@ impl CaptureSession {
         );
         result
     }
-
-    /// Crop plus baked annotations (Copy / Save / Pin). A combined selection is
-    /// annotated as a whole; a cross-display collection is copied unannotated.
-    pub fn export_selections(&self) -> Option<(RgbaImage, Bounds<Pixels>)> {
-        let (mut image, bounds) = self.crop_selections()?;
-        if self.extra_selections.is_empty() {
-            let scale = image.width() as f32 / bounds.size.width.as_f32().max(1.0);
-            annotate::bake(&mut image, self.annotations.committed(), scale);
-        }
-        Some((image, bounds))
-    }
 }
 
 /// Stack crops top to bottom on a transparent canvas wide enough for the widest.

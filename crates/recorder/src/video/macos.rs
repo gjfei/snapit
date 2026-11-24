@@ -19,11 +19,12 @@ use objc2::{AnyThread as _, Message};
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVFileTypeMPEG4,
     AVMediaTypeVideo, AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264,
-    AVVideoCodecTypeHEVC, AVVideoColorPrimaries_ITU_R_2020, AVVideoColorPrimariesKey,
-    AVVideoColorPropertiesKey, AVVideoCompressionPropertiesKey, AVVideoExpectedSourceFrameRateKey,
-    AVVideoHeightKey, AVVideoProfileLevelKey, AVVideoTransferFunction_SMPTE_ST_2084_PQ,
-    AVVideoTransferFunctionKey, AVVideoWidthKey, AVVideoYCbCrMatrix_ITU_R_2020,
-    AVVideoYCbCrMatrixKey,
+    AVVideoCodecTypeHEVC, AVVideoColorPrimaries_ITU_R_709_2, AVVideoColorPrimaries_ITU_R_2020,
+    AVVideoColorPrimariesKey, AVVideoColorPropertiesKey, AVVideoCompressionPropertiesKey,
+    AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey, AVVideoProfileLevelKey,
+    AVVideoTransferFunction_ITU_R_709_2, AVVideoTransferFunction_SMPTE_ST_2084_PQ,
+    AVVideoTransferFunctionKey, AVVideoWidthKey, AVVideoYCbCrMatrix_ITU_R_709_2,
+    AVVideoYCbCrMatrix_ITU_R_2020, AVVideoYCbCrMatrixKey,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::CMTime;
@@ -34,38 +35,53 @@ use objc2_core_video::{
     CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
-use objc2_foundation::{NSMutableDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSError, NSMutableDictionary, NSNumber, NSString, NSURL};
 use snapit_capture::{HdrImage, RgbaImage};
 
-use super::{hdr, prepare};
+use super::{bitrate, hdr, prepare_video};
 use crate::{FrameData, FrameSink, RecordOptions};
 
 /// The timescale presentation timestamps are expressed in; 600 is what
 /// AVFoundation uses for the movie itself.
 const TIMESCALE: i32 = 600;
 
+#[derive(Default)]
+struct PresentationTimes {
+    last_tick: Option<i64>,
+}
+
+impl PresentationTimes {
+    fn next(&mut self, at: Duration) -> i64 {
+        let tick = (at.as_secs_f64() * f64::from(TIMESCALE)).round() as i64;
+        let tick = tick.max(self.last_tick.map_or(0, |last| last + 1));
+        self.last_tick = Some(tick);
+        tick
+    }
+}
+
 pub(crate) struct Mp4Sink {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
     adaptor: Retained<AVAssetWriterInputPixelBufferAdaptor>,
-    /// Output dimensions, after the logical-width cap.
+    /// Output dimensions after the optional width limit and even-size crop.
     width: usize,
     height: usize,
     max_width: Option<u32>,
     /// Last encoded frame and its timestamp: a still tail is only visible in
     /// the file if something is written after it.
-    last: Option<(RgbaImage, Duration)>,
+    last: Option<(Arc<RgbaImage>, Duration)>,
     frames: usize,
     t_scale: Duration,
     t_buffer: Duration,
     t_copy: Duration,
     t_wait: Duration,
     t_append: Duration,
+    presentation: PresentationTimes,
 }
 
 impl Mp4Sink {
     pub(crate) fn new(path: &Path, options: &RecordOptions, probe: &RgbaImage) -> Result<Self> {
-        let first = prepare(probe, options.max_width);
+        let first = prepare_video(probe, options.max_width);
         let (width, height) = first.dimensions();
         let (width_usize, height_usize) = (width as usize, height as usize);
 
@@ -82,6 +98,7 @@ impl Mp4Sink {
 
         let settings = NSMutableDictionary::<NSString, AnyObject>::new();
         let compression = NSMutableDictionary::<NSString, AnyObject>::new();
+        let color = NSMutableDictionary::<NSString, AnyObject>::new();
         unsafe {
             compression.insert(
                 AVVideoAverageBitRateKey.ok_or_else(|| anyhow!("missing bit rate key"))?,
@@ -108,6 +125,25 @@ impl Mp4Sink {
                 AVVideoCompressionPropertiesKey
                     .ok_or_else(|| anyhow!("missing compression key"))?,
                 any(&*compression),
+            );
+            color.insert(
+                AVVideoColorPrimariesKey.ok_or_else(|| anyhow!("missing primaries key"))?,
+                any(AVVideoColorPrimaries_ITU_R_709_2
+                    .ok_or_else(|| anyhow!("BT.709 unavailable"))?),
+            );
+            color.insert(
+                AVVideoTransferFunctionKey.ok_or_else(|| anyhow!("missing transfer key"))?,
+                any(AVVideoTransferFunction_ITU_R_709_2
+                    .ok_or_else(|| anyhow!("BT.709 transfer unavailable"))?),
+            );
+            color.insert(
+                AVVideoYCbCrMatrixKey.ok_or_else(|| anyhow!("missing matrix key"))?,
+                any(AVVideoYCbCrMatrix_ITU_R_709_2
+                    .ok_or_else(|| anyhow!("BT.709 matrix unavailable"))?),
+            );
+            settings.insert(
+                AVVideoColorPropertiesKey.ok_or_else(|| anyhow!("missing color key"))?,
+                any(&*color),
             );
         }
 
@@ -155,6 +191,7 @@ impl Mp4Sink {
             t_copy: Duration::ZERO,
             t_wait: Duration::ZERO,
             t_append: Duration::ZERO,
+            presentation: PresentationTimes::default(),
         })
     }
 
@@ -213,14 +250,20 @@ impl Mp4Sink {
         self.t_wait += wait_started.elapsed();
 
         let append_started = Instant::now();
-        let time = unsafe { CMTime::with_seconds(at.as_secs_f64(), TIMESCALE) };
+        let tick = self.presentation.next(at);
+        let time = unsafe { CMTime::new(tick, TIMESCALE) };
         let appended = unsafe {
             self.adaptor
                 .appendPixelBuffer_withPresentationTime(&buffer, time)
         };
         self.t_append += append_started.elapsed();
         if !appended {
-            bail!("failed to append a frame: {}", status(&self.writer));
+            bail!(
+                "failed to append frame {} at {:.3} ms (tick {tick}/{TIMESCALE}): {}",
+                self.frames + 1,
+                at.as_secs_f64() * 1000.0,
+                status(&self.writer)
+            );
         }
         self.frames += 1;
         Ok(())
@@ -232,7 +275,7 @@ impl Mp4Sink {
 unsafe impl Send for Mp4Sink {}
 
 impl FrameSink for Mp4Sink {
-    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
         // `open` only routes SDR frames here; tonemapping keeps the sink
         // correct for a caller that hands it an extended-range frame.
         let frame = match frame {
@@ -243,11 +286,17 @@ impl FrameSink for Mp4Sink {
         // needs one more sample, and cloning the capture (or scaling it again)
         // would mean another pass over four times as many pixels.
         let scaled_started = Instant::now();
-        let scaled = prepare(&frame, self.max_width).into_owned();
+        let scaled = prepare_video(&frame, self.max_width);
         self.t_scale += scaled_started.elapsed();
         self.append_scaled(&scaled, at)?;
-        self.last = Some((scaled, at));
-        Ok(())
+        self.last = Some((
+            match scaled {
+                std::borrow::Cow::Borrowed(_) => Arc::clone(&frame),
+                std::borrow::Cow::Owned(image) => Arc::new(image),
+            },
+            at,
+        ));
+        Ok(true)
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -337,6 +386,7 @@ pub(crate) struct HdrMp4Sink {
     t_copy: Duration,
     t_wait: Duration,
     t_append: Duration,
+    presentation: PresentationTimes,
 }
 
 unsafe impl Send for HdrMp4Sink {}
@@ -467,6 +517,7 @@ impl HdrMp4Sink {
             t_copy: Duration::ZERO,
             t_wait: Duration::ZERO,
             t_append: Duration::ZERO,
+            presentation: PresentationTimes::default(),
         })
     }
 
@@ -509,14 +560,20 @@ impl HdrMp4Sink {
         self.t_wait += wait_started.elapsed();
 
         let append_started = Instant::now();
-        let time = unsafe { CMTime::with_seconds(at.as_secs_f64(), TIMESCALE) };
+        let tick = self.presentation.next(at);
+        let time = unsafe { CMTime::new(tick, TIMESCALE) };
         let appended = unsafe {
             self.adaptor
                 .appendPixelBuffer_withPresentationTime(&buffer, time)
         };
         self.t_append += append_started.elapsed();
         if !appended {
-            bail!("failed to append a frame: {}", status(&self.writer));
+            bail!(
+                "failed to append frame {} at {:.3} ms (tick {tick}/{TIMESCALE}): {}",
+                self.frames + 1,
+                at.as_secs_f64() * 1000.0,
+                status(&self.writer)
+            );
         }
         self.frames += 1;
         self.last_at = Some(at);
@@ -525,7 +582,7 @@ impl HdrMp4Sink {
 }
 
 impl FrameSink for HdrMp4Sink {
-    fn push(&mut self, frame: FrameData, at: Duration) -> Result<()> {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
         let FrameData::Hdr(hdr) = frame else {
             bail!("the HEVC Main10 sink only accepts extended-range frames");
         };
@@ -547,7 +604,8 @@ impl FrameSink for HdrMp4Sink {
         let convert_started = Instant::now();
         hdr::convert_into(&scaled, &mut self.y, &mut self.uv);
         self.t_convert += convert_started.elapsed();
-        self.append_planes(at)
+        self.append_planes(at)?;
+        Ok(true)
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
@@ -610,15 +668,6 @@ fn planar_pixel_buffer(width: usize, height: usize) -> Result<CFRetained<CVPixel
     Ok(unsafe { CFRetained::from_raw(raw) })
 }
 
-/// Bits per second for a screen recording: screen content compresses far
-/// better than camera footage, so this sits below the usual 0.1 bpp ladder.
-fn bitrate(width: u32, height: u32, options: &RecordOptions) -> u32 {
-    let pixels = width as f64 * height as f64;
-    let quality = (options.quality.max(1) as f64) / 90.0;
-    let bits = pixels * options.fps.max(1) as f64 * 0.06 * quality;
-    bits.clamp(500_000.0, 25_000_000.0) as u32
-}
-
 fn pixel_buffer(frame: &RgbaImage) -> Result<CFRetained<CVPixelBuffer>> {
     let (width, height) = frame.dimensions();
     let mut raw: *mut CVPixelBuffer = std::ptr::null_mut();
@@ -645,7 +694,7 @@ fn status(writer: &AVAssetWriter) -> String {
             0 => "cancelled".to_string(),
             2 => "completed".to_string(),
             3 => match writer.error() {
-                Some(err) => format!("failed: {}", err.localizedDescription()),
+                Some(err) => format!("failed: {}", error_description(&err)),
                 None => "failed".to_string(),
             },
             _ => format!("status {}", writer.status().0),
@@ -653,10 +702,53 @@ fn status(writer: &AVAssetWriter) -> String {
     }
 }
 
+fn error_description(error: &NSError) -> String {
+    let domain = error.domain().to_string();
+    let description = error.localizedDescription().to_string();
+    let underlying = error.underlyingErrors();
+    if underlying.count() == 0 {
+        format!("{description} ({domain}, code {})", error.code())
+    } else {
+        let nested = underlying.objectAtIndex(0);
+        format!(
+            "{} ({}, code {}); underlying {} ({}, code {})",
+            description,
+            domain,
+            error.code(),
+            nested.localizedDescription(),
+            nested.domain(),
+            nested.code()
+        )
+    }
+}
+
 /// Borrow any object as `AnyObject` for the dictionary APIs. Every Objective-C
 /// object shares the layout of an opaque pointer, so the cast is a no-op.
 fn any<T: Message>(object: &T) -> &AnyObject {
     unsafe { &*(object as *const T as *const AnyObject) }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn sub_tick_timestamps_still_advance_by_one_media_tick() {
+        let mut times = PresentationTimes::default();
+        assert_eq!(times.next(Duration::ZERO), 0);
+        assert_eq!(times.next(Duration::from_micros(500)), 1);
+        assert_eq!(times.next(Duration::from_micros(1_000)), 2);
+        assert_eq!(times.next(Duration::from_micros(1_100)), 3);
+        assert_eq!(times.next(Duration::from_millis(2)), 4);
+    }
+
+    #[test]
+    fn backwards_timestamps_never_repeat_or_move_back() {
+        let mut times = PresentationTimes::default();
+        assert_eq!(times.next(Duration::from_millis(100)), 60);
+        assert_eq!(times.next(Duration::from_millis(90)), 61);
+        assert_eq!(times.next(Duration::from_millis(90)), 62);
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +765,53 @@ mod hdr_sink_tests {
     /// in HDR mode. Run it with
     /// `cargo test -p snapit-recorder hdr_sink -- --ignored`, then play the
     /// file it names.
+    #[test]
+    #[ignore = "encodes with the system H.264 encoder and writes a file"]
+    fn sdr_sink_keeps_native_dimensions_and_tags_bt709() {
+        let path = std::env::temp_dir().join("snapit-sdr-macos-test.mp4");
+        let _ = std::fs::remove_file(&path);
+        let options = RecordOptions::default()
+            .with_format(RecordFormat::Mp4)
+            .with_fps(15);
+        let colours = [[240, 240, 240], [220, 40, 30], [30, 200, 60]];
+        let first = FrameData::Sdr(Arc::new(RgbaImage::from_pixel(
+            323,
+            203,
+            image::Rgba([colours[0][0], colours[0][1], colours[0][2], 255]),
+        )));
+        let mut sink = open(&path, &options, &first).expect("mp4 sink");
+
+        for index in 0..320 {
+            let colour = colours[index % colours.len()];
+            let frame = FrameData::Sdr(Arc::new(RgbaImage::from_pixel(
+                323,
+                203,
+                image::Rgba([colour[0], colour[1], colour[2], 255]),
+            )));
+            let at = match index {
+                0 => Duration::ZERO,
+                1 => Duration::from_micros(500),
+                2 => Duration::from_millis(1),
+                3 => Duration::from_micros(1_100),
+                _ => Duration::from_millis((index as u64 - 3) * 33),
+            };
+            sink.push(frame, at).expect("push");
+        }
+        sink.finish(Duration::from_secs(11)).expect("finalize");
+
+        let bytes = std::fs::read(&path).expect("the encoder wrote nothing");
+        let entry = find(&bytes, b"avc1").expect("no avc1 sample entry") - 4;
+        let width = u16::from_be_bytes(bytes[entry + 32..entry + 34].try_into().unwrap());
+        let height = u16::from_be_bytes(bytes[entry + 34..entry + 36].try_into().unwrap());
+        assert_eq!((width, height), (322, 202));
+        let colr = find(&bytes, b"colrnclx").expect("no colr/nclx box in the file");
+        assert_eq!(
+            &bytes[colr + 8..colr + 15],
+            &[0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00],
+            "expected BT.709 primaries, transfer and matrix with video range"
+        );
+    }
+
     #[test]
     #[ignore = "encodes with the system HEVC encoder and writes a file"]
     fn main10_sink_writes_an_hdr10_container() {

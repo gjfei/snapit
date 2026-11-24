@@ -4,31 +4,33 @@
 //! and the recording bar all drive the same state machine.
 
 use std::{
-    cell::RefCell,
     path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, ClipboardItem, Context, Entity,
     Global, Image, ImageFormat, Pixels, SharedString, Subscription, TitlebarOptions, WeakEntity,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
-use snapit_capture::{HdrImage, RgbaImage};
+use snapit_capture::{HdrImage, HdrPngCache, RgbaImage};
 use snapit_ocr::{OcrEngine, OcrOptions};
-use snapit_recorder::{RecordFormat, RecordOptions, Recorder};
+use snapit_recorder::{ClickEffect, RecordFormat, RecordOptions, Recorder, RecorderStart};
 use snapit_store::{EntryKind, ImageFormat as SaveFormat};
 
+use crate::annotate::{BakedImage, Shape};
 use crate::appearance;
 use crate::clipboard;
 use crate::history_store::HistoryStore;
 use crate::history_view::HistoryView;
 use crate::hotkey::HotkeyAction;
 use crate::ocr_view::OcrView;
-use crate::overlay::OverlayView;
+use crate::overlay::{OverlayView, after_presented_frame};
 use crate::permission_view::PermissionView;
 use crate::permissions::{self, Permission};
 use crate::pin;
@@ -73,8 +75,11 @@ struct OverlayWindow {
 }
 
 struct ActiveRecording {
+    /// Distinguishes delayed callbacks from an older recording session.
+    id: u64,
     /// `None` while the recorder is starting, or after stop while the encoder flushes.
     recorder: Option<Recorder>,
+    start: Option<RecorderStart>,
     bar: Option<AnyWindowHandle>,
     /// The recorded display's overlay, kept on screen as the region highlight.
     frame: Option<AnyWindowHandle>,
@@ -99,16 +104,40 @@ struct ActiveRecording {
 pub struct Captured {
     pub image: Arc<RgbaImage>,
     pub hdr: Option<Arc<HdrImage>>,
+    pub hdr_png: Option<Arc<HdrPngCache>>,
+    pub baked: Option<Arc<BakedImage>>,
     pub scale: f32,
 }
 
 impl Captured {
-    fn new(image: RgbaImage, hdr: Option<HdrImage>, selection: Bounds<Pixels>) -> Self {
+    fn new(
+        image: RgbaImage,
+        hdr: Option<HdrImage>,
+        selection: Bounds<Pixels>,
+        shapes: Option<Arc<Vec<Shape>>>,
+    ) -> Self {
         let logical_width = selection.size.width.as_f32().max(1.0);
+        let scale = (image.width() as f32 / logical_width).max(0.1);
+        let image = Arc::new(image);
+        let baked =
+            shapes.map(|shapes| Arc::new(BakedImage::new(image.as_ref().clone(), shapes, scale)));
+        let hdr_png = hdr.as_ref().map(|hdr| Arc::new(HdrPngCache::new(hdr)));
         Self {
-            scale: (image.width() as f32 / logical_width).max(0.1),
-            image: Arc::new(image),
+            scale,
+            image,
             hdr: hdr.map(Arc::new),
+            hdr_png,
+            baked,
+        }
+    }
+
+    fn resolved(&self) -> Self {
+        Self {
+            image: self
+                .baked
+                .as_ref()
+                .map_or_else(|| self.image.clone(), |baked| baked.get()),
+            ..self.clone()
         }
     }
 }
@@ -161,8 +190,11 @@ pub struct Controller {
     /// synchronously.
     pending_close: Vec<AnyWindowHandle>,
     recording: Option<ActiveRecording>,
+    recording_serial: u64,
+    workflow_serial: u64,
     ocr: OcrState,
     ocr_revision: usize,
+    ocr_engine_revision: u64,
     ocr_engine: Option<Arc<dyn OcrEngine>>,
     last_capture: Option<Captured>,
     /// Screen the user last captured/recorded on. Panel windows (and their
@@ -182,21 +214,6 @@ struct GlobalController(Entity<Controller>);
 
 impl Global for GlobalController {}
 
-/// Run `callback` once the window has presented a frame with its current
-/// content. `Window::on_next_frame` runs callbacks before the frame is drawn,
-/// so the callback has to wait for one more frame.
-fn after_presented_frame(window: &mut Window, callback: impl FnOnce(&mut App) + 'static) {
-    let pending = Rc::new(RefCell::new(Some(callback)));
-    window.on_next_frame(move |window, _| {
-        let pending = pending.clone();
-        window.on_next_frame(move |_, cx| {
-            if let Some(callback) = pending.borrow_mut().take() {
-                callback(cx);
-            }
-        });
-    });
-}
-
 impl Controller {
     pub fn init(cx: &mut App) -> Entity<Self> {
         let controller = cx.new(|_| Self {
@@ -205,8 +222,11 @@ impl Controller {
             selection: None,
             pending_close: Vec::new(),
             recording: None,
+            recording_serial: 0,
+            workflow_serial: 0,
             ocr: OcrState::Idle,
             ocr_revision: 0,
+            ocr_engine_revision: 0,
             ocr_engine: None,
             last_capture: None,
             last_display_id: None,
@@ -314,7 +334,7 @@ impl Controller {
         let intent = match action {
             HotkeyAction::Screenshot => CaptureIntent::Choose,
             HotkeyAction::Ocr => CaptureIntent::Recognize,
-            HotkeyAction::Gif => CaptureIntent::Record(RecordFormat::Gif),
+            HotkeyAction::Gif => CaptureIntent::Record(last_animation_format(cx)),
             HotkeyAction::Video => CaptureIntent::Record(RecordFormat::Mp4),
         };
         if self.recording.is_some() {
@@ -326,6 +346,7 @@ impl Controller {
     }
 
     pub fn reset_ocr_engine(&mut self) {
+        self.ocr_engine_revision = self.ocr_engine_revision.wrapping_add(1);
         self.ocr_engine = None;
     }
 
@@ -338,6 +359,7 @@ impl Controller {
         let options = OcrOptions::default().with_languages(settings_view::ocr_languages(
             &AppSettings::get(cx).ocr.language,
         ));
+        let revision = self.ocr_engine_revision;
         cx.spawn(async move |this, cx| {
             let engine = cx
                 .background_spawn(async move {
@@ -349,7 +371,9 @@ impl Controller {
             match engine {
                 Ok(engine) => {
                     this.update(cx, |this, _| {
-                        this.ocr_engine.get_or_insert(Arc::from(engine));
+                        if this.ocr_engine_revision == revision {
+                            this.ocr_engine.get_or_insert(Arc::from(engine));
+                        }
                     })
                     .ok();
                 }
@@ -460,6 +484,7 @@ impl Controller {
         if self.is_busy() {
             return;
         }
+        self.workflow_serial = self.workflow_serial.wrapping_add(1);
         crate::logging::begin_capture();
         log::info!("capture start: intent={intent:?}");
         self.busy = Some(Busy::Capturing);
@@ -757,12 +782,11 @@ impl Controller {
                 session.finish_annotations();
             }
             let hdr = if want_hdr { session.export_hdr() } else { None };
-            let image = if bake {
-                session.export_selections()
-            } else {
-                session.crop_selections()
-            }
-            .map(|(image, bounds)| Captured::new(image, hdr, bounds));
+            let image = session.crop_selections().map(|(image, bounds)| {
+                let shapes = (bake && !multi && !session.annotations().committed().is_empty())
+                    .then(|| Arc::new(session.annotations().committed().to_vec()));
+                Captured::new(image, hdr, bounds, shapes)
+            });
             let record_target = session.selected_frame().map(|(frame, bounds)| {
                 (
                     frame.monitor_id(),
@@ -815,7 +839,7 @@ impl Controller {
                     },
                 );
                 // Open after the overlays are gone so the pin is not stacked beneath them.
-                cx.defer(move |cx| pin::open(captured, placement, cx));
+                self.open_pin_async(captured, placement, cx);
             }
             (SessionCommand::Recognize, Some(captured)) => self.recognize(captured, cx),
             (SessionCommand::Record(format), Some(_)) => {
@@ -872,16 +896,49 @@ impl Controller {
     /// Keep a capture for "pin last capture" and auto-save it to history.
     fn remember(&mut self, captured: &Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let (image, hdr, scale) = (captured.image.clone(), captured.hdr.clone(), captured.scale);
+        let (image, baked, hdr_png, scale) = (
+            captured.image.clone(),
+            captured.baked.clone(),
+            captured.hdr_png.clone(),
+            captured.scale,
+        );
         HistoryStore::global(cx).update(cx, |history, cx| {
-            history.add_image(image, hdr, scale, None, cx)
+            history.add_image(image, baked, hdr_png, scale, None, cx)
         });
+    }
+
+    fn open_pin_async(
+        &mut self,
+        captured: Captured,
+        placement: Option<pin::Placement>,
+        cx: &mut Context<Self>,
+    ) {
+        let controller = cx.entity();
+        let workflow = self.workflow_serial;
+        cx.spawn(async move |this, cx| {
+            let captured = cx
+                .background_spawn(async move { captured.resolved() })
+                .await;
+            this.update(cx, |_, cx| {
+                if controller.read(cx).workflow_serial != workflow {
+                    return;
+                }
+                let controller = controller.clone();
+                cx.defer(move |cx| {
+                    if controller.read(cx).workflow_serial == workflow {
+                        pin::open(captured, placement, cx);
+                    }
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Pin the most recent capture of this session, else the newest image in history.
     pub fn pin_last(&mut self, cx: &mut Context<Self>) {
         if let Some(captured) = self.last_capture.clone() {
-            cx.defer(move |cx| pin::open(captured, None, cx));
+            self.open_pin_async(captured, None, cx);
             return;
         }
         match HistoryStore::global(cx).read(cx).latest_image() {
@@ -898,28 +955,31 @@ impl Controller {
             let png = cx
                 .background_spawn(async move {
                     let started = Instant::now();
+                    let captured = captured.resolved();
                     // Put the same HDR data on the clipboard that Save and the
                     // history original use. GPUI writes PNG bytes verbatim on
                     // both platforms, so the 16-bit + cICP payload survives.
-                    let png = match captured.hdr.as_deref() {
-                        Some(hdr) => match snapit_capture::encode_png_hdr(hdr) {
+                    let png = match captured.hdr_png.as_deref() {
+                        Some(cache) => match cache.get() {
                             Ok(bytes) => {
                                 log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
                                 Ok(bytes)
                             }
                             Err(err) => {
-                                log::warn!("copy: HDR encode failed, falling back to SDR: {err:#}");
-                                snapit_capture::encode_png(&captured.image)
+                                log::warn!("copy: HDR encode failed, falling back to SDR: {err}");
+                                snapit_capture::encode_png(&captured.image).map(Arc::new)
                             }
                         },
-                        None => snapit_capture::encode_png(&captured.image),
+                        None => snapit_capture::encode_png(&captured.image).map(Arc::new),
                     };
                     log::info!(
                         target: "timing",
                         "copy: {width}x{height} PNG encode {:.1} ms",
                         ms(started.elapsed())
                     );
-                    png
+                    png.map(|png| {
+                        Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone())
+                    })
                 })
                 .await;
             let encode = encoded.elapsed();
@@ -960,7 +1020,13 @@ impl Controller {
     }
 
     pub(crate) fn save_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
-        let Captured { image, hdr, .. } = captured;
+        let Captured {
+            image,
+            hdr,
+            hdr_png,
+            baked,
+            ..
+        } = captured;
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
         let name = format!("SnapIt {}.{}", timestamp(), format.extension());
@@ -986,14 +1052,20 @@ impl Controller {
             let saved = cx
                 .background_spawn(async move {
                     let writing = Instant::now();
+                    let image = baked.map_or(image, |baked| baked.get());
                     let branch = match (format, &hdr) {
                         (SaveFormat::Png, Some(_)) => "HDR PNG (16-bit + cICP)",
                         (SaveFormat::Png, None) => "SDR PNG (8-bit)",
                         (SaveFormat::Jpg, _) => "JPEG (8-bit)",
                     };
                     log::info!("save branch: {branch}");
-                    let result = match (format, hdr) {
-                        (SaveFormat::Png, Some(hdr)) => snapit_capture::save_png_hdr(&hdr, &path),
+                    let result = match (format, hdr_png) {
+                        (SaveFormat::Png, Some(cache)) => {
+                            cache.get().map_err(anyhow::Error::msg).and_then(|bytes| {
+                                std::fs::write(&path, bytes.as_slice())
+                                    .with_context(|| format!("failed to write {}", path.display()))
+                            })
+                        }
                         (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
                         (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
                     };
@@ -1030,7 +1102,12 @@ impl Controller {
 
     fn recognize(&mut self, captured: Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let Captured { image, hdr, scale } = captured;
+        let Captured {
+            image,
+            hdr_png,
+            scale,
+            ..
+        } = captured;
         let history_image = image.clone();
         self.ocr = OcrState::Running;
         self.ocr_revision += 1;
@@ -1040,6 +1117,7 @@ impl Controller {
             &AppSettings::get(cx).ocr.language,
         ));
         let revision = self.ocr_revision;
+        let engine_revision = self.ocr_engine_revision;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -1057,7 +1135,7 @@ impl Controller {
                     .ok()
                     .map(|(_, blocks)| snapit_ocr::blocks_to_text(blocks));
                 HistoryStore::global(cx).update(cx, |history, cx| {
-                    history.add_image(history_image, hdr, scale, text.clone(), cx)
+                    history.add_image(history_image, None, hdr_png, scale, text.clone(), cx)
                 });
                 if this.ocr_revision != revision {
                     return;
@@ -1065,7 +1143,9 @@ impl Controller {
                 this.ocr = match result {
                     Ok((engine, _)) => {
                         let name = engine.name();
-                        this.ocr_engine = Some(engine);
+                        if this.ocr_engine_revision == engine_revision {
+                            this.ocr_engine = Some(engine);
+                        }
                         let text: SharedString = text.unwrap_or_default().into();
                         if !text.is_empty() {
                             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
@@ -1098,31 +1178,33 @@ impl Controller {
         log::info!("recording start: format={format:?} display={monitor_id} region={region:?}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
-        // Remember the choice so the overlay's record button repeats it.
-        if last_record_format(cx) != format {
-            AppSettings::update(cx, |config| {
-                config.recording.last_format = format.extension().to_string()
-            });
-        }
         let recording = &AppSettings::get(cx).recording;
-        // GIF and MP4 are tuned separately: a palette container stays small at
-        // a low rate, while a video codec can afford a smoother one.
+        // GIF and APNG share the animation rate; MP4 can afford a smoother one.
         let fps = match format {
-            RecordFormat::Gif => recording.gif_fps,
+            RecordFormat::Gif | RecordFormat::Apng => recording.gif_fps,
             RecordFormat::Mp4 => recording.mp4_fps,
         };
         let (output, dest) = recording_paths(cx, format);
+        // Keep the per-display gate used by still capture; this runs on the main
+        // thread because macOS HDR capability comes from NSScreen.
+        let hdr_requested = recording.hdr && snapit_capture::hdr_candidates().contains(&monitor_id);
         let options = RecordOptions::default()
             .with_fps(fps)
             .with_max_duration(Duration::from_secs(recording.max_duration_secs.into()))
-            .with_max_width(Some(selection.size.width.as_f32().round().max(1.0) as u32))
             .with_format(format)
             .with_cursor(recording.captures_cursor)
-            // The recorder ignores this for GIF, which has no extended range.
-            .with_hdr(recording.hdr);
+            .with_click_effects(recording.click_effects)
+            .with_click_effect(ClickEffect::parse(&recording.click_effect).unwrap_or_default())
+            // The recorder ignores this for GIF/APNG, which have no extended range.
+            .with_hdr(hdr_requested)
+            .with_mp4_bitrate_kbps(recording.mp4_bitrate_kbps);
         log::info!(
-            "recording options: fps={fps} hdr_requested={}",
-            recording.hdr
+            "recording options: fps={fps} hdr_requested={hdr_requested} captures_cursor={} \
+             click_effects={} click_effect={:?} mp4_bitrate_kbps={:?}",
+            recording.captures_cursor,
+            recording.click_effects,
+            options.click_effect,
+            options.mp4_bitrate_kbps
         );
         // Keep the overlay on screen as the region highlight: drop the frozen
         // frame and the toolbar, keep the dim mask and the selection border.
@@ -1140,8 +1222,13 @@ impl Controller {
             );
             return;
         };
+        self.workflow_serial = self.workflow_serial.wrapping_add(1);
+        self.recording_serial = self.recording_serial.wrapping_add(1);
+        let recording_id = self.recording_serial;
         self.recording = Some(ActiveRecording {
+            id: recording_id,
             recorder: None,
+            start: Some(RecorderStart::default()),
             bar: None,
             frame: Some(overlay.window),
             started: false,
@@ -1149,15 +1236,33 @@ impl Controller {
             dest,
             part: output.clone(),
         });
-        self.open_recording_bar(display_id, display_bounds, selection, cx);
+        self.open_recording_bar(recording_id, display_id, display_bounds, selection, cx);
         let controller = cx.entity();
         let entered = overlay.window.update(cx, |_, window, cx| {
             overlay
                 .view
                 .update(cx, |view, cx| view.enter_recording(selection, window, cx));
-            after_presented_frame(window, move |cx| {
+            after_presented_frame(window, move |_, cx| {
                 controller.update(cx, |this, cx| {
-                    this.spawn_recorder((monitor_id, region), options, output, cx)
+                    if this
+                        .recording
+                        .as_ref()
+                        .is_some_and(|active| active.id == recording_id)
+                    {
+                        let start = this
+                            .recording
+                            .as_ref()
+                            .and_then(|active| active.start.clone())
+                            .expect("current recording has a start token");
+                        this.spawn_recorder(
+                            recording_id,
+                            (monitor_id, region),
+                            options,
+                            output,
+                            start,
+                            cx,
+                        );
+                    }
                 });
             });
         });
@@ -1204,31 +1309,37 @@ impl Controller {
 
     fn spawn_recorder(
         &mut self,
+        recording_id: u64,
         (monitor_id, region): (u32, snapit_capture::Region),
         options: RecordOptions,
         output: PathBuf,
+        start: RecorderStart,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
             let path = output.clone();
             let recorder = cx
-                .background_spawn(
-                    async move { Recorder::start(monitor_id, region, options, output) },
-                )
+                .background_spawn(async move {
+                    Recorder::start_with_cancel(monitor_id, region, options, output, start)
+                })
                 .await;
             this.update(cx, |this, cx| {
+                let Some(active) = this.recording.as_mut() else {
+                    // Cancelled or superseded while the platform recorder warmed up.
+                    discard_stale_recorder(recorder, path);
+                    return;
+                };
+                if active.id != recording_id {
+                    discard_stale_recorder(recorder, path);
+                    return;
+                }
                 this.busy = None;
                 match recorder {
                     Ok(recorder) => {
                         let Some(active) = this.recording.as_mut() else {
-                            // Cancelled while the platform recorder warmed up:
-                            // stop it off the main thread and drop the file.
-                            std::thread::spawn(move || {
-                                let _ = recorder.stop();
-                                let _ = std::fs::remove_file(path);
-                            });
                             return;
                         };
+                        active.start = None;
                         active.recorder = Some(recorder);
                         active.started = true;
                         cx.notify();
@@ -1257,6 +1368,7 @@ impl Controller {
 
     fn open_recording_bar(
         &mut self,
+        recording_id: u64,
         display_id: Option<gpui_kit::DisplayId>,
         display_bounds: Bounds<Pixels>,
         selection: Bounds<Pixels>,
@@ -1321,14 +1433,28 @@ impl Controller {
                 .map(AnyWindowHandle::from)
                 .inspect_err(|err| log::error!("failed to open recording bar: {err:#}"));
             let Ok(handle) = opened else {
+                controller.update(cx, |this, cx| {
+                    if this
+                        .recording
+                        .as_ref()
+                        .is_some_and(|active| active.id == recording_id)
+                    {
+                        this.cancel_recording(cx);
+                        this.fail(
+                            t!("controller.record_start_failed", error = "recording bar")
+                                .to_string(),
+                            cx,
+                        );
+                    }
+                });
                 return;
             };
             let orphaned = controller.update(cx, |this, _| match this.recording.as_mut() {
-                Some(active) => {
+                Some(active) if active.id == recording_id => {
                     active.bar = Some(handle);
                     false
                 }
-                None => true,
+                _ => true,
             });
             if orphaned {
                 handle
@@ -1381,6 +1507,9 @@ impl Controller {
         if matches!(self.busy, Some(Busy::Encoding)) {
             return;
         }
+        if let Some(start) = active.start.take() {
+            start.cancel();
+        }
         if let Some(recorder) = active.recorder.take() {
             let discard = std::thread::Builder::new()
                 .name("snapit-record-discard".into())
@@ -1423,6 +1552,9 @@ impl Controller {
             }
             // Still waiting for the platform recorder: cancel the start. The
             // task that owns the recorder discards it when it finds no session.
+            if let Some(start) = active.start.take() {
+                start.cancel();
+            }
             self.busy = None;
             self.finish_recording_ui(cx);
             self.resume_queued_capture(cx);
@@ -1506,12 +1638,12 @@ impl Controller {
                             return Err(err);
                         }
                     };
-                    // Read a finished GIF off the main thread; large recordings
-                    // would otherwise stall a frame while copying.
-                    let gif = matches!(format, RecordFormat::Gif)
+                    // Read finished animation bytes off the main thread; large
+                    // recordings would otherwise stall a frame while copying.
+                    let image = matches!(format, RecordFormat::Gif | RecordFormat::Apng)
                         .then(|| std::fs::read(&path).ok())
                         .flatten();
-                    Ok::<_, anyhow::Error>((path, gif))
+                    Ok::<_, anyhow::Error>((path, image))
                 })
                 .await;
             let published = publishing.elapsed();
@@ -1519,19 +1651,25 @@ impl Controller {
             let preview = summary.first_frame.clone();
             this.update(cx, |this, cx| {
                 match saved {
-                    Ok((path, gif)) => {
+                    Ok((path, image)) => {
                         // Fill the clipboard before the bar closes: a paste
                         // right after completion must find this recording, not
                         // whatever was copied last.
                         let filling = Instant::now();
-                        let copied = match (summary.format, gif) {
+                        let copied = match (summary.format, image) {
                             (RecordFormat::Gif, Some(bytes)) => {
                                 cx.write_to_clipboard(ClipboardItem::new_image(
                                     &Image::from_bytes(ImageFormat::Gif, bytes),
                                 ));
                                 Ok(clipboard::FileCopy::File)
                             }
-                            (RecordFormat::Gif, None) => {
+                            (RecordFormat::Apng, Some(bytes)) => {
+                                cx.write_to_clipboard(ClipboardItem::new_image(
+                                    &Image::from_bytes(ImageFormat::Png, bytes),
+                                ));
+                                Ok(clipboard::FileCopy::File)
+                            }
+                            (RecordFormat::Gif | RecordFormat::Apng, None) => {
                                 Err(anyhow::anyhow!("cannot read {}", path.display()))
                             }
                             (RecordFormat::Mp4, _) => clipboard::copy_file_reference(&path, cx),
@@ -1827,6 +1965,26 @@ fn open_panel_window(
     Ok(handle)
 }
 
+fn discard_stale_recorder(recorder: Result<Recorder>, path: PathBuf) {
+    match recorder {
+        Ok(recorder) => {
+            if let Err(err) = std::thread::Builder::new()
+                .name("snapit-stale-recorder".into())
+                .spawn(move || {
+                    if let Err(err) = recorder.discard() {
+                        log::warn!("failed to discard stale recorder: {err:#}");
+                    }
+                })
+            {
+                log::warn!("failed to start stale-recorder cleanup: {err:#}");
+            }
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string()
 }
@@ -1835,10 +1993,11 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
-/// Format the overlay's single record button uses: whatever was recorded last,
-/// wherever that happened (shortcut, tray or the button's dropdown).
-pub fn last_record_format(cx: &App) -> RecordFormat {
-    RecordFormat::parse(&AppSettings::get(cx).recording.last_format).unwrap_or_default()
+pub fn last_animation_format(cx: &App) -> RecordFormat {
+    match AppSettings::get(cx).recording.animation_format.as_str() {
+        "apng" => RecordFormat::Apng,
+        _ => RecordFormat::Gif,
+    }
 }
 
 /// History kind for a finished recording, so GIFs and videos can sit side by
@@ -1846,6 +2005,7 @@ pub fn last_record_format(cx: &App) -> RecordFormat {
 fn entry_kind(format: RecordFormat) -> EntryKind {
     match format {
         RecordFormat::Gif => EntryKind::Gif,
+        RecordFormat::Apng => EntryKind::Apng,
         RecordFormat::Mp4 => EntryKind::Mp4,
     }
 }
@@ -1854,6 +2014,7 @@ fn entry_kind(format: RecordFormat) -> EntryKind {
 pub fn format_label(format: RecordFormat) -> String {
     match format {
         RecordFormat::Gif => t!("format.gif").to_string(),
+        RecordFormat::Apng => t!("format.apng").to_string(),
         RecordFormat::Mp4 => t!("format.mp4").to_string(),
     }
 }
@@ -1872,9 +2033,16 @@ pub fn save_dir(cx: &App) -> PathBuf {
 /// encoder finishes. The `.part` file already sits in the final directory, so
 /// publishing it is a rename instead of a copy out of the temp directory. A
 /// save directory that cannot be written falls back to the temp directory.
+static NEXT_RECORDING_FILE: AtomicU64 = AtomicU64::new(0);
+
 fn recording_paths(cx: &App, format: RecordFormat) -> (PathBuf, PathBuf) {
     let extension = format.extension();
-    let name = format!("SnapIt {}.{extension}", timestamp());
+    let serial = NEXT_RECORDING_FILE.fetch_add(1, Ordering::Relaxed) + 1;
+    let millis = chrono::Local::now().format("%Y-%m-%d %H.%M.%S%.3f");
+    let name = format!(
+        "SnapIt {millis}-{}-{serial}.{extension}",
+        std::process::id()
+    );
     let paths_in = |dir: PathBuf| {
         let dest = dir.join(&name);
         (dest.with_extension(format!("{extension}.part")), dest)
@@ -1883,7 +2051,11 @@ fn recording_paths(cx: &App, format: RecordFormat) -> (PathBuf, PathBuf) {
     // AVAssetWriter refuses to open an existing file, so probe writability
     // with a throwaway sibling instead of the recording path itself.
     let probe = part.with_extension("probe");
-    let writable = std::fs::File::create(&probe).is_ok();
+    let writable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
     std::fs::remove_file(&probe).ok();
     if writable {
         (part, dest)
@@ -1909,10 +2081,74 @@ fn default_save_dir() -> PathBuf {
 }
 
 fn move_file(from: &Path, to: &Path) -> Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            std::fs::remove_file(from)
+                .with_context(|| format!("failed to remove {}", from.display()))?;
+            return Ok(());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "refusing to overwrite existing recording {}: {err}",
+                to.display()
+            );
+        }
+        Err(_) => {}
     }
-    std::fs::copy(from, to).with_context(|| format!("failed to write {}", to.display()))?;
-    std::fs::remove_file(from).ok();
+    let mut source =
+        std::fs::File::open(from).with_context(|| format!("failed to open {}", from.display()))?;
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .with_context(|| format!("failed to create {}", to.display()))?;
+    let copied = (|| {
+        std::io::copy(&mut source, &mut destination)
+            .with_context(|| format!("failed to write {}", to.display()))?;
+        destination
+            .sync_all()
+            .with_context(|| format!("failed to flush {}", to.display()))?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    drop(destination);
+    if let Err(err) = copied {
+        let _ = std::fs::remove_file(to);
+        return Err(err);
+    }
+    std::fs::remove_file(from).with_context(|| format!("failed to remove {}", from.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("snapit-controller-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn publishing_a_recording_never_replaces_an_existing_file() {
+        let dir = temp_dir("publish");
+        let part = dir.join("recording.gif.part");
+        let dest = dir.join("recording.gif");
+        std::fs::write(&part, b"new recording").unwrap();
+        std::fs::write(&dest, b"user file").unwrap();
+
+        assert!(move_file(&part, &dest).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"user file");
+        assert_eq!(std::fs::read(&part).unwrap(), b"new recording");
+
+        std::fs::remove_file(&dest).unwrap();
+        move_file(&part, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new recording");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

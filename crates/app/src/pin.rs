@@ -117,6 +117,8 @@ pub fn open_file(path: PathBuf, scale: f32, cx: &mut App) {
                 Captured {
                     image: Arc::new(image),
                     hdr: None,
+                    hdr_png: None,
+                    baked: None,
                     scale: scale.max(0.1),
                 },
                 None,

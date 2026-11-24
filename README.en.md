@@ -12,7 +12,7 @@
   <a href="https://github.com/gjfei/snapit/releases/latest"><img src="https://img.shields.io/github/v/release/gjfei/snapit?sort=semver" alt="Release"></a>
 </p>
 
-SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [gpui-kit](https://github.com/longbridge/gpui-kit) (Zed's GPUI) — no Electron, no WebView. It lives in the tray with no main window or launcher: a global shortcut freezes every display, and the overlay lets you copy, save, pin, recognize text or record a GIF / MP4 from the selection.
+SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [gpui-kit](https://github.com/longbridge/gpui-kit) (Zed's GPUI) — no Electron, no WebView. It lives in the tray with no main window or launcher: a global shortcut freezes every display, and the overlay lets you copy, save, pin, recognize text or record a GIF / APNG / MP4 from the selection.
 
 <p align="center">
   <img src="assets/screenshots/en/capture.png" width="820" alt="SnapIt selection overlay and toolbar">
@@ -29,16 +29,16 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **HDR capture**: when the display is in HDR and the frame actually exceeds SDR white, Save, Copy and the history original keep the same 16-bit PNG tagged with cICP (BT.2020 / PQ); the selection preview, pins, OCR, GIF and history thumbnails use an SDR image, and annotated or multi-region captures stay 8-bit. With HDR recording enabled and supported by the system, MP4 is encoded as HDR10 (HEVC Main 10, PQ / BT.2020); otherwise it falls back to SDR / H.264. macOS needs 15+ on Apple Silicon; Windows needs an HDR-enabled display.
 - **Pins**: keep a capture on screen, movable, zoomable and translucent; multiple pins are supported.
 - **Text recognition**: recognizes the selection and copies the text when it can; the results panel lets you copy again, and the text is stored in history.
-- **GIF / MP4 recording**: two separate actions with their own shortcut and tray entry — a GIF drops straight into a chat, an MP4 goes through the system hardware encoder and stays small and smooth. Both show a progress bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.
-- **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧O` recognize text, `⌥⇧G` record a GIF, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
-- **History**: copy, save, pin, OCR and recorded GIFs / videos are all saved automatically, pruned by item count (0 keeps everything).
+- **Video / animation recording (GIF and APNG)**: the overlay toolbar and tray expose separate Animation and Video actions. Animation uses the format chosen in Settings (GIF by default), with no repeated format picker at the recording entry points. GIF drops straight into a chat, APNG keeps full lossless RGBA quality in a `.png` animation, and MP4 goes through the system hardware encoder and stays small and smooth. The cursor and click effects are on by default. Settings offers 22 effects in Basic, Motion, Particles and Glow groups, including a diamond outline, corner brackets, orbiting dots, radar sweep, stardust, a micro rocket, nebula glow and a rainbow ring. Compact category tabs save vertical space, and clicking a style card plays a one-shot preview at the clicked position, hides the static thumbnail while it plays, and restores the thumbnail after 1.2 seconds without another click. Click effects require cursor capture and are drawn before duplicate-frame detection, so they still animate over a static screen. Recording captures, encodes and writes on a dedicated thread; GIF / APNG use a bounded queue sized for the physical resolution, and changed frames get a sampled prefilter before exact deduplication without reducing output pixels. Every format shows a control bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.
+- **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧O` recognize text, `⌥⇧G` record an animation, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
+- **History**: copy, save, pin, OCR and recorded GIFs / APNGs / videos are all saved automatically, pruned by item count (0 keeps everything).
 - **Permission guidance**: when macOS screen recording or accessibility access is missing, SnapIt opens a permissions panel that explains what each one is for and links to System Settings.
 - **Small and native**: a single executable, light / dark themes that follow the system, Simplified Chinese and English UI.
 
 ## How it differs
 
 - **Tray-only**: no main window, launcher or always-open window. Settings, history and OCR results are panels opened on demand.
-- **Region-only recording**: GIF / MP4 recording covers the selection; no camera, microphone or picture-in-picture.
+- **Region-only recording**: GIF / APNG / MP4 recording covers the selection; no camera, microphone or picture-in-picture.
 - **Element snapping needs a system accessibility API**: available on macOS and Windows.
 - **Built-in updater**: checks GitHub Releases after launch (can be disabled in Settings) and on demand from the tray or app menu; pre-releases are included, and every download is verified against SHA-256. Windows installs and restarts; macOS saves the verified DMG to Downloads and reveals it in Finder — drag it into Applications.
 - **Windows has an installer**: `setup.exe` installs to `Program Files` with an uninstall entry and is also used for in-app updates; macOS uses DMG / zip.
@@ -81,7 +81,7 @@ Each release also includes `SHA256SUMS.txt` with the checksums of all files and 
 
 ### Tray and global shortcuts
 
-On launch SnapIt only shows a tray icon (the menu bar on macOS). The tray menu contains Screenshot, Record GIF, Record Video, Recognize Text, Pin Last Capture, History, Settings and Quit. Closing settings, history, OCR results, a pin or the overlay never quits the app. On macOS there is normally no Dock icon; it appears only while the settings, history or OCR panel is open.
+On launch SnapIt only shows a tray icon (the menu bar on macOS). The tray menu contains Screenshot, Animation, Video, Recognize Text, Pin Last Capture, History, Settings and Quit. The animation format is configured in Settings and defaults to GIF. Closing settings, history, OCR results, a pin or the overlay never quits the app. On macOS there is normally no Dock icon; it appears only while the settings, history or OCR panel is open.
 
 Default global shortcuts:
 
@@ -89,7 +89,7 @@ Default global shortcuts:
 | --- | --- |
 | Capture region | `⌥⇧A` (`Alt+Shift+A` on Windows) |
 | Recognize text | `⌥⇧O` (`Alt+Shift+O`) |
-| Record GIF | `⌥⇧G` (`Alt+Shift+G`) |
+| Record animation | `⌥⇧G` (`Alt+Shift+G`) |
 | Record video | `⌥⇧V` (`Alt+Shift+V`) |
 
 Rebind them in **Settings → Shortcuts** by clicking and pressing a new combination; `Esc` aborts the rebinding and `Backspace` / `⌫` clears (disables) a binding. Unsupported combinations, conflicts with another action and shortcuts the system refuses to register are reported. While recording, any global shortcut stops the current recording and then runs that shortcut's own action once encoding finishes (press the GIF shortcut again to start the next recording).
@@ -155,12 +155,12 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 </p>
 <p align="center"><sub>Results panel: a result is copied automatically and can be copied again</sub></p>
 
-### GIF / MP4 recording
+### Video / animation recording (GIF / APNG)
 
-1. Press the shortcut for the format you want, choose Record GIF / Record Video in the tray, or click the film / camera button in the overlay toolbar.
+1. Press the animation or video shortcut, choose Animation or Video in the tray, or click the matching overlay toolbar button. Every animation entry uses the GIF or APNG format selected in **Settings → Recording → Animation format**, defaulting to GIF.
 2. Recording starts as soon as the region is committed: an outline frames the selection (it sits just outside the captured area, so it never appears in the recording) and a control bar beside it shows the elapsed time and, when set, the duration limit. The bar has three icon-only buttons — pause / resume, cancel and stop (hover for a tooltip); it can be dragged and stays where you drop it. SnapIt's own windows never appear in the recording, so dropping it over the selection is fine.
-3. `Space` pauses or resumes: paused frames are not encoded, and the paused stretch is left out of both the file's timeline and the duration limit. Any global shortcut, the bar's stop icon (or `Enter`), or reaching the limit ends and saves the recording; the bar then shows “Encoding GIF…” or “Encoding MP4…”. When a shortcut stopped it, that shortcut's action starts automatically after encoding. `Esc` or the cancel icon discards the recording outright: no file, no history entry, no clipboard write.
-4. When encoding finishes, the file is saved automatically to the default save directory as `SnapIt <date> <time>.gif` or `.mp4`, added to history, and a notification shows the path, frame count and duration. The recording is also copied to the clipboard automatically — the GIF as an image, the MP4 as a file — ready to paste right away.
+3. `Space` pauses or resumes: paused frames are not encoded, and the paused stretch is left out of both the file's timeline and the duration limit. Any global shortcut, the bar's stop icon (or `Enter`), or reaching the limit ends and saves the recording; the bar then shows the selected format while encoding. When a shortcut stopped it, that shortcut's action starts automatically after encoding. `Esc` or the cancel icon discards the recording outright: no file, no history entry, no clipboard write.
+4. When encoding finishes, the file is saved automatically to the default save directory as `SnapIt <date> <time>.gif`, `.png` (APNG) or `.mp4`, added to history, and a notification shows the path, frame count and duration. GIF and APNG are copied as images (APNG as PNG data); MP4 is copied as a file — ready to paste right away.
 
 <p align="center">
   <img src="assets/screenshots/en/recording.png" width="820" alt="Recording outline and control bar">
@@ -172,9 +172,9 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 </p>
 <p align="center"><sub>Recorded GIF (fictional demo content): changes inside the selection captured frame by frame</sub></p>
 
-The format comes from the entry point — the GIF shortcut, tray item and film button write a GIF; the video ones write an MP4 — so there is no default format to pick. Recording options live in **Settings → Recording**: GIF frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), 0–600 seconds (default 0, unlimited), whether to record the mouse pointer (off by default, macOS only) and HDR recording (on by default, MP4 only). The two containers keep separate frame rates: a palette-based GIF saves more by staying slow, while MP4 goes through a video encoder and can afford a higher rate. Consecutive identical frames are dropped, and output is scaled to the selection's logical width so HiDPI captures stay small.
+The animation format is configured only in **Settings → Recording → Animation format** and defaults to GIF; shortcuts, the tray and the overlay share that choice. The same page holds GIF / APNG frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), MP4 target bitrate in Kbps, 0–600 seconds (default 0, unlimited), cursor capture (on by default), click effects (on by default), click style (14 options in Basic, Motion, Particles and Glow groups, including multicolour fireworks, sparkles, comets and aurora effects) and HDR recording (on by default, MP4 only). Enter 0 for the MP4 target bitrate to use the automatic value; a positive integer overrides it. You can also set `animation_format`, `click_effect`, `mp4_bitrate_kbps`, `captures_cursor` and `click_effects` under `[recording]` in `config.toml`. The bitrate affects MP4 only, for both SDR / H.264 and HDR / HEVC. APNG shares GIF's frame rate but keeps lossless 8-bit RGBA pixels instead of a 256-colour palette; it loops forever and is copied as PNG image data. Click effects are drawn before duplicate-frame detection, so they still animate over a static screen. Output uses the display's physical pixels by default, matching screenshot resolution instead of automatically shrinking to logical size on Retina displays.
 
-Each recording writes exactly one file, but GIF and MP4 entries coexist in history. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows): HDR sessions use HEVC Main10, and an unavailable encoder or a rejected first frame automatically reopens the file as SDR / H.264, so no codec has to be installed; GIF is encoded in pure Rust and plays anywhere. Both stream to disk while recording: on macOS ScreenCaptureKit scales physical-pixel frames down to the selection's logical size during capture (Windows and the fallback path use an integer box mean), and a GIF shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. That is why stopping takes almost no time and long recordings do not slow down the way per-frame re-quantisation does. H.264 and HEVC need even dimensions, so an MP4 can be up to one pixel narrower or shorter than the selection.
+Each recording writes exactly one file, and all three formats coexist in history with a first-frame PNG thumbnail. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows): HDR sessions use HEVC Main10, and an unavailable encoder or a rejected first frame automatically reopens the file as SDR / H.264, so no codec has to be installed. SDR video is explicitly tagged BT.709 and, unless a manual bitrate is set, targets 0.1 bit/pixel/frame at the physical resolution to leave room for small text and fine edges. GIF is encoded in pure Rust and plays anywhere: it shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. APNG stores lossless RGBA8 frames through the existing PNG encoder, reuses GIF's dirty rectangles with no disposal or blend operation, loops forever, and patches the final frame count into `acTL` when recording finishes. GIF and APNG stream to disk through a bounded eight-frame queue, so long recordings do not require keeping every frame in memory. Physical pixels cost more CPU, memory and disk space, and GIF still has a 256-colour limit; callers that need smaller output can set `max_width` explicitly. GIF and APNG keep actual pixel dimensions, including odd sizes. H.264 and HEVC need even dimensions for 4:2:0 chroma, so an MP4 can be up to one pixel narrower or shorter than the selection.
 
 ### Pins
 
@@ -199,7 +199,7 @@ Copying, saving, pinning, OCR and recording all store a copy in history (disable
 </p>
 <p align="center"><sub>History panel with filters, thumbnails and per-entry actions</sub></p>
 
-The history panel has **All / Screenshots / Recordings** filters at the top; the entry count and disk usage update with the selection. It can copy an image, pin it to the screen, reveal it in the file manager, delete an entry, or clear everything. **Click a row's thumbnail or text** to open the **original file** with the system's default app — an image viewer for PNG, a viewer for GIF, a player for MP4. There is no in-app preview. Videos have no Copy Image button but do have **Copy File**, which puts the video file itself on the clipboard, ready to paste into Finder or a chat window. GIF and MP4 entries use a first-frame PNG thumbnail in the list and when pinned.
+The history panel has **All / Screenshots / Recordings** filters at the top; the entry count and disk usage update with the selection. It can copy an image, pin it to the screen, reveal it in the file manager, delete an entry, or clear everything. **Click a row's thumbnail or text** to open the **original file** with the system's default app — an image viewer for PNG, a viewer for GIF, a player for MP4. There is no in-app preview. Videos have no Copy Image button but do have **Copy File**, which puts the video file itself on the clipboard, ready to paste into Finder or a chat window. GIF, APNG and MP4 entries use a first-frame PNG thumbnail in the list and when pinned.
 
 ### Settings
 
@@ -208,7 +208,7 @@ The history panel has **All / Screenshots / Recordings** filters at the top; the
 | General | Language (follow system / Simplified Chinese / English), theme (follow system / light / dark), launch at login |
 | Shortcuts | Global shortcuts for capture, text recognition, GIF and video recording |
 | Capture | Default save directory, image format (PNG / JPEG), JPG quality, window snapping, element snapping, dim mask strength, selection drop shadow |
-| Recording | Frame rate, maximum duration, cursor, HDR recording |
+| Recording | Animation format (GIF / APNG), GIF / APNG and MP4 frame rates, MP4 target bitrate, maximum duration, cursor, click effects and style, HDR recording |
 | Text Recognition | Recognition language |
 | History | Enable saving, maximum entries (0 = unlimited), and a button to open the history panel |
 | About | Config file path and Reveal in Folder |
@@ -259,14 +259,21 @@ Paths come from `directories::ProjectDirs::from("dev", "SnapIt", "SnapIt")`. Set
 | Settings `config.toml` | `~/Library/Application Support/dev.SnapIt.SnapIt/config.toml` | `%APPDATA%\SnapIt\SnapIt\config\config.toml` |
 | History `history/index.json`, captures and recordings | `~/Library/Application Support/dev.SnapIt.SnapIt/history/` | `%APPDATA%\SnapIt\SnapIt\data\history\` |
 
-The default TOML is written on first run. A corrupt config is moved to `config.toml.bak` and replaced with defaults. Settings are written back to `config.toml` as soon as they change.
+The default TOML is written on first run. A corrupt config is moved to `config.toml.bak` and replaced with defaults. Settings are written back to `config.toml` as soon as they change. For example, to set the MP4 target bitrate to 12 Mbps:
+
+```toml
+[recording]
+mp4_bitrate_kbps = 12000
+```
+
+Omit the key or set it to `0` to use the automatic bitrate.
 
 ## Building from source
 
 ### Prerequisites
 
 - Install [rustup](https://rustup.rs/). The toolchain is pinned in `rust-toolchain.toml` (currently 1.99.1) and is downloaded on the first build.
-- This repository pulls `vendor/xcap` in as a git submodule (it carries the recording needs: region crop, frame-rate cap, timestamps, cursor options and the `OutputSize::Logical` hint). Clone with `git clone --recursive`; an existing clone needs `git submodule update --init`.
+- This repository pulls `vendor/xcap` in as a git submodule (it carries the recording needs: region crop, frame-rate cap, timestamps, cursor options and the `OutputSize` native/logical size hint). Clone with `git clone --recursive`; an existing clone needs `git submodule update --init`.
 - **macOS**: Xcode Command Line Tools (`xcode-select --install`).
 - **Windows**: install the “Desktop development with C++” workload in Visual Studio Build Tools, including MSVC and the Windows SDK (gpui compiles shaders with the SDK's `fxc`, and the packaging script uses the resource compiler to embed the icon). Building the installer also needs [NSIS](https://nsis.sourceforge.io/) (`makensis`).
 
@@ -400,17 +407,17 @@ Model lookup order: the `SNAPIT_OCR_MODELS` environment variable → `models/` n
 ## Known limitations
 
 - **Element snapping** works only on macOS and Windows, and only with Accessibility permission; it also requires window snapping to be enabled.
-- **Recording** (GIF / MP4) covers the selection only and has no audio; the default limit is 0 (unlimited) and the maximum is 600 seconds. Recording entries in history use a first-frame PNG thumbnail and are pinned as that still image; videos open in the system player rather than inside the app.
-- **Recording bar and cursor**: SnapIt's own windows (the selection outline and the bar) are always left out of the recording — through ScreenCaptureKit on macOS and display affinity on Windows — so the bar can sit anywhere. DXGI never includes the pointer, so recording the cursor is macOS-only.
+- **Recording** (GIF / APNG / MP4) covers the selection only and has no audio; the default limit is 0 (unlimited) and the maximum is 600 seconds. Recording entries in history use a first-frame PNG thumbnail and are pinned as that still image; videos open in the system player rather than inside the app. APNG support depends on the app receiving the PNG image data.
+- **Recording bar and cursor**: SnapIt's own windows (the selection outline and the bar) are always left out of the recording — through ScreenCaptureKit on macOS and display affinity on Windows — so the bar can sit anywhere. ScreenCaptureKit supplies the macOS cursor; because DXGI does not, Windows composites the current system cursor in SnapIt. Click detection polls the current mouse state and needs no global input hook or extra macOS permission.
 - **Copying a video file**: macOS writes a file reference (pasteable); Windows falls back to copying the path as text.
 - **OCR**: the ocrs backend is Latin-only; the language setting only affects Vision and Windows.Media.Ocr.
 - **Auto-updates**: macOS only downloads the DMG to Downloads and reveals it in Finder; installing it (drag into `/Applications`) is left to you, because an app cannot reliably replace itself while running. A development build run from `target/debug` cannot update itself. Windows updates run `setup.exe` elevated and restart afterwards.
-- **One selection at a time**: all displays freeze together, but a selection always lives on a single display.
+- **Multiple regions and cross-display stitching**: all displays freeze together. Hold `Shift` to add or remove regions, release it to finish the collection, then use the toolbar to export. Regions on one display are composed at their relative on-screen positions over a transparent canvas and support annotation, but not resizing or region recording. Regions on different displays remain separate and are exported in selection order, stitched top to bottom; annotation, resizing and region recording are unavailable for this collection.
 
 ## Credits and license
 
 - The UI is built on [gpui](https://www.gpui.rs/) and [gpui-kit](https://github.com/longbridge/gpui-kit) (pinned to `0.9.1`, which tracks GPUI `gpui-pre` 0.3.12), both Apache-2.0.
-- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/gjfei/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor, own-window exclusion and an `OutputSize::Logical` hint). GIF encoding uses [gif](https://github.com/image-rs/image-gif) with [color_quant](https://crates.io/crates/color_quant) for a shared palette, table-driven quantization and dirty-rectangle frames; macOS scales in the compositor when the logical-size hint is set and keeps an integer box mean as the fallback rather than a general resize filter. MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
+- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/gjfei/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor, own-window exclusion and `OutputSize` hints). GIF encoding uses [gif](https://github.com/image-rs/image-gif) with [color_quant](https://crates.io/crates/color_quant) for a shared palette, table-driven quantization and dirty-rectangle frames; APNG reuses the PNG dependency for lossless RGBA8 animation. SnapIt requests `OutputSize::Native` physical pixels by default; callers that need lower encoding cost can explicitly choose logical size or the integer box-mean CPU downscale instead of a general resize filter. MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
 - Pure-Rust OCR uses [ocrs](https://github.com/robertknight/ocrs).
 - Annotation baking uses [tiny-skia](https://github.com/RazrFalcon/tiny-skia); text bitmaps use [fontdue](https://github.com/mooman219/fontdue).
 - The tray, global shortcuts and launch at login use [tray-icon](https://github.com/tauri-apps/tray-icon), [global-hotkey](https://github.com/tauri-apps/global-hotkey) and [auto-launch](https://github.com/zzzgydi/auto-launch).

@@ -115,8 +115,8 @@ fn main() {
             return;
         }
         Err(err) => {
-            log::warn!("single-instance lock is unavailable: {err:#}");
-            None
+            log::error!("cannot acquire the single-instance lock: {err:#}");
+            return;
         }
     };
 
@@ -145,7 +145,10 @@ fn main() {
             KeyBinding::new(shortcut!(","), OpenSettings, None),
             KeyBinding::new(shortcut!("y"), OpenHistory, None),
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| {
+            log::logger().flush();
+            cx.quit();
+        });
         cx.on_action(|_: &Capture, cx| {
             Controller::global(cx).update(cx, |controller, cx| {
                 controller.start_capture(CaptureIntent::Choose, cx)

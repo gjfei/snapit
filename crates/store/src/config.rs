@@ -154,23 +154,31 @@ impl Default for CaptureConfig {
 #[serde(default)]
 #[non_exhaustive]
 pub struct RecordingConfig {
-    /// Frame rate for GIF recordings: a palette-based container where small
-    /// files matter more than smoothness.
+    /// Frame rate for GIF and lossless APNG recordings.
     pub gif_fps: u32,
     /// Frame rate for MP4 recordings: a real video codec handles 30 fps well,
-    /// so MP4 is not held back by the GIF-friendly default.
+    /// so MP4 is not held back by the animation-friendly default.
     pub mp4_fps: u32,
     pub max_duration_secs: u32,
-    /// Container recorded last, so the overlay's single record button repeats
-    /// it on a plain click. `"gif"` or `"mp4"`; anything else reads as GIF.
-    pub last_format: String,
+    /// Animation container used by the animation shortcut, tray and overlay.
+    pub animation_format: String,
     pub captures_cursor: bool,
+    pub click_effects: bool,
+    /// Grouped click style identifier.
+    pub click_effect: String,
     /// Capture and encode MP4 in HDR10 when the display is an HDR panel. GIF
-    /// has no extended range, so this only applies to the MP4 container.
+    /// and APNG have no extended range, so this only applies to the MP4 container.
     pub hdr: bool,
+    /// MP4 target bitrate in Kbps. None or zero uses the automatic formula.
+    pub mp4_bitrate_kbps: Option<u32>,
 }
 
 impl RecordingConfig {
+    pub const CLICK_EFFECTS: &'static [&'static str] = &[
+        "ring", "dot", "outline", "cross", "burst", "ripple", "pulse", "sparkle", "firework",
+        "comet", "confetti", "bloom", "aurora", "prism", "diamond", "corners", "orbit", "radar",
+        "stardust", "rocket", "nebula", "rainbow",
+    ];
     pub const FPS_RANGE: (u32, u32) = (1, 30);
     /// Zero means "record until stopped"; the upper bound guards against a
     /// hand-edited config leaving a runaway recording.
@@ -183,9 +191,12 @@ impl Default for RecordingConfig {
             gif_fps: 12,
             mp4_fps: 30,
             max_duration_secs: 0,
-            last_format: "gif".into(),
-            captures_cursor: false,
+            animation_format: "gif".into(),
+            captures_cursor: true,
+            click_effects: true,
+            click_effect: "ring".into(),
             hdr: true,
+            mp4_bitrate_kbps: None,
         }
     }
 }
@@ -494,6 +505,21 @@ impl Config {
         self.recording.mp4_fps = self.recording.mp4_fps.clamp(min_fps, max_fps);
         self.recording.max_duration_secs =
             self.recording.max_duration_secs.clamp(min_secs, max_secs);
+        let animation_format = self.recording.animation_format.trim().to_ascii_lowercase();
+        self.recording.animation_format = if matches!(animation_format.as_str(), "gif" | "apng") {
+            animation_format
+        } else {
+            RecordingConfig::default().animation_format
+        };
+        let click_effect = self.recording.click_effect.trim().to_ascii_lowercase();
+        self.recording.click_effect = if RecordingConfig::CLICK_EFFECTS
+            .iter()
+            .any(|valid| *valid == click_effect)
+        {
+            click_effect
+        } else {
+            RecordingConfig::default().click_effect
+        };
         self.capture.jpeg_quality = self.capture.jpeg_quality.clamp(1, 100);
         self.capture.mask_opacity = self.capture.mask_opacity.min(100);
         if !matches!(self.general.language.as_str(), "auto" | "zh-CN" | "en") {
@@ -591,13 +617,17 @@ impl ConfigStore {
         if next == self.config {
             return Ok(false);
         }
+        Self::save_config(&self.path, &next)?;
         self.config = next;
-        self.save()?;
         Ok(true)
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic(&self.path, self.config.to_toml()?.as_bytes())
+        Self::save_config(&self.path, &self.config)
+    }
+
+    fn save_config(path: &Path, config: &Config) -> Result<()> {
+        write_atomic(path, config.to_toml()?.as_bytes())
     }
 }
 
@@ -656,6 +686,25 @@ mod tests {
         assert_eq!(reopened.config().capture.image_format, ImageFormat::Jpg);
         assert_eq!(reopened.config().recording.gif_fps, 15);
         assert_eq!(reopened.config().recording.mp4_fps, 24);
+    }
+
+    #[test]
+    fn failed_update_keeps_the_previous_config_in_memory_and_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut store = ConfigStore::open(&path).unwrap();
+        let before = store.config().clone();
+        let disk_before = std::fs::read_to_string(&path).unwrap();
+
+        // `write_atomic` uses config.tmp for config.toml.
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        let result = store.update(|config| {
+            config.general.theme = ThemePreference::Dark;
+            config.history.enabled = false;
+        });
+        assert!(result.is_err());
+        assert_eq!(store.config(), &before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), disk_before);
     }
 
     #[test]
@@ -740,6 +789,52 @@ mod tests {
     }
 
     #[test]
+    fn recording_pointer_options_default_on_and_persist_explicit_choices() {
+        let defaults = RecordingConfig::default();
+        assert!(defaults.captures_cursor);
+        assert!(defaults.click_effects);
+        assert_eq!(defaults.animation_format, "gif");
+        assert_eq!(defaults.click_effect, "ring");
+        let old = Config::from_toml("[recording]\ngif_fps = 15\n").unwrap();
+        assert!(old.recording.captures_cursor);
+        assert!(old.recording.click_effects);
+        assert_eq!(old.recording.animation_format, "gif");
+        assert_eq!(old.recording.click_effect, "ring");
+
+        let configured = Config::from_toml(
+            "[recording]\ncaptures_cursor = false\nclick_effects = false\n\
+             animation_format = \"apng\"\nclick_effect = \"burst\"\n",
+        )
+        .unwrap();
+        assert!(!configured.recording.captures_cursor);
+        assert!(!configured.recording.click_effects);
+        assert_eq!(configured.recording.animation_format, "apng");
+        assert_eq!(configured.recording.click_effect, "burst");
+        let round_trip = toml::to_string(&configured).unwrap();
+        let reloaded = Config::from_toml(&round_trip).unwrap();
+        assert_eq!(reloaded.recording, configured.recording);
+    }
+
+    #[test]
+    fn grouped_click_effects_round_trip_through_config() {
+        for effect in RecordingConfig::CLICK_EFFECTS {
+            let config =
+                Config::from_toml(&format!("[recording]\nclick_effect = \"{effect}\"\n")).unwrap();
+            assert_eq!(config.recording.click_effect, *effect);
+        }
+    }
+
+    #[test]
+    fn invalid_animation_and_click_options_fall_back_to_defaults() {
+        let config = Config::from_toml(
+            "[recording]\nanimation_format = \"webm\"\nclick_effect = \"unknown\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.recording.animation_format, "gif");
+        assert_eq!(config.recording.click_effect, "ring");
+    }
+
+    #[test]
     fn out_of_range_values_are_clamped() {
         let config = Config::from_toml(
             "[recording]\ngif_fps = 500\nmp4_fps = 500\nmax_duration_secs = 9999\n[history]\nmax_items = 0\n",
@@ -798,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn gif_and_mp4_frame_rates_are_independent() {
+    fn animation_and_mp4_frame_rates_are_independent() {
         let mut config = Config::default();
         config.recording.gif_fps = 10;
         config.recording.mp4_fps = 28;
@@ -811,5 +906,26 @@ mod tests {
         // being folded into either container.
         let old = Config::from_toml("[recording]\nfps = 20\n").unwrap();
         assert_eq!(old.recording, RecordingConfig::default());
+    }
+
+    #[test]
+    fn mp4_bitrate_is_optional_and_zero_is_automatic() {
+        assert_eq!(RecordingConfig::default().mp4_bitrate_kbps, None);
+        let missing = Config::from_toml("[recording]\ngif_fps = 20\n").unwrap();
+        assert_eq!(missing.recording.mp4_bitrate_kbps, None);
+        let zero = Config::from_toml("[recording]\nmp4_bitrate_kbps = 0\n").unwrap();
+        assert_eq!(zero.recording.mp4_bitrate_kbps, Some(0));
+
+        for kbps in [0, 1, 12_000, u32::MAX] {
+            let mut config = Config::default();
+            config.recording.mp4_bitrate_kbps = Some(kbps);
+            let written = config.to_toml().unwrap();
+            assert!(written.contains(&format!("mp4_bitrate_kbps = {kbps}")));
+            let reopened = Config::from_toml(&written).unwrap();
+            assert_eq!(reopened.recording.mp4_bitrate_kbps, Some(kbps));
+        }
+
+        let written = Config::default().to_toml().unwrap();
+        assert!(!written.contains("mp4_bitrate_kbps"));
     }
 }

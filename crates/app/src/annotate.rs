@@ -1303,6 +1303,35 @@ fn utf16_range_to_byte(text: &str, range: Range<usize>) -> Range<usize> {
     start..utf16_to_byte(text, range.end).max(start)
 }
 
+/// A lazy annotation bake shared by history, clipboard and save workers.
+pub struct BakedImage {
+    source: RgbaImage,
+    shapes: Arc<Vec<Shape>>,
+    scale: f32,
+    result: OnceLock<Arc<RgbaImage>>,
+}
+
+impl BakedImage {
+    pub fn new(source: RgbaImage, shapes: Arc<Vec<Shape>>, scale: f32) -> Self {
+        Self {
+            source,
+            shapes,
+            scale,
+            result: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Arc<RgbaImage> {
+        self.result
+            .get_or_init(|| {
+                let mut image = self.source.clone();
+                bake(&mut image, &self.shapes, self.scale);
+                Arc::new(image)
+            })
+            .clone()
+    }
+}
+
 /// Rasterize committed shapes onto a cropped RGBA bitmap.
 pub fn bake(image: &mut RgbaImage, shapes: &[Shape], scale: f32) {
     if shapes.is_empty() {

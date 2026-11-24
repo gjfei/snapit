@@ -8,7 +8,7 @@
 use std::{
     path::Path,
     sync::{
-        Arc,
+        Arc, OnceLock,
         mpsc::{Receiver, RecvTimeoutError},
     },
     time::Duration,
@@ -565,7 +565,11 @@ impl LiveRecorder {
     /// Stop the platform capture. Dropping the receiver also releases a
     /// producer blocked on the next frame.
     pub fn stop(self) -> Result<()> {
-        self.recorder.stop()?;
+        let Self { recorder, frames } = self;
+        // Wake a producer blocked on a full channel before asking the platform
+        // to stop; stopCapture may wait for that producer's callback to return.
+        drop(frames);
+        recorder.stop()?;
         Ok(())
     }
 }
@@ -643,6 +647,31 @@ const BT2020_FROM_SRGB: [[f32; 3]; 3] = [
 
 const PQ_STEPS: usize = 65536;
 
+/// One HDR PNG encoding shared by clipboard, save and history exports.
+pub struct HdrPngCache {
+    source: HdrImage,
+    encoded: OnceLock<std::result::Result<Arc<Vec<u8>>, String>>,
+}
+
+impl HdrPngCache {
+    pub fn new(source: &HdrImage) -> Self {
+        Self {
+            source: source.clone(),
+            encoded: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> std::result::Result<Arc<Vec<u8>>, String> {
+        self.encoded
+            .get_or_init(|| {
+                encode_png_hdr(&self.source)
+                    .map(Arc::new)
+                    .map_err(|err| format!("{err:#}"))
+            })
+            .clone()
+    }
+}
+
 /// Encode an HDR frame as a 16-bit RGB PNG labelled with cICP.
 pub fn encode_png_hdr(hdr: &HdrImage) -> Result<Vec<u8>> {
     let data = pq_bt2020_samples(hdr);
@@ -690,7 +719,7 @@ fn pq_bt2020_samples(hdr: &HdrImage) -> Vec<u8> {
     // Same threshold as the overlay's RGBA->BGRA swap: below it, spawning
     // threads costs more than the conversion.
     if out.len() < 1024 * 1024 {
-        write_pq_band(hdr, &mut out, 0, white_nits, &pq);
+        write_pq_band(hdr, &mut out, 0, white_nits, pq);
         return out;
     }
     let threads = std::thread::available_parallelism()
@@ -700,7 +729,6 @@ fn pq_bt2020_samples(hdr: &HdrImage) -> Vec<u8> {
     let row_bytes = width * 6;
     let rows_per_band = height.div_ceil(threads).max(1);
     let band_bytes = rows_per_band * row_bytes;
-    let pq = &*pq;
     std::thread::scope(|scope| {
         for (band_index, band) in out.chunks_mut(band_bytes).enumerate() {
             scope.spawn(move || {
@@ -746,22 +774,25 @@ fn pq_sample(linear: f32, white_nits: f32, pq: &[u16; PQ_STEPS]) -> u16 {
 }
 
 /// 16-bit PQ codes over 0..=10000 nits, indexed by `sqrt(nits / 10000)`.
-fn pq_lut() -> Box<[u16; PQ_STEPS]> {
-    // SMPTE ST 2084 constants.
-    const M1: f64 = 2610.0 / 16384.0;
-    const M2: f64 = 2523.0 / 32.0;
-    const C1: f64 = 3424.0 / 4096.0;
-    const C2: f64 = 2413.0 / 128.0;
-    const C3: f64 = 2392.0 / 128.0;
-    let mut lut = Box::new([0u16; PQ_STEPS]);
-    for (index, code) in lut.iter_mut().enumerate() {
-        let normalized = index as f64 / (PQ_STEPS - 1) as f64;
-        let luminance = normalized * normalized;
-        let powered = luminance.powf(M1);
-        let encoded = ((C1 + C2 * powered) / (1.0 + C3 * powered)).powf(M2);
-        *code = (encoded.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16;
-    }
-    lut
+fn pq_lut() -> &'static [u16; PQ_STEPS] {
+    static LUT: std::sync::OnceLock<Box<[u16; PQ_STEPS]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        // SMPTE ST 2084 constants.
+        const M1: f64 = 2610.0 / 16384.0;
+        const M2: f64 = 2523.0 / 32.0;
+        const C1: f64 = 3424.0 / 4096.0;
+        const C2: f64 = 2413.0 / 128.0;
+        const C3: f64 = 2392.0 / 128.0;
+        let mut lut = Box::new([0u16; PQ_STEPS]);
+        for (index, code) in lut.iter_mut().enumerate() {
+            let normalized = index as f64 / (PQ_STEPS - 1) as f64;
+            let luminance = normalized * normalized;
+            let powered = luminance.powf(M1);
+            let encoded = ((C1 + C2 * powered) / (1.0 + C3 * powered)).powf(M2);
+            *code = (encoded.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16;
+        }
+        lut
+    })
 }
 
 #[cfg(test)]
@@ -882,11 +913,11 @@ mod tests {
     #[test]
     fn pq_encoding_matches_reference_levels() {
         let pq = pq_lut();
-        assert_eq!(pq_sample(0.0, 80.0, &pq), 0);
-        assert_eq!(pq_sample(125.0, 80.0, &pq), u16::MAX);
+        assert_eq!(pq_sample(0.0, 80.0, pq), 0);
+        assert_eq!(pq_sample(125.0, 80.0, pq), u16::MAX);
         // ST 2084 reference codes: 100 nits -> 0.5081, 1000 nits -> 0.7518.
         for (nits, expected) in [(100.0, 0.5081), (1000.0, 0.7518)] {
-            let code = f32::from(pq_sample(nits / 80.0, 80.0, &pq)) / 65535.0;
+            let code = f32::from(pq_sample(nits / 80.0, 80.0, pq)) / 65535.0;
             assert!((code - expected).abs() < 0.001, "{nits} nits -> {code}");
         }
     }

@@ -8,14 +8,20 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 color_quant = "2.0"
+crc32fast = "1.5.5"
 gif = "0.14"
 image.workspace = true
 log.workspace = true
+png.workspace = true
 snapit-capture.workspace = true
 
 # MP4 goes through whatever encoder the OS ships, so no codec is compiled in.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSEvent",
+] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSDictionary",
@@ -28,6 +34,13 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "CFDictionary",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGGeometry",
 ] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -54,7 +67,10 @@ objc2-av-foundation = { version = "0.3.2", default-features = false, features = 
 windows = { version = "0.62", features = [
     "Foundation",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
