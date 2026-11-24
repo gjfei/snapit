@@ -144,7 +144,12 @@ impl Mp4Sink {
         })
     }
 
-    fn append_scaled(&mut self, frame: &RgbaImage, at: Duration) -> Result<()> {
+    fn append_scaled(
+        &mut self,
+        frame: &RgbaImage,
+        at: Duration,
+        duration_ticks: i64,
+    ) -> Result<()> {
         let (width, height) = frame.dimensions();
         if width != self.width || height != self.height {
             bail!(
@@ -186,7 +191,7 @@ impl Mp4Sink {
         unsafe {
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime((at.as_secs_f64() * TICKS_PER_SECOND as f64) as i64)?;
-            sample.SetSampleDuration(self.frame_ticks.max(1))?;
+            sample.SetSampleDuration(duration_ticks.max(1))?;
             self.writer.WriteSample(self.stream, &sample)?;
         }
         self.t_write += write_started.elapsed();
@@ -212,25 +217,21 @@ impl FrameSink for Mp4Sink {
         let scaled_started = Instant::now();
         let scaled = prepare(&frame, self.max_width).into_owned();
         self.t_scale += scaled_started.elapsed();
-        self.append_scaled(&scaled, at)?;
+        self.append_scaled(&scaled, at, self.frame_ticks)?;
         self.last = Some((scaled, at));
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        ensure_com()?;
         let closing_started = Instant::now();
         let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
         // needs a frame of its own or the video looks cut short.
         if let Some((frame, at)) = self.last.take()
-            && end > at
+            && let Some((hold, duration_ticks)) = closing_sample(at, end, self.frame_ticks)
         {
-            // Sample times must strictly increase, or the sink can reject the
-            // closing sample on a very short recording.
-            let hold = end
-                .saturating_sub(Duration::from_millis(1))
-                .max(at + Duration::from_millis(2));
-            self.append_scaled(&frame, hold)?;
+            self.append_scaled(&frame, hold, duration_ticks)?;
             closing = closing_started.elapsed();
         }
         let finalize_started = Instant::now();
@@ -378,7 +379,7 @@ impl HdrMp4Sink {
 
     /// Hand the converter's tightly packed planes to the encoder, one padded
     /// row at a time.
-    fn append_planes(&mut self, at: Duration) -> Result<()> {
+    fn append_planes(&mut self, at: Duration, duration_ticks: i64) -> Result<()> {
         let row = self.width as usize * 2;
         let luma_len = self.stride * self.height as usize;
         let total = luma_len + luma_len / 2;
@@ -412,7 +413,7 @@ impl HdrMp4Sink {
         unsafe {
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime((at.as_secs_f64() * TICKS_PER_SECOND as f64) as i64)?;
-            sample.SetSampleDuration(self.frame_ticks.max(1))?;
+            sample.SetSampleDuration(duration_ticks.max(1))?;
             self.writer.WriteSample(self.stream, &sample)?;
         }
         self.t_write += write_started.elapsed();
@@ -446,23 +447,19 @@ impl FrameSink for HdrMp4Sink {
         let convert_started = Instant::now();
         hdr::convert_into(&scaled, &mut self.y, &mut self.uv);
         self.t_convert += convert_started.elapsed();
-        self.append_planes(at)
+        self.append_planes(at, self.frame_ticks)
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
+        ensure_com()?;
         let closing_started = Instant::now();
         let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
         // needs a frame of its own or the video looks cut short.
         if let Some(at) = self.last_at
-            && end > at
+            && let Some((hold, duration_ticks)) = closing_sample(at, end, self.frame_ticks)
         {
-            // Sample times must strictly increase, or the sink can reject the
-            // closing sample on a very short recording.
-            let hold = end
-                .saturating_sub(Duration::from_millis(1))
-                .max(at + Duration::from_millis(2));
-            self.append_planes(hold)?;
+            self.append_planes(hold, duration_ticks)?;
             closing = closing_started.elapsed();
         }
         let finalize_started = Instant::now();
@@ -512,9 +509,23 @@ fn pack(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
+fn closing_sample(at: Duration, end: Duration, frame_ticks: i64) -> Option<(Duration, i64)> {
+    if end <= at {
+        return None;
+    }
+    let hold = end
+        .saturating_sub(Duration::from_millis(1))
+        .max(at + Duration::from_micros(1));
+    let duration =
+        (end.saturating_sub(hold).as_secs_f64() * TICKS_PER_SECOND as f64).round() as i64;
+    Some((hold, duration.clamp(1, frame_ticks.max(1))))
+}
+
 fn ensure_com() -> Result<()> {
-    // S_FALSE means this thread was already initialised, which is fine.
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if result.is_err() {
+        return Err(windows::core::Error::from(result).into());
+    }
     Ok(())
 }
 
@@ -522,6 +533,30 @@ fn ensure_com() -> Result<()> {
 mod hdr_sink_tests {
     use super::*;
     use crate::{RecordFormat, video::hdr::synth_solid};
+
+    #[test]
+    fn closing_samples_end_at_the_requested_timestamp() {
+        let (hold, ticks) = closing_sample(Duration::ZERO, Duration::from_secs(1), 666_667)
+            .expect("a closing sample");
+        assert_eq!(hold, Duration::from_millis(999));
+        assert_eq!(
+            hold + Duration::from_nanos(ticks as u64 * 100),
+            Duration::from_secs(1)
+        );
+
+        let (hold, ticks) = closing_sample(
+            Duration::from_millis(100),
+            Duration::from_micros(100_500),
+            666_667,
+        )
+        .expect("a short closing sample");
+        assert!(hold > Duration::from_millis(100));
+        assert_eq!(
+            hold + Duration::from_nanos(ticks as u64 * 100),
+            Duration::from_micros(100_500)
+        );
+        assert!(closing_sample(Duration::from_secs(1), Duration::from_secs(1), 666_667).is_none());
+    }
 
     /// Encode synthetic extended-range frames through the real sink writer and
     /// read the container back. The frames are built by hand, so this checks
