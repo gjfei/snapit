@@ -14,9 +14,10 @@
 //! refuses a file laid out any other way.
 
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -88,11 +89,8 @@ const VISUAL_ENTRY_BASE: usize = 78;
 /// are already encoded by the time this runs, so the caller logs a failure and
 /// keeps the recording rather than discarding it over metadata.
 pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to reopen {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to reopen {}", path.display()))?;
     let length = usize::try_from(file.metadata()?.len()).context("file size")?;
 
     // The top-level walk reads one header at a time; `mdat` can be gigabytes.
@@ -147,19 +145,97 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
     tail.splice(insert_at..insert_at + replaced, added);
     let delta = tail.len() as i64 - before as i64;
     for start in entry.ancestors {
-        let raw = u32::from_be_bytes(
-            tail[start..start + 4]
-                .try_into()
-                .map_err(|_| anyhow!("no box header at {start}"))?,
-        );
-        let patched = u32::try_from(raw as i64 + delta)
-            .map_err(|_| anyhow!("the metadata no longer fits a 32-bit box size"))?;
-        tail[start..start + 4].copy_from_slice(&patched.to_be_bytes());
+        patch_ancestor_size(&mut tail, start, delta)?;
     }
 
-    file.seek(SeekFrom::Start(moov_at as u64))?;
-    file.write_all(&tail)?;
-    file.set_len((moov_at + tail.len()) as u64)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (temporary_path, mut temporary) = loop {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let candidate = parent.unwrap_or(Path::new(".")).join(format!(
+            ".{name}.{}.{}.colr.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err).with_context(|| "failed to create the colour-tag patch"),
+        }
+    };
+    let result = (|| {
+        file.seek(SeekFrom::Start(0))?;
+        let mut prefix = (&mut file).take(moov_at as u64);
+        std::io::copy(&mut prefix, &mut temporary)?;
+        temporary.write_all(&tail)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        drop(file);
+        replace_file(path, &temporary_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn patch_ancestor_size(bytes: &mut [u8], start: usize, delta: i64) -> Result<()> {
+    let raw = u32::from_be_bytes(
+        bytes
+            .get(start..start + 4)
+            .ok_or_else(|| anyhow!("no box header at {start}"))?
+            .try_into()
+            .map_err(|_| anyhow!("no box header at {start}"))?,
+    );
+    if raw == 0 {
+        // A zero-sized box extends to its parent's end; growing the parent
+        // grows this box without changing its header.
+        return Ok(());
+    }
+    if raw == 1 {
+        let at = start + 8;
+        let large = u64::from_be_bytes(
+            bytes
+                .get(at..at + 8)
+                .ok_or_else(|| anyhow!("no large box size at {start}"))?
+                .try_into()
+                .map_err(|_| anyhow!("no large box size at {start}"))?,
+        );
+        let patched = large
+            .checked_add_signed(delta)
+            .ok_or_else(|| anyhow!("the metadata no longer fits a 64-bit box size"))?;
+        bytes[at..at + 8].copy_from_slice(&patched.to_be_bytes());
+    } else {
+        let patched = i64::from(raw)
+            .checked_add(delta)
+            .and_then(|size| u32::try_from(size).ok())
+            .ok_or_else(|| anyhow!("the metadata no longer fits a 32-bit box size"))?;
+        bytes[start..start + 4].copy_from_slice(&patched.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn replace_file(path: &Path, temporary: &Path) -> Result<()> {
+    use windows::{
+        Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW},
+        core::HSTRING,
+    };
+    unsafe {
+        ReplaceFileW(
+            &HSTRING::from(path.as_os_str()),
+            &HSTRING::from(temporary.as_os_str()),
+            None,
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -424,6 +500,24 @@ mod tests {
         assert_eq!(nclx_in(&after), Some((9, 16, 9, 0)));
         assert_eq!(after.len(), before.len(), "an equal swap moves nothing");
         assert_eq!(position(&after, b"colr"), position(&before, b"colr"));
+    }
+
+    #[test]
+    fn ancestor_sizes_support_both_header_widths() {
+        let mut short = vec![0; 8];
+        short[..4].copy_from_slice(&100u32.to_be_bytes());
+        patch_ancestor_size(&mut short, 0, 19).unwrap();
+        assert_eq!(u32::from_be_bytes(short[..4].try_into().unwrap()), 119);
+
+        let mut large = vec![0; 16];
+        large[..4].copy_from_slice(&1u32.to_be_bytes());
+        large[8..16].copy_from_slice(&1000u64.to_be_bytes());
+        patch_ancestor_size(&mut large, 0, 19).unwrap();
+        assert_eq!(u64::from_be_bytes(large[8..16].try_into().unwrap()), 1019);
+
+        let mut to_parent_end = vec![0; 8];
+        patch_ancestor_size(&mut to_parent_end, 0, 19).unwrap();
+        assert_eq!(to_parent_end[..4], [0; 4]);
     }
 
     #[test]
