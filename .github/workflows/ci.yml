@@ -42,9 +42,10 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      # vendor/xcap is excluded from the root workspace, so test it separately.
+      # vendor/xcap is excluded from the root workspace and intentionally ignores
+      # its library Cargo.lock, so resolve it independently in this clean checkout.
       - name: Test xcap
-        run: cargo test --locked --manifest-path vendor/xcap/Cargo.toml --lib
+        run: cargo test --manifest-path vendor/xcap/Cargo.toml --lib
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -638,6 +638,54 @@ mod http {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn output_command() -> Command {
+            #[cfg(target_os = "macos")]
+            {
+                let mut command = Command::new("/usr/bin/printf");
+                command.arg("abc");
+                command
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let mut command = super::super::hidden_command("cmd.exe");
+                command.args(["/D", "/C", "echo", "abc"]);
+                command
+            }
+        }
+
+        #[test]
+        fn finish_rechecks_cancellation_after_eof() {
+            let mut child = output_command()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let cancel = CancelToken::default();
+            let mut body = Body {
+                child: Arc::new(Mutex::new(Some(child))),
+                stdout,
+                stderr,
+                received: 0,
+                max_len: 1024,
+                cancel: cancel.clone(),
+            };
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.windows(3).any(|window| window == b"abc"));
+            cancel.cancel();
+            assert_eq!(
+                body.finish().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+        }
+    }
 }
 
 fn fetch_manifest(url: &str) -> Result<Manifest> {
@@ -1428,7 +1476,7 @@ fn process_alive(pid: u32) -> Option<bool> {
         let mut code = 0;
         let known = GetExitCodeProcess(process, &mut code) != 0;
         CloseHandle(process);
-        known.then_some(code != STILL_ACTIVE as u32)
+        known.then_some(code == STILL_ACTIVE as u32)
     }
 }
 
@@ -2616,31 +2664,6 @@ mod tests {
         assert!(!staging.exists());
         server.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn finish_rechecks_cancellation_after_eof() {
-        use std::io::Write as _;
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/manifest", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
-                .unwrap();
-        });
-        let cancel = http::CancelToken::default();
-        let mut body = http::get(&url, Duration::from_secs(5), 1024, &cancel).unwrap();
-        let mut bytes = Vec::new();
-        body.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"abc");
-        cancel.cancel();
-        let err = body.finish().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
-        server.join().unwrap();
     }
 
     #[test]
