@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(any(target_os = "windows", test))]
@@ -192,8 +192,9 @@ fn web_source(repo: &str) -> Result<Source> {
 }
 
 fn get_text(url: &str) -> Result<String> {
-    let mut body =
-        http::get(url, MANIFEST_TIMEOUT, MAX_MANIFEST_BYTES).localize("update.error.network")?;
+    let cancel = http::CancelToken::default();
+    let mut body = http::get(url, MANIFEST_TIMEOUT, MAX_MANIFEST_BYTES, &cancel)
+        .localize("update.error.network")?;
     let mut text = String::new();
     body.read_to_string(&mut text)
         .localize("update.error.network")?;
@@ -464,15 +465,58 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod http {
     use std::io::{self, Read};
-    use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct CancelState {
+        cancelled: std::sync::atomic::AtomicBool,
+        child: Mutex<Option<Child>>,
+    }
+
+    /// Cancellation owns the curl process handle, so it interrupts a blocked
+    /// read instead of merely asking the download loop to stop later.
+    #[derive(Clone, Default)]
+    pub struct CancelToken {
+        state: Arc<CancelState>,
+    }
+
+    impl CancelToken {
+        pub fn is_cancelled(&self) -> bool {
+            self.state
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        pub fn check(&self) -> io::Result<()> {
+            if self.is_cancelled() {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn cancel(&self) {
+            self.state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Ok(mut child) = self.state.child.lock()
+                && let Some(child) = child.as_mut()
+            {
+                let _ = child.kill();
+            }
+        }
+    }
 
     /// A response body streamed from curl's stdout.
     pub struct Body {
-        child: Child,
+        child: Arc<Mutex<Option<Child>>>,
         stdout: ChildStdout,
+        stderr: ChildStderr,
         received: u64,
         max_len: u64,
+        cancel: CancelToken,
     }
 
     #[cfg(target_os = "macos")]
@@ -494,7 +538,13 @@ mod http {
 
     /// Start a GET of `url` that fails on an HTTP error status, after
     /// `timeout` or when the body is longer than `max_len`.
-    pub fn get(url: &str, timeout: Duration, max_len: u64) -> io::Result<Body> {
+    pub fn get(
+        url: &str,
+        timeout: Duration,
+        max_len: u64,
+        cancel: &CancelToken,
+    ) -> io::Result<Body> {
+        cancel.check()?;
         let mut child = curl()
             // Must come first: ignores the user's .curlrc.
             .arg("--disable")
@@ -523,17 +573,28 @@ mod http {
             .spawn()
             .map_err(|err| io::Error::new(err.kind(), format!("curl: {err}")))?;
         let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let child = Arc::new(Mutex::new(Some(child)));
+        if cancel.is_cancelled()
+            && let Some(child) = child.lock().unwrap().as_mut()
+        {
+            let _ = child.kill();
+        }
         Ok(Body {
-            child,
+            child: child.clone(),
             stdout,
+            stderr,
             received: 0,
             max_len,
+            cancel: cancel.clone(),
         })
     }
 
     impl Read for Body {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.cancel.check()?;
             let n = self.stdout.read(buf)?;
+            self.cancel.check()?;
             self.received += n as u64;
             if self.received > self.max_len {
                 return Err(io::Error::other(format!(
@@ -548,11 +609,15 @@ mod http {
     impl Body {
         /// Once the body was read to the end: curl's error if the transfer failed.
         pub fn finish(mut self) -> io::Result<()> {
+            self.cancel.check()?;
+            // Keep the child in the shared slot while reading stderr: cancellation
+            // must still be able to kill curl if it blocks at this boundary.
             let mut stderr = String::new();
-            if let Some(mut pipe) = self.child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
-            let status = self.child.wait()?;
+            let _ = self.stderr.read_to_string(&mut stderr);
+            self.cancel.check()?;
+            let mut child = self.child.lock().unwrap().take().expect("curl child");
+            let status = child.wait()?;
+            self.cancel.check()?;
             if status.success() {
                 return Ok(());
             }
@@ -565,15 +630,20 @@ mod http {
 
     impl Drop for Body {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            if let Ok(mut child) = self.child.lock()
+                && let Some(mut child) = child.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
 
 fn fetch_manifest(url: &str) -> Result<Manifest> {
-    let mut body =
-        http::get(url, MANIFEST_TIMEOUT, MAX_MANIFEST_BYTES).localize("update.error.network")?;
+    let cancel = http::CancelToken::default();
+    let mut body = http::get(url, MANIFEST_TIMEOUT, MAX_MANIFEST_BYTES, &cancel)
+        .localize("update.error.network")?;
     let mut text = String::new();
     body.read_to_string(&mut text)
         .localize("update.error.network")?;
@@ -664,40 +734,74 @@ fn verify_and_lock(path: &Path, expected_size: u64, expected_sha256: &str) -> Re
     verify_open_file(file, expected_size, expected_sha256)
 }
 
-/// Download `asset` to `dest`, counting bytes in `progress`, then verify it.
-fn download(asset: &Asset, dest: &Path, progress: &AtomicU64, cancel: &AtomicBool) -> Result<()> {
-    let mut body =
-        http::get(&asset.url, DOWNLOAD_TIMEOUT, asset.size).localize("update.error.download")?;
-    let mut file = fs::File::create(dest).localize("update.error.download")?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0; 64 * 1024];
-    let mut size = 0;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = fs::remove_file(dest);
-            return Err(Cancelled.into());
-        }
-        let n = body.read(&mut buf).localize("update.error.download")?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n])
-            .localize("update.error.download")?;
-        size += n as u64;
-        progress.store(size, Ordering::Relaxed);
+fn check_cancel(cancel: &http::CancelToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(Cancelled.into())
+    } else {
+        Ok(())
     }
-    body.finish().localize("update.error.download")?;
-    file.sync_all().localize("update.error.download")?;
-    drop(file);
-    // A package that fails verification must not sit on disk looking
-    // installable.
-    let verified = verify(size, &hex(&hasher.finalize()), asset);
-    if verified.is_err() {
+}
+
+/// Download `asset` to `dest`, counting bytes in `progress`, then verify it.
+/// `dest` must be a newly reserved staging path owned by this job.
+fn download(
+    asset: &Asset,
+    dest: &Path,
+    progress: &AtomicU64,
+    cancel: &http::CancelToken,
+) -> Result<()> {
+    let mut created = false;
+    let result = (|| -> Result<()> {
+        check_cancel(cancel)?;
+        let mut body = http::get(&asset.url, DOWNLOAD_TIMEOUT, asset.size, cancel)
+            .localize("update.error.download")?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .localize("update.error.download")?;
+        created = true;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0; 64 * 1024];
+        let mut size = 0;
+        loop {
+            check_cancel(cancel)?;
+            let n = body.read(&mut buf).map_err(|err| -> anyhow::Error {
+                if cancel.is_cancelled() {
+                    Cancelled.into()
+                } else {
+                    UpdateError::new("update.error.download").detail(err).into()
+                }
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])
+                .localize("update.error.download")?;
+            size += n as u64;
+            progress.store(size, Ordering::Relaxed);
+        }
+        // EOF alone is not success: curl may still be reporting a truncated
+        // transfer, and cancellation can land while finish is waiting for it.
+        check_cancel(cancel)?;
+        body.finish().map_err(|err| -> anyhow::Error {
+            if cancel.is_cancelled() {
+                Cancelled.into()
+            } else {
+                UpdateError::new("update.error.download").detail(err).into()
+            }
+        })?;
+        file.sync_all().localize("update.error.download")?;
+        drop(file);
+        check_cancel(cancel)?;
+        verify(size, &hex(&hasher.finalize()), asset)?;
+        check_cancel(cancel)
+    })();
+    if result.is_err() && created {
         let _ = fs::remove_file(dest);
     }
-    verified
+    result
 }
 
 /// File name of a download URL, ignoring any query.
@@ -768,6 +872,36 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     path.with_file_name(name)
+}
+
+fn unique_staging(path: &Path) -> PathBuf {
+    let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+    with_suffix(path, &format!(".{}-{nonce}.part", std::process::id()))
+}
+
+/// Claim a public download name without replacing a package another instance
+/// may already have published. Both paths are siblings, so a hard link publishes
+/// the fully written staging file atomically and fails if the target exists.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn claim_download_target(staging: &Path, target: &Path) -> std::io::Result<()> {
+    fs::hard_link(staging, target)?;
+    if let Err(err) = fs::remove_file(staging)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "cannot remove published download staging {}: {err}",
+            staging.display()
+        );
+    }
+    Ok(())
+}
+
+struct Downloaded {
+    /// Verified file. On macOS this is still the unique staging path; the UI
+    /// thread gives it the public Downloads name only after accepting the job.
+    archive: PathBuf,
+    target: PathBuf,
+    work: Option<PathBuf>,
 }
 
 /// Put `new` in place of the binary `exe`, which may be running. On Windows
@@ -1193,31 +1327,153 @@ fn install(_: &Path, _: &Path, _: &str) -> Result<Command> {
         .into())
 }
 
-/// A fresh scratch directory for one update. macOS has no installer to feed,
-/// so nothing there needs a work directory.
+/// A fresh scratch directory for one update. The pid + nonce name and
+/// create-new owner marker make ownership explicit; no directory is reused.
 #[cfg(any(not(target_os = "macos"), test))]
 fn work_dir(version: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("snapit-update-{version}"));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).localize("update.error.download")?;
+    let base = std::env::temp_dir();
+    loop {
+        let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+        match create_work_dir_in(&base, version, std::process::id(), nonce) {
+            Err(err)
+                if err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                continue;
+            }
+            result => return result,
+        }
+    }
+}
+
+const WORK_OWNER_FILE: &str = ".snapit-owner";
+static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+static OWNED_WORK_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn create_work_dir_in(base: &Path, version: &str, pid: u32, nonce: u64) -> Result<PathBuf> {
+    let dir = base.join(format!("snapit-update-{version}-{pid}-{nonce}"));
+    fs::create_dir(&dir).localize("update.error.download")?;
+    let owner = format!("{pid} {nonce}\n");
+    let reserved = (|| -> Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(WORK_OWNER_FILE))?
+            .write_all(owner.as_bytes())?;
+        Ok(())
+    })();
+    if let Err(err) = reserved {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(err).localize("update.error.download");
+    }
+    if let Ok(mut owned) = OWNED_WORK_DIRS.lock() {
+        owned.push(dir.clone());
+    }
     Ok(dir)
 }
 
-/// Remove scratch directories left by earlier updates. The Windows helper
-/// cannot delete its own copy while it runs, so its directory stays behind.
-fn remove_stale_update_dirs() {
-    let Ok(entries) = std::env::temp_dir().read_dir() else {
+fn work_owner(path: &Path) -> Option<(u32, u64)> {
+    let owner = fs::read_to_string(path.join(WORK_OWNER_FILE)).ok()?;
+    let mut fields = owner.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let nonce = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((pid, nonce))
+}
+
+fn work_dir_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    // `rsplitn` yields the suffix first; parse from the right without letting
+    // hyphens in a semver pre-release confuse the pid/nonce fields.
+    let mut parts = name.rsplitn(3, '-');
+    let _nonce = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let prefix = parts.next()?;
+    (prefix.starts_with("snapit-update-") && prefix.len() > "snapit-update-".len()).then_some(pid)
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> Option<bool> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Some(false);
+    }
+    // SAFETY: kill(pid, 0) only probes process existence and sends no signal.
+    if unsafe { kill(pid as i32, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(3) => Some(false), // ESRCH
+        _ => None,              // EPERM and unknown errors are not proof of death.
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    // SAFETY: the returned handle is closed on every path.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return (std::io::Error::last_os_error().raw_os_error()
+                == Some(ERROR_INVALID_PARAMETER as i32))
+            .then_some(false);
+        }
+        let mut code = 0;
+        let known = GetExitCodeProcess(process, &mut code) != 0;
+        CloseHandle(process);
+        known.then_some(code != STILL_ACTIVE as u32)
+    }
+}
+
+/// Remove only directories owned by this process or whose owner pid is
+/// provably gone. A live peer, an unreadable marker, or an uncertain process
+/// query is left untouched.
+fn remove_stale_update_dirs_in(base: &Path) {
+    let Ok(entries) = base.read_dir() else {
         return;
     };
+    let owned = OWNED_WORK_DIRS
+        .lock()
+        .map(|dirs| dirs.clone())
+        .unwrap_or_default();
     for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("snapit-update-")
-        {
-            let _ = fs::remove_dir_all(entry.path());
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(pid) = work_dir_pid(&path) else {
+            continue;
+        };
+        let Some((owner_pid, _)) = work_owner(&path) else {
+            continue;
+        };
+        if owner_pid != pid {
+            continue;
+        }
+        let ours = owned.contains(&path);
+        let stale = !ours && process_alive(pid) == Some(false);
+        if ours || stale {
+            if let Err(err) = fs::remove_dir_all(&path) {
+                log::warn!(
+                    "cannot remove stale update directory {}: {err}",
+                    path.display()
+                );
+            } else if let Ok(mut owned) = OWNED_WORK_DIRS.lock() {
+                owned.retain(|dir| dir != &path);
+            }
         }
     }
+}
+
+fn remove_stale_update_dirs() {
+    remove_stale_update_dirs_in(&std::env::temp_dir());
 }
 
 // -- state ---------------------------------------------------------------------
@@ -1237,9 +1493,10 @@ pub struct UpdateState {
 impl Global for UpdateState {}
 
 pub(crate) struct Job {
+    id: u64,
     downloaded: Arc<AtomicU64>,
     pub(crate) total: u64,
-    cancel: Arc<AtomicBool>,
+    cancel: http::CancelToken,
     pub(crate) phase: Phase,
     /// Verified package on disk: the disk image on macOS, the downloaded
     /// installer or archive on Windows. `None` until the download finishes.
@@ -1312,6 +1569,21 @@ impl UpdateState {
     pub(crate) fn busy(&self) -> bool {
         matches!(&self.job, Some(job) if !matches!(job.phase, Phase::Failed(_)))
     }
+
+    /// A worker may publish Ready only for the still-current, uncancelled job.
+    fn can_publish_ready(&self, id: u64, cancel: &http::CancelToken) -> bool {
+        !cancel.is_cancelled()
+            && self
+                .job
+                .as_ref()
+                .is_some_and(|job| job.id == id && matches!(job.phase, Phase::Downloading))
+    }
+}
+
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_job_id() -> u64 {
+    NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn state(cx: &App) -> &UpdateState {
@@ -1330,15 +1602,13 @@ fn open_panel(cx: &mut App) {
 
 /// Clean up after a previous update and schedule the automatic check.
 pub fn init(cx: &mut App) {
+    // Finish startup cleanup before any UI action can create a new job. Doing
+    // this after the startup delay could otherwise delete our own live job.
+    remove_leftovers();
+    remove_stale_update_dirs();
     cx.set_global(UpdateState::default());
     cx.spawn(async move |cx| {
         cx.background_executor().timer(STARTUP_DELAY).await;
-        cx.background_executor()
-            .spawn(async {
-                remove_leftovers();
-                remove_stale_update_dirs();
-            })
-            .await;
         cx.update(|cx| {
             let config = AppSettings::get(cx);
             if config.update.check && due(config.update.last_check, now()) {
@@ -1433,40 +1703,63 @@ pub fn check(manual: bool, cx: &mut App) {
 /// Stop a running download, or forget a finished/failed update and its package.
 pub fn dismiss_job(cx: &mut App) {
     let state = cx.global_mut::<UpdateState>();
-    match state.job.as_ref() {
-        Some(job) if matches!(job.phase, Phase::Downloading) => {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
-        Some(job) if matches!(job.phase, Phase::Ready | Phase::Failed(_)) => {
-            if let Some(job) = state.job.take() {
-                if let Some(archive) = job.archive {
-                    let _ = fs::remove_file(archive);
-                }
-                if let Some(work) = job.work {
-                    let _ = fs::remove_dir_all(work);
-                }
-            }
-        }
-        _ => {}
+    if let Some(job) = state.job.as_ref()
+        && matches!(job.phase, Phase::Downloading)
+    {
+        // Kill curl first, then remove the job immediately so `busy()` is
+        // released even if a platform is slow to reap the child process.
+        job.cancel.cancel();
     }
-    cx.refresh_windows();
-}
-
-fn set_phase(phase: Phase, cx: &mut App) {
-    if let Some(job) = &mut cx.global_mut::<UpdateState>().job {
-        job.phase = phase;
-    }
-    cx.refresh_windows();
-}
-
-fn fail(err: anyhow::Error, cx: &mut App) {
-    if err.is::<Cancelled>() {
-        cx.global_mut::<UpdateState>().job = None;
+    if state
+        .job
+        .as_ref()
+        .is_some_and(|job| matches!(job.phase, Phase::Installing))
+    {
         cx.refresh_windows();
         return;
     }
-    let message = error_text(&err);
-    set_phase(Phase::Failed(message), cx);
+    if let Some(job) = state.job.take() {
+        if let Some(archive) = job.archive {
+            let _ = fs::remove_file(archive);
+        }
+        if let Some(work) = job.work {
+            let _ = fs::remove_dir_all(work);
+        }
+    }
+    cx.refresh_windows();
+}
+
+fn set_phase(id: u64, phase: Phase, cx: &mut App) -> bool {
+    let changed = if let Some(job) = &mut cx.global_mut::<UpdateState>().job {
+        if job.id != id {
+            false
+        } else {
+            job.phase = phase;
+            true
+        }
+    } else {
+        false
+    };
+    if changed {
+        cx.refresh_windows();
+    }
+    changed
+}
+
+fn fail(id: u64, err: anyhow::Error, cx: &mut App) {
+    if err.is::<Cancelled>() {
+        if cx
+            .global::<UpdateState>()
+            .job
+            .as_ref()
+            .is_some_and(|job| job.id == id)
+        {
+            cx.global_mut::<UpdateState>().job = None;
+            cx.refresh_windows();
+        }
+        return;
+    }
+    set_phase(id, Phase::Failed(error_text(&err)), cx);
 }
 
 pub fn start_update(cx: &mut App) {
@@ -1482,8 +1775,10 @@ pub fn start_update(cx: &mut App) {
         return;
     }
     let downloaded = Arc::new(AtomicU64::new(0));
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = http::CancelToken::default();
+    let id = next_job_id();
     state.job = Some(Job {
+        id,
         downloaded: downloaded.clone(),
         total: asset.size,
         cancel: cancel.clone(),
@@ -1512,6 +1807,7 @@ pub fn start_update(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     let version = release.version.clone();
     cx.spawn(async move |cx| {
+        let worker_cancel = cancel.clone();
         let fetched = cx
             .background_executor()
             .spawn(async move {
@@ -1527,53 +1823,117 @@ pub fn start_update(cx: &mut App) {
                     (work.join(&name), Some(work))
                 };
                 // Stage beside the target so a cancelled run never truncates
-                // a package the user already had there.
-                let staging = with_suffix(&dest, ".part");
-                let _ = fs::remove_file(&staging);
-                download(&asset, &staging, &downloaded, &cancel)?;
-                fs::rename(&staging, &dest).localize("update.error.install")?;
-                anyhow::Ok((dest, work))
+                // a package the user already had there. The staging name is
+                // unique across processes and jobs.
+                let staging = unique_staging(&dest);
+                let result = (|| -> Result<Downloaded> {
+                    download(&asset, &staging, &downloaded, &worker_cancel)?;
+                    check_cancel(&worker_cancel)?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        // The fixed public name is claimed on the UI thread,
+                        // after the job identity and cancellation are checked.
+                        Ok(Downloaded {
+                            archive: staging.clone(),
+                            target: dest,
+                            work: work.clone(),
+                        })
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        // Windows needs the package's real extension, and this
+                        // rename stays inside this job's unique work directory.
+                        fs::rename(&staging, &dest).localize("update.error.install")?;
+                        check_cancel(&worker_cancel)?;
+                        Ok(Downloaded {
+                            archive: dest.clone(),
+                            target: dest,
+                            work: work.clone(),
+                        })
+                    }
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&staging);
+                    if let Some(work) = &work {
+                        let _ = fs::remove_dir_all(work);
+                    }
+                }
+                result
             })
             .await;
         finished.store(true, Ordering::Relaxed);
         cx.update(|cx| match fetched {
-            Ok((archive, work)) => {
-                let state = cx.global_mut::<UpdateState>();
-                if let Some(job) = &mut state.job {
-                    job.archive = Some(archive);
-                    job.work = work;
-                }
-                set_phase(Phase::Ready, cx);
-            }
-            Err(err) => fail(err, cx),
+            Ok(downloaded) => publish_download(id, &cancel, downloaded, cx),
+            Err(err) => fail(id, err, cx),
         });
     })
     .detach();
 }
 
+fn publish_download(id: u64, cancel: &http::CancelToken, downloaded: Downloaded, cx: &mut App) {
+    if !cx.global::<UpdateState>().can_publish_ready(id, cancel) {
+        let _ = fs::remove_file(&downloaded.archive);
+        if let Some(work) = downloaded.work {
+            let _ = fs::remove_dir_all(work);
+        }
+        return;
+    }
+    if downloaded.archive != downloaded.target
+        && let Err(err) = claim_download_target(&downloaded.archive, &downloaded.target)
+            .localize("update.error.install")
+    {
+        let _ = fs::remove_file(&downloaded.archive);
+        if let Some(work) = downloaded.work {
+            let _ = fs::remove_dir_all(work);
+        }
+        fail(id, err, cx);
+        return;
+    }
+    // Re-check immediately before Ready. This update runs on the UI thread,
+    // so dismissal cannot interleave between the check and publication.
+    if !cx.global::<UpdateState>().can_publish_ready(id, cancel) {
+        let _ = fs::remove_file(&downloaded.target);
+        if let Some(work) = downloaded.work {
+            let _ = fs::remove_dir_all(work);
+        }
+        return;
+    }
+    let state = cx.global_mut::<UpdateState>();
+    if let Some(job) = &mut state.job {
+        job.archive = Some(downloaded.target);
+        job.work = downloaded.work;
+    }
+    set_phase(id, Phase::Ready, cx);
+}
+
 /// Windows: install the verified package and restart, on the user's click.
 #[cfg(not(target_os = "macos"))]
 pub fn install_ready(cx: &mut App) {
-    let Some(job) = cx.global::<UpdateState>().job() else {
-        return;
-    };
-    if !matches!(job.phase, Phase::Ready) {
-        return;
-    }
-    let (Some(archive), Some(work), version, expected_sha256, expected_size) = (
-        job.archive.clone(),
-        job.work.clone(),
-        cx.global::<UpdateState>().job_version(),
-        job.expected_sha256.clone(),
-        job.expected_size,
-    ) else {
+    let Some((id, archive, work, version, expected_sha256, expected_size)) = (|| {
+        let state = cx.global::<UpdateState>();
+        let job = state.job()?;
+        if !matches!(job.phase, Phase::Ready) {
+            return None;
+        }
+        let (Some(archive), Some(work)) = (job.archive.clone(), job.work.clone()) else {
+            return None;
+        };
+        Some((
+            job.id,
+            archive,
+            work,
+            state.job_version(),
+            job.expected_sha256.clone(),
+            job.expected_size,
+        ))
+    })() else {
         return;
     };
     if !archive.exists() {
         forget_stale_package(cx);
         return;
     }
-    set_phase(Phase::Installing, cx);
+    set_phase(id, Phase::Installing, cx);
     cx.spawn(async move |cx| {
         let installed = cx
             .background_executor()
@@ -1587,8 +1947,8 @@ pub fn install_ready(cx: &mut App) {
             })
             .await;
         cx.update(|cx| match installed {
-            Ok(relaunch) => restart(relaunch, cx),
-            Err(err) => fail(err, cx),
+            Ok(relaunch) => restart(id, relaunch, cx),
+            Err(err) => fail(id, err, cx),
         });
     })
     .detach();
@@ -1623,9 +1983,10 @@ pub(crate) fn forget_stale_package(cx: &mut App) {
 /// Start the installed version and quit this one through the app's own quit
 /// path.
 #[cfg(not(target_os = "macos"))]
-fn restart(mut relaunch: Command, cx: &mut App) {
+fn restart(id: u64, mut relaunch: Command, cx: &mut App) {
     if let Err(err) = relaunch.spawn() {
         set_phase(
+            id,
             Phase::Failed(
                 UpdateError::new("update.error.relaunch")
                     .detail(err)
@@ -1992,9 +2353,11 @@ mod tests {
         let work = work_dir(&release.version).unwrap();
         let archive = work.join(url_file_name(&asset.url));
         let progress = AtomicU64::new(0);
-        let cancelled = download(&asset, &archive, &progress, &AtomicBool::new(true)).unwrap_err();
+        let cancel = http::CancelToken::default();
+        cancel.cancel();
+        let cancelled = download(&asset, &archive, &progress, &cancel).unwrap_err();
         assert!(cancelled.is::<Cancelled>() && !archive.exists());
-        download(&asset, &archive, &progress, &AtomicBool::new(false)).unwrap();
+        download(&asset, &archive, &progress, &http::CancelToken::default()).unwrap();
         assert_eq!(progress.load(Ordering::Relaxed), asset.size);
         assert_eq!(fs::read(&archive).unwrap().len() as u64, asset.size);
 
@@ -2006,10 +2369,278 @@ mod tests {
             size: asset.size,
         };
         let rejected = work.join("rejected.dmg");
-        let err = download(&wrong, &rejected, &progress, &AtomicBool::new(false)).unwrap_err();
+        let err =
+            download(&wrong, &rejected, &progress, &http::CancelToken::default()).unwrap_err();
         eprintln!("mismatched package refused: {err:#}");
         assert!(!rejected.exists());
         let _ = fs::remove_dir_all(&work);
+    }
+
+    fn test_job(id: u64, cancel: http::CancelToken) -> Job {
+        Job {
+            id,
+            downloaded: Arc::new(AtomicU64::new(0)),
+            total: 0,
+            cancel,
+            phase: Phase::Downloading,
+            archive: None,
+            work: None,
+            #[cfg(target_os = "windows")]
+            expected_sha256: String::new(),
+            #[cfg(target_os = "windows")]
+            expected_size: 0,
+        }
+    }
+
+    #[test]
+    fn only_the_current_uncancelled_job_can_publish_ready() {
+        let cancel = http::CancelToken::default();
+        let mut state = UpdateState {
+            job: Some(test_job(1, cancel.clone())),
+            ..UpdateState::default()
+        };
+        assert!(!state.can_publish_ready(2, &cancel));
+        assert!(state.can_publish_ready(1, &cancel));
+        cancel.cancel();
+        assert!(!state.can_publish_ready(1, &cancel));
+        state.job = None;
+        assert!(!state.busy());
+        assert!(!state.can_publish_ready(1, &cancel));
+    }
+
+    #[test]
+    fn work_directories_are_unique_and_owned_with_create_new() {
+        let base = std::env::temp_dir().join(format!(
+            "snapit-updater-work-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|index| {
+                let base = base.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_work_dir_in(&base, "1.2.3-beta.1", std::process::id(), index).unwrap()
+                })
+            })
+            .collect();
+        let dirs: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_ne!(dirs[0], dirs[1]);
+        for (index, dir) in dirs.iter().enumerate() {
+            assert_eq!(work_owner(dir), Some((std::process::id(), index as u64)));
+            assert!(
+                create_work_dir_in(&base, "1.2.3-beta.1", std::process::id(), index as u64)
+                    .is_err()
+            );
+            assert!(dir.is_dir(), "a losing creator must not remove the owner");
+        }
+        let first = work_dir("1.2.3").unwrap();
+        let second = work_dir("1.2.3").unwrap();
+        assert_ne!(first, second);
+        fs::remove_dir_all(&first).unwrap();
+        fs::remove_dir_all(&second).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_preserves_live_peers_and_removes_only_proven_stale_dirs() {
+        let base = std::env::temp_dir().join(format!(
+            "snapit-updater-cleanup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let ours = create_work_dir_in(&base, "1.0.0", std::process::id(), 100).unwrap();
+        let live = base.join(format!("snapit-update-1.0.0-{}-101", std::process::id()));
+        let dead = base.join(format!("snapit-update-1.0.0-{}-102", u32::MAX));
+        for dir in [&live, &dead] {
+            fs::create_dir(dir).unwrap();
+            let owner = if dir == &live {
+                &format!("{} 101\n", std::process::id())
+            } else {
+                &format!("{} 102\n", u32::MAX)
+            };
+            fs::write(dir.join(WORK_OWNER_FILE), owner).unwrap();
+        }
+        let unrelated = base.join("snapit-update-unowned");
+        fs::create_dir(&unrelated).unwrap();
+
+        remove_stale_update_dirs_in(&base);
+
+        assert!(
+            !ours.exists(),
+            "this instance's directories are provably ours"
+        );
+        assert!(live.exists(), "a live peer's directory must survive");
+        assert!(!dead.exists(), "a provably dead owner's directory is stale");
+        assert!(unrelated.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn staging_names_do_not_collide_across_jobs() {
+        let target = Path::new("/tmp/SnapIt-1.0.0.dmg");
+        assert_ne!(unique_staging(target), unique_staging(target));
+    }
+
+    #[test]
+    fn public_download_name_is_claimed_without_overwriting_a_peer() {
+        let dir = std::env::temp_dir().join(format!(
+            "snapit-updater-publish-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let staging = dir.join("SnapIt-1.0.0.dmg.part");
+        let target = dir.join("SnapIt-1.0.0.dmg");
+        fs::write(&staging, b"new package").unwrap();
+        claim_download_target(&staging, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert!(!staging.exists());
+
+        fs::write(&staging, b"peer package").unwrap();
+        let err = claim_download_target(&staging, &target).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert_eq!(fs::read(&staging).unwrap(), b"peer package");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_terminates_a_blocked_curl_and_removes_staging() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        use std::sync::{Barrier, mpsc};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/update.dmg", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let server_release = release.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\nabc")
+                .unwrap();
+            stream.flush().unwrap();
+            started_tx.send(()).unwrap();
+            server_release.wait();
+            let _ = stream.write_all(&[0; 1021]);
+        });
+        let dir =
+            std::env::temp_dir().join(format!("snapit-updater-cancel-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let staging = dir.join("update.dmg");
+        let asset = Asset {
+            url,
+            sha256: "0".repeat(64),
+            size: 1024,
+        };
+        let cancel = http::CancelToken::default();
+        let worker_cancel = cancel.clone();
+        let worker_staging = staging.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            result_tx
+                .send(download(
+                    &asset,
+                    &worker_staging,
+                    &AtomicU64::new(0),
+                    &worker_cancel,
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancel.cancel();
+        release.wait();
+        let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(result.unwrap_err().is::<Cancelled>());
+        assert!(!staging.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn truncated_transfer_is_rejected_and_removes_staging() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/update.dmg", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\nabc")
+                .unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "snapit-updater-truncated-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let staging = dir.join("update.dmg");
+        let asset = Asset {
+            url,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 3,
+        };
+        let err = download(
+            &asset,
+            &staging,
+            &AtomicU64::new(0),
+            &http::CancelToken::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("curl"), "{err:#}");
+        assert!(!staging.exists());
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn finish_rechecks_cancellation_after_eof() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/manifest", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+                .unwrap();
+        });
+        let cancel = http::CancelToken::default();
+        let mut body = http::get(&url, Duration::from_secs(5), 1024, &cancel).unwrap();
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abc");
+        cancel.cancel();
+        let err = body.finish().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        server.join().unwrap();
     }
 
     #[test]

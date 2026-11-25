@@ -1,6 +1,9 @@
 //! Browse past captures: re-copy, pin, reveal, delete, clear.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::Local;
 use gpui_kit::assets::IconName as LucideIcon;
@@ -12,8 +15,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, Context, Entity, FontWeight, ImageFormat, InteractiveElement as _,
-    IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, ImageFormat,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Window, div, img,
     prelude::FluentBuilder as _, px,
 };
@@ -59,6 +62,9 @@ impl HistoryFilter {
 pub struct HistoryView {
     store: Entity<HistoryStore>,
     filter: HistoryFilter,
+    cached_generation: Option<u64>,
+    cached_entries: Arc<Vec<HistoryEntry>>,
+    copy_serial: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -73,6 +79,9 @@ impl HistoryView {
             ],
             store,
             filter: HistoryFilter::default(),
+            cached_generation: None,
+            cached_entries: Arc::new(Vec::new()),
+            copy_serial: 0,
         }
     }
 
@@ -195,6 +204,42 @@ impl HistoryView {
         }))
     }
 
+    fn copy_image(&mut self, path: PathBuf, kind: EntryKind, cx: &mut Context<Self>) {
+        let format = match kind {
+            EntryKind::Png | EntryKind::Apng => ImageFormat::Png,
+            EntryKind::Gif => ImageFormat::Gif,
+            EntryKind::Mp4 => return,
+        };
+        self.copy_serial = self.copy_serial.wrapping_add(1);
+        let serial = self.copy_serial;
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { clipboard::read_image_file(&path, format) }
+                })
+                .await;
+            view.update(cx, |this, cx| {
+                if this.copy_serial != serial {
+                    return;
+                }
+                match result {
+                    Ok(image) => {
+                        clipboard::write_image(image, cx);
+                        Controller::global(cx).update(cx, |controller, cx| {
+                            controller.inform(t!("history.copied").to_string(), cx)
+                        });
+                    }
+                    Err(err) => Controller::global(cx).update(cx, |controller, cx| {
+                        controller.inform(t!("history.copy_failed", error = err).to_string(), cx)
+                    }),
+                }
+            });
+        })
+        .detach();
+    }
+
     fn render_entry(&self, entry: &HistoryEntry, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let store = self.store.read(cx);
@@ -301,7 +346,9 @@ impl HistoryView {
                                 .tooltip(t!("history.copy_image").to_string())
                                 .on_click({
                                     let file = file.clone();
-                                    move |_, window, cx| copy_file(&file, kind, window, cx)
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.copy_image(file.clone(), kind, cx)
+                                    })
                                 }),
                         )
                     })
@@ -368,21 +415,6 @@ fn open_with_system(path: &Path) {
     }
 }
 
-fn copy_file(path: &Path, kind: EntryKind, window: &mut Window, cx: &mut App) {
-    let format = match kind {
-        EntryKind::Png | EntryKind::Apng => ImageFormat::Png,
-        EntryKind::Gif => ImageFormat::Gif,
-        // Filtered out at the call site: only images reach the clipboard.
-        EntryKind::Mp4 => return,
-    };
-    match clipboard::copy_image_file(path, format, cx) {
-        Ok(()) => window.push_notification(t!("history.copied").to_string(), cx),
-        Err(err) => {
-            window.push_notification(t!("history.copy_failed", error = err).to_string(), cx)
-        }
-    }
-}
-
 fn copy_file_to_clipboard(path: &Path, window: &mut Window, cx: &mut App) {
     let message = match clipboard::copy_file_reference(path, cx) {
         Ok(clipboard::FileCopy::File) => t!("history.copied_file").to_string(),
@@ -398,17 +430,20 @@ fn copy_file_to_clipboard(path: &Path, window: &mut Window, cx: &mut App) {
 impl Render for HistoryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = self.filter;
-        let (entries, count, bytes, error) = {
+        let (count, bytes, error) = {
             let store = self.store.read(cx);
-            let entries: Vec<HistoryEntry> = store
-                .entries()
-                .filter(|entry| filter.matches(entry.kind))
-                .cloned()
-                .collect();
-            let count = entries.len();
-            let bytes = entries.iter().map(|entry| entry.bytes).sum();
+            if self.cached_generation != Some(store.generation()) {
+                self.cached_entries = Arc::new(store.entries().cloned().collect());
+                self.cached_generation = Some(store.generation());
+            }
+            let entries = self
+                .cached_entries
+                .iter()
+                .filter(|entry| filter.matches(entry.kind));
+            let count = entries.clone().count();
+            let bytes = entries.map(|entry| entry.bytes).sum();
             let error = store.error().map(str::to_string);
-            (entries, count, bytes, error)
+            (count, bytes, error)
         };
         let theme = cx.theme();
         let (background, foreground, muted, danger) = (
@@ -418,7 +453,7 @@ impl Render for HistoryView {
             theme.danger,
         );
 
-        let body = if entries.is_empty() {
+        let body = if count == 0 {
             div()
                 .flex_1()
                 .flex()
@@ -440,7 +475,12 @@ impl Render for HistoryView {
                 .flex_1()
                 .min_h_0()
                 .gap_2()
-                .children(entries.iter().map(|entry| self.render_entry(entry, cx)))
+                .children(
+                    self.cached_entries
+                        .iter()
+                        .filter(|entry| filter.matches(entry.kind))
+                        .map(|entry| self.render_entry(entry, cx)),
+                )
                 .overflow_y_scrollbar()
                 .into_any_element()
         };

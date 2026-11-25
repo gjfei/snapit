@@ -75,6 +75,10 @@ impl HistoryStore {
         self.history.iter().flat_map(|history| history.entries())
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn len(&self) -> usize {
         self.history.as_ref().map_or(0, History::len)
     }
@@ -107,12 +111,6 @@ impl HistoryStore {
             }
         });
         resolved.unwrap_or_else(|| self.dir.join(".invalid-history-entry"))
-    }
-
-    /// Newest capture, preferring the original PNG; animations use their PNG
-    /// thumbnail so pinning does not need an animation decoder.
-    pub fn latest_image(&self) -> Option<(PathBuf, f32)> {
-        self.entries().next().map(|entry| self.pin_source(entry))
     }
 
     pub fn pin_source(&self, entry: &HistoryEntry) -> (PathBuf, f32) {
@@ -173,13 +171,22 @@ impl HistoryStore {
         let dir = self.dir.clone();
         let task = cx.background_spawn(async move {
             let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
+            let (width, height) = composition.dimensions();
             if composition.has_hdr_original() {
                 log::info!("history: storing shared HDR original (16-bit BT.2020/PQ)");
                 let png = composition.png().map_err(anyhow::Error::msg)?;
                 NewEntry::image_hdr(&dir, &png, &image, scale_factor, ocr_text)
             } else {
                 log::info!("history: storing composed SDR original");
-                NewEntry::image(&dir, &image, scale_factor, ocr_text)
+                NewEntry::image_from_png(
+                    &dir,
+                    width,
+                    height,
+                    |path| composition.write_png(path).map_err(anyhow::Error::msg),
+                    &image,
+                    scale_factor,
+                    ocr_text,
+                )
             }
         });
         self.insert_when_ready(task, generation, cx).detach();
@@ -232,6 +239,7 @@ impl HistoryStore {
                         {
                             log::error!("failed to add history entry: {err:#}");
                         }
+                        this.generation = this.generation.wrapping_add(1);
                     }
                     Ok(entry) => {
                         log::info!(
@@ -261,6 +269,7 @@ impl HistoryStore {
             Ok(Some(_)) | Ok(None) => {}
             Err(err) => log::error!("failed to delete history entry: {err:#}"),
         }
+        self.generation = self.generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -285,6 +294,7 @@ impl HistoryStore {
             match history.prune(limits) {
                 Ok(pruned) if !pruned.is_empty() => {
                     log::info!("pruned {} history entries", pruned.len());
+                    self.generation = self.generation.wrapping_add(1);
                     cx.notify();
                 }
                 Ok(_) => {}

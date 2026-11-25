@@ -123,9 +123,8 @@ pub struct NewEntry(HistoryEntry);
 /// Metadata for the original file backing a new entry, shared by the three
 /// constructors so `finish` stays a small function.
 struct FinishSpec {
-    id: String,
+    reservation: Reservation,
     kind: EntryKind,
-    file: String,
     hdr: bool,
 }
 
@@ -136,20 +135,42 @@ impl NewEntry {
         scale_factor: f32,
         ocr_text: Option<String>,
     ) -> Result<Self> {
-        let (id, file) = reserve(dir, EntryKind::Png)?;
+        Self::image_from_png(
+            dir,
+            image.width(),
+            image.height(),
+            |path| {
+                image
+                    .save_with_format(path, image::ImageFormat::Png)
+                    .with_context(|| format!("failed to write {}", path.display()))
+            },
+            image,
+            scale_factor,
+            ocr_text,
+        )
+    }
+
+    pub fn image_from_png(
+        dir: &Path,
+        width: u32,
+        height: u32,
+        write: impl FnOnce(&Path) -> Result<()>,
+        preview: &RgbaImage,
+        scale_factor: f32,
+        ocr_text: Option<String>,
+    ) -> Result<Self> {
+        let reservation = reserve(dir, EntryKind::Png)?;
         let writing = Instant::now();
-        image
-            .save_with_format(dir.join(&file), image::ImageFormat::Png)
-            .with_context(|| format!("failed to write {file}"))?;
+        let path = reservation.path();
+        write(&path)?;
         let written = writing.elapsed();
         let previewing = Instant::now();
         let spec = FinishSpec {
-            id,
+            reservation,
             kind: EntryKind::Png,
-            file,
             hdr: false,
         };
-        let entry = Self::finish(dir, spec, image, scale_factor, ocr_text)?;
+        let entry = Self::finish(dir, spec, preview, width, height, scale_factor, ocr_text)?;
         log::info!(
             target: "timing",
             "history: image write {:.1} ms, thumbnail {:.1} ms",
@@ -170,19 +191,26 @@ impl NewEntry {
         scale_factor: f32,
         ocr_text: Option<String>,
     ) -> Result<Self> {
-        let (id, file) = reserve(dir, EntryKind::Png)?;
+        let reservation = reserve(dir, EntryKind::Png)?;
         let writing = Instant::now();
-        std::fs::write(dir.join(&file), png_bytes)
-            .with_context(|| format!("failed to write {file}"))?;
+        std::fs::write(reservation.path(), png_bytes)
+            .with_context(|| format!("failed to write {}", reservation.file))?;
         let written = writing.elapsed();
         let previewing = Instant::now();
         let spec = FinishSpec {
-            id,
+            reservation,
             kind: EntryKind::Png,
-            file,
             hdr: true,
         };
-        let entry = Self::finish(dir, spec, preview, scale_factor, ocr_text)?;
+        let entry = Self::finish(
+            dir,
+            spec,
+            preview,
+            preview.width(),
+            preview.height(),
+            scale_factor,
+            ocr_text,
+        )?;
         log::info!(
             target: "timing",
             "history: HDR PNG write {:.1} ms, thumbnail {:.1} ms",
@@ -200,19 +228,20 @@ impl NewEntry {
         preview: &RgbaImage,
         scale_factor: f32,
     ) -> Result<Self> {
-        let (id, file) = reserve_import(dir, source, kind)?;
+        let reservation = reserve_import(dir, source, kind)?;
         let copying = Instant::now();
-        let destination = dir.join(&file);
+        let destination = reservation.path();
         let mut source_file = std::fs::File::open(source)
             .with_context(|| format!("failed to open {}", source.display()))?;
         (|| -> Result<()> {
+            // Reservation created the destination; reopen it without create_new
+            // so another writer can never claim the path after the check.
             let mut destination_file = std::fs::OpenOptions::new()
                 .write(true)
-                .create_new(true)
+                .truncate(true)
                 .open(&destination)
-                .with_context(|| format!("failed to create {}", destination.display()))?;
+                .with_context(|| format!("failed to open {}", destination.display()))?;
             if let Err(err) = std::io::copy(&mut source_file, &mut destination_file) {
-                let _ = std::fs::remove_file(&destination);
                 return Err(err).with_context(|| format!("failed to copy {}", source.display()));
             }
             Ok(())
@@ -220,12 +249,19 @@ impl NewEntry {
         let copied = copying.elapsed();
         let previewing = Instant::now();
         let spec = FinishSpec {
-            id,
+            reservation,
             kind,
-            file,
             hdr: false,
         };
-        let entry = Self::finish(dir, spec, preview, scale_factor, None)?;
+        let entry = Self::finish(
+            dir,
+            spec,
+            preview,
+            preview.width(),
+            preview.height(),
+            scale_factor,
+            None,
+        )?;
         log::info!(
             target: "timing",
             "history: copy {:.1} ms, thumbnail {:.1} ms",
@@ -239,23 +275,25 @@ impl NewEntry {
         dir: &Path,
         spec: FinishSpec,
         preview: &RgbaImage,
+        width: u32,
+        height: u32,
         scale_factor: f32,
         ocr_text: Option<String>,
     ) -> Result<Self> {
         let FinishSpec {
-            id,
+            mut reservation,
             kind,
-            file,
             hdr,
         } = spec;
-        let thumbnail = format!("{id}.thumb.png");
-        let (width, height) = preview.dimensions();
-        let thumb_source = if height > width.saturating_mul(2) && width > 0 {
-            let crop_h = width.saturating_mul(2).min(height);
-            Some(image::imageops::crop_imm(preview, 0, 0, width, crop_h).to_image())
-        } else if width > height.saturating_mul(2) && height > 0 {
-            let crop_w = height.saturating_mul(2).min(width);
-            Some(image::imageops::crop_imm(preview, 0, 0, crop_w, height).to_image())
+        let thumbnail = &reservation.thumbnail;
+        let (preview_width, preview_height) = preview.dimensions();
+        let thumb_source = if preview_height > preview_width.saturating_mul(2) && preview_width > 0
+        {
+            let crop_h = preview_width.saturating_mul(2).min(preview_height);
+            Some(image::imageops::crop_imm(preview, 0, 0, preview_width, crop_h).to_image())
+        } else if preview_width > preview_height.saturating_mul(2) && preview_height > 0 {
+            let crop_w = preview_height.saturating_mul(2).min(preview_width);
+            Some(image::imageops::crop_imm(preview, 0, 0, crop_w, preview_height).to_image())
         } else {
             None
         };
@@ -268,15 +306,16 @@ impl NewEntry {
             ((th as f32 * scale).round() as u32).max(1),
         );
         thumb
-            .save_with_format(dir.join(&thumbnail), image::ImageFormat::Png)
+            .save_with_format(dir.join(thumbnail), image::ImageFormat::Png)
             .with_context(|| format!("failed to write {thumbnail}"))?;
-        let bytes = file_size(&dir.join(&file)) + file_size(&dir.join(&thumbnail));
+        let bytes = file_size(&reservation.path()) + file_size(&dir.join(thumbnail));
+        reservation.finished = true;
         Ok(Self(HistoryEntry {
-            id,
+            id: reservation.id.clone(),
             kind,
             created_at: Utc::now(),
-            file,
-            thumbnail: Some(thumbnail),
+            file: reservation.file.clone(),
+            thumbnail: Some(thumbnail.clone()),
             width,
             height,
             bytes,
@@ -301,48 +340,156 @@ impl NewEntry {
     }
 }
 
-fn reserve(dir: &Path, kind: EntryKind) -> Result<(String, String)> {
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let base = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
-    let mut id = base.clone();
-    let mut n = 1;
-    while dir.join(format!("{id}.{}", kind.extension())).exists() {
-        id = format!("{base}-{n}");
-        n += 1;
-    }
-    let file = format!("{id}.{}", kind.extension());
-    Ok((id, file))
+/// Atomically owned history paths. The thumbnail placeholder reserves the id as
+/// well as its path, so concurrent tasks cannot select either path after an
+/// `exists` check. Failed construction removes both placeholders.
+struct Reservation {
+    id: String,
+    file: String,
+    thumbnail: String,
+    original_path: Option<PathBuf>,
+    thumbnail_path: PathBuf,
+    finished: bool,
 }
 
-fn reserve_import(dir: &Path, source: &Path, kind: EntryKind) -> Result<(String, String)> {
-    let (id, fallback) = reserve(dir, kind)?;
-    let Some(preferred) = source
+impl Reservation {
+    fn path(&self) -> PathBuf {
+        self.original_path.as_ref().unwrap().clone()
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            for path in self
+                .original_path
+                .iter()
+                .chain(std::iter::once(&self.thumbnail_path))
+            {
+                if let Err(err) = std::fs::remove_file(path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!(
+                        "failed to remove history placeholder {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn reserve(dir: &Path, kind: EntryKind) -> Result<Reservation> {
+    let base = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    reserve_with_base(dir, &base, None, kind)
+}
+
+fn reserve_import(dir: &Path, source: &Path, kind: EntryKind) -> Result<Reservation> {
+    let preferred = source
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| validate_file_name(name).is_ok())
-    else {
-        return Ok((id, fallback));
-    };
-    if !dir.join(preferred).exists() {
-        return Ok((id, preferred.to_string()));
-    }
+        .filter(|name| validate_file_name(name).is_ok());
+    let base = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    reserve_with_base(dir, &base, preferred, kind)
+}
 
-    let path = Path::new(preferred);
+/// `base` is injectable so tests can force identical millisecond names without
+/// relying on sleeps or thread scheduling.
+fn reserve_with_base(
+    dir: &Path,
+    base: &str,
+    preferred: Option<&str>,
+    kind: EntryKind,
+) -> Result<Reservation> {
+    validate_file_name(base)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let (id, thumbnail_path) = reserve_id(dir, base, kind)?;
+    let thumbnail = format!("{id}.thumb.png");
+    let mut reservation = Reservation {
+        id,
+        file: String::new(),
+        thumbnail,
+        original_path: None,
+        thumbnail_path,
+        finished: false,
+    };
+    reservation.file = match preferred {
+        Some(name) => reserve_file_name(dir, name)?,
+        None => reserve_file_name(dir, &format!("{}.{}", reservation.id, kind.extension()))?,
+    };
+    reservation.original_path = Some(dir.join(&reservation.file));
+    Ok(reservation)
+}
+
+fn reserve_id(dir: &Path, base: &str, kind: EntryKind) -> Result<(String, PathBuf)> {
+    let mut id = base.to_string();
+    let mut n = 1;
+    loop {
+        let thumbnail = dir.join(format!("{id}.thumb.png"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&thumbnail)
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                id = format!("{base}-{n}");
+                n += 1;
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to reserve history id in {}", dir.display()));
+            }
+        }
+        // Older/incomplete entries may have an original but no thumbnail.
+        if dir.join(format!("{id}.{}", kind.extension())).exists() {
+            if let Err(err) = std::fs::remove_file(&thumbnail) {
+                return Err(err)
+                    .with_context(|| format!("failed to release {}", thumbnail.display()));
+            }
+            id = format!("{base}-{n}");
+            n += 1;
+            continue;
+        }
+        return Ok((id, thumbnail));
+    }
+}
+
+fn reserve_file_name(dir: &Path, name: &str) -> Result<String> {
+    validate_file_name(name)?;
+    let path = Path::new(name);
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or(preferred);
+        .unwrap_or(name);
     let extension = path.extension().and_then(|extension| extension.to_str());
-    for n in 2.. {
-        let candidate = match extension {
-            Some(extension) => format!("{stem}-{n}.{extension}"),
-            None => format!("{stem}-{n}"),
-        };
-        if !dir.join(&candidate).exists() {
-            return Ok((id, candidate));
+    let mut candidate = name.to_string();
+    let mut n = 2;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&candidate))
+        {
+            Ok(_) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = match extension {
+                    Some(extension) => format!("{stem}-{n}.{extension}"),
+                    None => format!("{stem}-{n}"),
+                };
+                n += 1;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to reserve history file {}",
+                        dir.join(name).display()
+                    )
+                });
+            }
         }
     }
-    unreachable!("file-name collision search is unbounded")
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -473,11 +620,18 @@ impl History {
     /// The candidate index is persisted before memory changes or file deletion.
     pub fn insert(&mut self, entry: NewEntry, limits: Limits) -> Result<Vec<HistoryEntry>> {
         validate_entry(entry.entry())?;
+        let candidate = entry.entry().clone();
         let mut next = self.entries.clone();
         next.push(entry.0);
         next.sort_by_key(|entry| entry.created_at);
         let pruned = Self::prune_entries(&mut next, limits);
-        self.save_entries(&next)?;
+        if let Err(err) = self.save_entries(&next) {
+            // NewEntry has finished writing, so its reservation no longer owns
+            // cleanup. Until the index is published these files are orphans;
+            // remove only this candidate and keep every indexed file intact.
+            self.delete_files(&candidate);
+            return Err(err);
+        }
         self.entries = next;
         self.delete_pruned_files(&pruned);
         Ok(pruned)
@@ -622,6 +776,178 @@ mod tests {
         assert!(reopened.file_path(entry).unwrap().exists());
         assert!(reopened.thumbnail_path(entry).unwrap().exists());
         assert!(entry.bytes > 0);
+    }
+
+    fn assert_unique_entry_paths(entries: &[(String, String, String)]) {
+        let ids: std::collections::HashSet<_> = entries.iter().map(|entry| &entry.0).collect();
+        let files: std::collections::HashSet<_> = entries.iter().map(|entry| &entry.1).collect();
+        let thumbnails: std::collections::HashSet<_> =
+            entries.iter().map(|entry| &entry.2).collect();
+        assert_eq!(ids.len(), entries.len(), "duplicate ids: {entries:?}");
+        assert_eq!(
+            files.len(),
+            entries.len(),
+            "duplicate originals: {entries:?}"
+        );
+        assert_eq!(
+            thumbnails.len(),
+            entries.len(),
+            "duplicate thumbnails: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn same_millisecond_image_and_hdr_entries_reserve_distinct_paths() {
+        const COUNT: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let barrier = std::sync::Barrier::new(COUNT);
+        let barrier = &barrier;
+        let entries = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..COUNT)
+                .map(|index| {
+                    scope.spawn(move || {
+                        let reservation =
+                            reserve_with_base(path, "20261124-120000-123", None, EntryKind::Png)
+                                .unwrap();
+                        let hdr = index % 2 == 0;
+                        std::fs::write(reservation.path(), if hdr { b"hdr" } else { b"sdr" })
+                            .unwrap();
+                        let entry = NewEntry::finish(
+                            path,
+                            FinishSpec {
+                                reservation,
+                                kind: EntryKind::Png,
+                                hdr,
+                            },
+                            &image(8, 8),
+                            8,
+                            8,
+                            1.0,
+                            None,
+                        )
+                        .unwrap()
+                        .entry()
+                        .clone();
+                        // Keep every completed entry on disk until all tasks
+                        // have finished, exposing any shared reservation.
+                        barrier.wait();
+                        (entry.id, entry.file, entry.thumbnail.unwrap())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_unique_entry_paths(&entries);
+        assert!(entries.iter().any(|entry| entry.0 == "20261124-120000-123"));
+        for (id, file, thumbnail) in entries {
+            assert_eq!(file, format!("{id}.png"));
+            assert_eq!(thumbnail, format!("{id}.thumb.png"));
+            let original = std::fs::read(dir.path().join(&file)).unwrap();
+            assert!(matches!(original.as_slice(), b"hdr" | b"sdr"));
+            let thumb = image::open(dir.path().join(&thumbnail)).unwrap();
+            assert_eq!((thumb.width(), thumb.height()), (8, 8));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), COUNT * 2);
+    }
+
+    #[test]
+    fn repeated_base_after_completion_still_reserves_a_new_id() {
+        let dir = tempfile::tempdir().unwrap();
+        for expected in [
+            "20261124-120000-123",
+            "20261124-120000-123-1",
+            "20261124-120000-123-2",
+        ] {
+            let reservation =
+                reserve_with_base(dir.path(), "20261124-120000-123", None, EntryKind::Png).unwrap();
+            std::fs::write(reservation.path(), b"sdr").unwrap();
+            let entry = NewEntry::finish(
+                dir.path(),
+                FinishSpec {
+                    reservation,
+                    kind: EntryKind::Png,
+                    hdr: false,
+                },
+                &image(8, 8),
+                8,
+                8,
+                1.0,
+                None,
+            )
+            .unwrap();
+            assert_eq!(entry.entry().id, expected);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 6);
+    }
+
+    #[test]
+    fn concurrent_imports_of_the_same_name_reserve_distinct_paths() {
+        const COUNT: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let barrier = std::sync::Barrier::new(COUNT);
+        let barrier = &barrier;
+        let entries = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..COUNT)
+                .map(|index| {
+                    scope.spawn(move || {
+                        let reservation = reserve_with_base(
+                            path,
+                            "20261124-120000-123",
+                            Some("clip.png"),
+                            EntryKind::Png,
+                        )
+                        .unwrap();
+                        std::fs::write(reservation.path(), index.to_string().as_bytes()).unwrap();
+                        let entry = NewEntry::finish(
+                            path,
+                            FinishSpec {
+                                reservation,
+                                kind: EntryKind::Png,
+                                hdr: false,
+                            },
+                            &image(8, 8),
+                            8,
+                            8,
+                            1.0,
+                            None,
+                        )
+                        .unwrap()
+                        .entry()
+                        .clone();
+                        barrier.wait();
+                        (entry.id, entry.file, entry.thumbnail.unwrap())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_unique_entry_paths(&entries);
+        assert_eq!(
+            entries.iter().filter(|entry| entry.1 == "clip.png").count(),
+            1
+        );
+        let mut payloads: Vec<_> = entries
+            .iter()
+            .map(|(_, file, _)| std::fs::read(dir.path().join(file)).unwrap())
+            .collect();
+        payloads.sort();
+        assert_eq!(
+            payloads,
+            (0..COUNT)
+                .map(|index| index.to_string().into_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), COUNT * 2);
     }
 
     #[test]
@@ -978,13 +1304,17 @@ mod tests {
         let pending_id = pending.entry().id.clone();
         let before: Vec<_> = history.entries().cloned().collect();
         let index_before = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
-        let original_paths: Vec<_> = before
+        let original_files: Vec<_> = before
             .iter()
-            .map(|entry| {
-                (
+            .flat_map(|entry| {
+                [
                     history.file_path(entry).unwrap(),
                     history.thumbnail_path(entry).unwrap(),
-                )
+                ]
+            })
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
             })
             .collect();
 
@@ -1010,14 +1340,91 @@ mod tests {
             std::fs::read(dir.path().join(INDEX_FILE)).unwrap(),
             index_before
         );
-        for (file, thumbnail) in original_paths {
-            assert!(file.exists());
-            assert!(thumbnail.exists());
+        for (path, bytes) in original_files {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
-        // A failed insert did not delete the newly written, still-unindexed
-        // entry, nor any old files that the candidate prune would have removed.
-        assert!(dir.path().join(format!("{pending_id}.png")).exists());
-        assert!(dir.path().join(format!("{pending_id}.thumb.png")).exists());
+        // A failed insert removes its unindexed candidate, including the
+        // thumbnail, and does not delete files targeted by the candidate prune.
+        assert!(!dir.path().join(format!("{pending_id}.png")).exists());
+        assert!(!dir.path().join(format!("{pending_id}.thumb.png")).exists());
+    }
+
+    #[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
+    #[test]
+    fn permission_failure_cleans_the_candidate_and_preserves_indexed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::open(dir.path()).unwrap();
+        let (first, _) = add(&mut history, 0, UNLIMITED);
+        let pending = NewEntry::image(history.dir(), &image(64, 48), 2.0, None).unwrap();
+        let candidate = pending.entry().clone();
+        let before: Vec<_> = history.entries().cloned().collect();
+        let index_before = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        let old_file = history.file_path(history.get(&first).unwrap()).unwrap();
+        let old_thumbnail = history
+            .thumbnail_path(history.get(&first).unwrap())
+            .unwrap();
+        let old_file_bytes = std::fs::read(&old_file).unwrap();
+        let old_thumbnail_bytes = std::fs::read(&old_thumbnail).unwrap();
+
+        // Block only the index temporary file. The history directory remains
+        // writable so the failed candidate can actually be cleaned up.
+        let index_tmp = dir.path().join("index.tmp");
+        std::fs::write(&index_tmp, b"blocked").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&index_tmp, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&index_tmp).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&index_tmp, permissions).unwrap();
+        }
+        let writable = std::fs::OpenOptions::new().write(true).open(&index_tmp);
+        if let Ok(probe) = writable {
+            // Privileged test users bypass mode bits; do not report a
+            // permission failure that the OS cannot produce for them.
+            drop(probe);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&index_tmp, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            #[cfg(windows)]
+            {
+                let mut permissions = std::fs::metadata(&index_tmp).unwrap().permissions();
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&index_tmp, permissions).unwrap();
+            }
+            std::fs::remove_file(&index_tmp).unwrap();
+            history.delete_files(&candidate);
+            return;
+        }
+        let result = history.insert(pending, Limits::new(1, 1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&index_tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&index_tmp).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&index_tmp, permissions).unwrap();
+        }
+
+        assert!(result.is_err());
+        assert_eq!(history.entries().cloned().collect::<Vec<_>>(), before);
+        assert_eq!(
+            std::fs::read(dir.path().join(INDEX_FILE)).unwrap(),
+            index_before
+        );
+        assert_eq!(std::fs::read(&old_file).unwrap(), old_file_bytes);
+        assert_eq!(std::fs::read(&old_thumbnail).unwrap(), old_thumbnail_bytes);
+        assert!(!dir.path().join(&candidate.file).exists());
+        assert!(!dir.path().join(candidate.thumbnail.unwrap()).exists());
     }
 
     #[test]
