@@ -264,6 +264,7 @@ mod tests {
         let worker_release = release.clone();
         let worker_started = started.clone();
         let worker_applied = applied.clone();
+        assert_eq!(queue.lock().unwrap().enqueue(false), 1);
         let worker = std::thread::spawn(move || {
             let mut request = worker_queue.lock().unwrap().take_next();
             let mut first = true;
@@ -290,7 +291,6 @@ mod tests {
             }
         });
 
-        assert_eq!(queue.lock().unwrap().enqueue(false), 1);
         entered.wait();
         // Both changes land while the mocked OS query is blocked.
         assert_eq!(queue.lock().unwrap().enqueue(true), 2);
