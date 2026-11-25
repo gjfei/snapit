@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/capture",
     "crates/recorder",
+    "crates/scroll",
     "crates/ocr",
     "crates/store",
     "crates/app",
@@ -21,6 +22,7 @@ repository = "https://github.com/gjfei/snapit"
 [workspace.dependencies]
 snapit-capture = { path = "crates/capture" }
 snapit-recorder = { path = "crates/recorder" }
+snapit-scroll = { path = "crates/scroll" }
 snapit-ocr = { path = "crates/ocr" }
 snapit-store = { path = "crates/store" }
 

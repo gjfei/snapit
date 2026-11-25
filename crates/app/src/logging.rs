@@ -43,6 +43,11 @@ pub fn begin_recording() -> u64 {
     begin(2)
 }
 
+/// Publish a new scrolling capture id and return it.
+pub fn begin_scroll() -> u64 {
+    begin(3)
+}
+
 fn begin(kind: u64) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     ACTIVE_ID.store(id, Ordering::Relaxed);
@@ -56,6 +61,7 @@ fn tag() -> Option<String> {
     match (kind, id) {
         (1, n) if n != 0 => Some(format!("cap#{n}")),
         (2, n) if n != 0 => Some(format!("rec#{n}")),
+        (3, n) if n != 0 => Some(format!("scr#{n}")),
         _ => None,
     }
 }
@@ -400,5 +406,13 @@ mod tests {
         assert_eq!(std::fs::read(&old).unwrap(), b"before rotation\n");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(old);
+    }
+
+    #[test]
+    fn scroll_tag_formats_with_scr_prefix() {
+        let id = begin_scroll();
+        assert_eq!(tag(), Some(format!("scr#{id}")));
+        ACTIVE_KIND.store(0, Ordering::Relaxed);
+        ACTIVE_ID.store(0, Ordering::Relaxed);
     }
 }

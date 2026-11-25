@@ -113,7 +113,7 @@ impl RecordingBar {
 
 /// The window has no titlebar, so the drag has to start as a caption drag.
 #[cfg(target_os = "windows")]
-fn native_drag(window: &mut Window) {
+pub(crate) fn native_drag(window: &mut Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};

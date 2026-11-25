@@ -250,11 +250,22 @@ impl NewEntry {
         } = spec;
         let thumbnail = format!("{id}.thumb.png");
         let (width, height) = preview.dimensions();
-        let scale = (THUMBNAIL_SIZE as f32 / width.max(height).max(1) as f32).min(1.0);
+        let thumb_source = if height > width.saturating_mul(2) && width > 0 {
+            let crop_h = width.saturating_mul(2).min(height);
+            Some(image::imageops::crop_imm(preview, 0, 0, width, crop_h).to_image())
+        } else if width > height.saturating_mul(2) && height > 0 {
+            let crop_w = height.saturating_mul(2).min(width);
+            Some(image::imageops::crop_imm(preview, 0, 0, crop_w, height).to_image())
+        } else {
+            None
+        };
+        let thumb_input = thumb_source.as_ref().unwrap_or(preview);
+        let (tw, th) = thumb_input.dimensions();
+        let scale = (THUMBNAIL_SIZE as f32 / tw.max(th).max(1) as f32).min(1.0);
         let thumb = image::imageops::thumbnail(
-            preview,
-            ((width as f32 * scale).round() as u32).max(1),
-            ((height as f32 * scale).round() as u32).max(1),
+            thumb_input,
+            ((tw as f32 * scale).round() as u32).max(1),
+            ((th as f32 * scale).round() as u32).max(1),
         );
         thumb
             .save_with_format(dir.join(&thumbnail), image::ImageFormat::Png)
@@ -1020,5 +1031,18 @@ mod tests {
         let reopened = History::open(dir.path()).unwrap();
         assert_eq!(reopened.len(), 1);
         assert!(reopened.get(&first).is_none());
+    }
+
+    #[test]
+    fn tall_image_keeps_full_dimensions_and_crops_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::open(dir.path()).unwrap();
+        let tall = image(400, 4000);
+        let entry = NewEntry::image(history.dir(), &tall, 2.0, None).unwrap();
+        let meta = entry.entry().clone();
+        history.insert(entry, UNLIMITED).unwrap();
+        assert_eq!((meta.width, meta.height), (400, 4000));
+        let thumb = image::open(history.thumbnail_path(&meta).unwrap()).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (160, 320));
     }
 }

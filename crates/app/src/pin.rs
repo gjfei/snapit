@@ -3,14 +3,19 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context as _;
-use gpui_kit::component::{ActiveTheme as _, native_menu::NativeMenu};
+use gpui_kit::component::{
+    ActiveTheme as _, native_menu::NativeMenu, scroll::ScrollableElement as _,
+};
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, DisplayId, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, ObjectFit, ParentElement as _, Pixels,
-    Render, RenderImage, ScrollEvent, Size, Styled as _, StyledImage as _, Window,
+    Render, RenderImage, ScrollEvent, ScrollHandle, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, img,
     prelude::FluentBuilder as _, px, size,
 };
+
+use snapit_capture::RgbaImage;
 
 use crate::controller::{Captured, Controller};
 use crate::session;
@@ -21,6 +26,33 @@ const MIN_OPACITY: f32 = 0.2;
 /// Pins opened away from their selection start at most this share of the display.
 const MAX_INITIAL_SHARE: f32 = 0.6;
 const MIN_SIDE: f32 = 24.;
+const TILE_MAX_HEIGHT: u32 = 2048;
+
+struct PinTile {
+    id: usize,
+    height: u32,
+    render: Arc<RenderImage>,
+}
+
+fn build_pin_tiles(image: &RgbaImage) -> Vec<PinTile> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let count = height.div_ceil(TILE_MAX_HEIGHT) as usize;
+    let mut tiles = Vec::with_capacity(count);
+    for ix in 0..count {
+        let y0 = ix as u32 * TILE_MAX_HEIGHT;
+        let h = TILE_MAX_HEIGHT.min(height - y0);
+        let slice = image::imageops::crop_imm(image, 0, y0, width, h).to_image();
+        tiles.push(PinTile {
+            id: ix,
+            height: h,
+            render: session::render_image(&slice),
+        });
+    }
+    tiles
+}
 
 actions!(
     snapit_pin,
@@ -48,25 +80,56 @@ pub struct Placement {
     pub bounds: Bounds<Pixels>,
 }
 
-pub fn open(captured: Captured, placement: Option<Placement>, cx: &mut App) {
+pub fn open(
+    captured: Captured,
+    preview: Arc<RgbaImage>,
+    placement: Option<Placement>,
+    cx: &mut App,
+) {
     let natural = size(
-        px(captured.image.width() as f32 / captured.scale),
-        px(captured.image.height() as f32 / captured.scale),
+        px(preview.width() as f32 / captured.scale),
+        px(preview.height() as f32 / captured.scale),
     );
-    let (display_id, bounds, zoom) = match placement {
-        Some(placement) => (placement.display_id, placement.bounds, 1.0),
+    let display_size = display_id_size(placement.as_ref().and_then(|p| p.display_id), cx);
+    let is_tall =
+        natural.height > display_size.height * 0.8 && natural.height > natural.width * 1.5;
+    let (display_id, bounds, zoom, scrollable) = match placement {
+        Some(placement) => {
+            if is_tall {
+                let win_h = placement.bounds.size.height.min(display_size.height * 0.75);
+                let bounds = Bounds::new(
+                    placement.bounds.origin,
+                    size(
+                        placement.bounds.size.width.max(px(MIN_SIDE)),
+                        win_h.max(px(MIN_SIDE)),
+                    ),
+                );
+                (placement.display_id, bounds, 1.0, true)
+            } else {
+                (placement.display_id, placement.bounds, 1.0, false)
+            }
+        }
         None => {
-            let zoom = cx
-                .primary_display()
-                .map(|display| {
-                    let area = display.bounds().size;
-                    ((area.width / natural.width).min(area.height / natural.height)
-                        * MAX_INITIAL_SHARE)
-                        .min(1.0)
-                })
-                .unwrap_or(1.0);
-            let size = scaled(natural, zoom);
-            (None, Bounds::centered(None, size, cx), zoom)
+            if is_tall {
+                let zoom = ((display_size.width * 0.55) / natural.width).clamp(0.25, 1.0);
+                let win_w = (natural.width * zoom).max(px(MIN_SIDE));
+                let win_h = (natural.height * zoom)
+                    .min(display_size.height * 0.75)
+                    .max(px(MIN_SIDE));
+                (
+                    None,
+                    Bounds::centered(None, size(win_w, win_h), cx),
+                    zoom,
+                    true,
+                )
+            } else {
+                let zoom = ((display_size.width / natural.width)
+                    .min(display_size.height / natural.height)
+                    * MAX_INITIAL_SHARE)
+                    .min(1.0);
+                let size = scaled(natural, zoom);
+                (None, Bounds::centered(None, size, cx), zoom, false)
+            }
         }
     };
     let options = WindowOptions {
@@ -83,47 +146,46 @@ pub fn open(captured: Captured, placement: Option<Placement>, cx: &mut App) {
         ..Default::default()
     };
     if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| PinView::new(captured, natural, zoom, window, cx))
+        cx.new(|cx| PinView::new(captured, preview, natural, zoom, scrollable, window, cx))
     }) {
         log::error!("failed to open pin window: {err:#}");
     }
 }
 
+fn display_id_size(display_id: Option<DisplayId>, cx: &App) -> Size<Pixels> {
+    display_id
+        .and_then(|id| cx.displays().into_iter().find(|d| d.id() == id))
+        .or_else(|| cx.primary_display())
+        .map(|d| d.bounds().size)
+        .unwrap_or_else(|| size(px(1440.), px(900.)))
+}
+
 /// Pin an image file, e.g. from history.
 pub fn open_file(path: PathBuf, scale: f32, cx: &mut App) {
     let load = cx.background_spawn(async move {
-        // History originals are 16-bit BT.2020/PQ HDR PNGs. Decode those with
-        // the PQ-aware path so a pinned history capture shows the same SDR
-        // preview as the live capture; ordinary PNG/GIF use the generic decoder.
-        let bytes = std::fs::read(&path)
-            .with_context(|| t!("pin.read_failed", path = path.display()).to_string())?;
-        match snapit_capture::decode_hdr_png_preview(&bytes) {
-            Ok(Some(preview)) => Ok(preview),
-            Ok(None) => image::load_from_memory(&bytes)
-                .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
-                .map(|image| image.to_rgba8()),
-            Err(err) => {
-                log::warn!("failed to decode HDR PNG for pin, trying generic decoder: {err:#}");
-                image::load_from_memory(&bytes)
-                    .with_context(|| t!("pin.read_failed", path = path.display()).to_string())
-                    .map(|image| image.to_rgba8())
+        let png = Arc::new(
+            std::fs::read(&path)
+                .with_context(|| t!("pin.read_failed", path = path.display()).to_string())?,
+        );
+        match snapit_capture::decode_hdr_png_preview(&png) {
+            Ok(Some(preview)) => Ok((png, preview, true)),
+            Ok(None) => {
+                let preview = image::load_from_memory(&png)
+                    .with_context(|| t!("pin.read_failed", path = path.display()).to_string())?
+                    .to_rgba8();
+                Ok((png, preview, false))
             }
+            Err(err) => Err(err).context(t!("pin.read_failed", path = path.display()).to_string()),
         }
     });
     cx.spawn(async move |cx| {
-        let image = load.await;
-        cx.update(|cx| match image {
-            Ok(image) => open(
-                Captured {
-                    image: Arc::new(image),
-                    hdr: None,
-                    hdr_png: None,
-                    baked: None,
-                    scale: scale.max(0.1),
-                },
-                None,
-                cx,
-            ),
+        let loaded = load.await;
+        cx.update(|cx| match loaded {
+            Ok((png, preview, hdr)) => {
+                let preview = Arc::new(preview);
+                let captured = Captured::frozen(png, preview.clone(), scale, hdr);
+                open(captured, preview, None, cx)
+            }
             Err(err) => Controller::global(cx)
                 .update(cx, |controller, cx| controller.fail(format!("{err:#}"), cx)),
         })
@@ -140,29 +202,35 @@ fn scaled(natural: Size<Pixels>, zoom: f32) -> Size<Pixels> {
 
 pub struct PinView {
     captured: Captured,
-    render: Arc<RenderImage>,
+    tiles: Vec<PinTile>,
     natural: Size<Pixels>,
     zoom: f32,
     opacity: f32,
+    scrollable: bool,
+    scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
 }
 
 impl PinView {
     fn new(
         captured: Captured,
+        preview: Arc<RgbaImage>,
         natural: Size<Pixels>,
         zoom: f32,
+        scrollable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         Self {
-            render: session::render_image(&captured.image),
+            tiles: build_pin_tiles(&preview),
             captured,
             natural,
             zoom,
             opacity: 1.0,
+            scrollable,
+            scroll_handle: ScrollHandle::new(),
             focus_handle,
         }
     }
@@ -173,7 +241,16 @@ impl PinView {
             return;
         }
         self.zoom = zoom;
-        window.resize(scaled(self.natural, zoom));
+        let mut next = scaled(self.natural, zoom);
+        if self.scrollable {
+            let max_h = window
+                .display(cx)
+                .map(|d| d.bounds().size.height)
+                .unwrap_or_else(|| display_id_size(None, cx).height)
+                * 0.85;
+            next.height = next.height.min(max_h).max(px(MIN_SIDE));
+        }
+        window.resize(next);
         cx.notify();
     }
 
@@ -232,7 +309,8 @@ impl PinView {
             .show(event.position, window, cx);
     }
 
-    /// Scroll zooms; with Alt (Option) held it changes opacity instead.
+    /// Scroll zooms; for tall scrollable pins, plain scroll moves through the
+    /// image while Cmd/Ctrl+scroll zooms and Alt+scroll changes opacity.
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(window.line_height()).y.as_f32();
         if delta == 0. {
@@ -240,8 +318,10 @@ impl PinView {
         }
         if event.modifiers.alt {
             self.set_opacity(self.opacity + delta * 0.002, cx);
-        } else {
+            cx.stop_propagation();
+        } else if !self.scrollable || event.modifiers.platform || event.modifiers.control {
             self.set_zoom(self.zoom * (delta * 0.005).exp(), window, cx);
+            cx.stop_propagation();
         }
     }
 
@@ -286,11 +366,63 @@ impl Render for PinView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
             .on_scroll(cx.listener(Self::on_scroll))
-            .child(
-                img(self.render.clone())
-                    .size_full()
-                    .object_fit(ObjectFit::Fill),
-            )
+            .when(self.scrollable, |this| {
+                let win_w = self.natural.width * self.zoom;
+                let scale = self.captured.scale;
+                let zoom = self.zoom;
+                this.child(
+                    div()
+                        .id("pin-scroll-wrap")
+                        .size_full()
+                        .relative()
+                        .child(
+                            div()
+                                .id("pin-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll_handle)
+                                .child(gpui_kit::component::v_flex().w(win_w).children(
+                                    self.tiles.iter().map(|tile| {
+                                        let tile_h = px((tile.height as f32 / scale) * zoom);
+                                        img(tile.render.clone())
+                                            .id(SharedString::from(format!("pin-tile-{}", tile.id)))
+                                            .w(win_w)
+                                            .h(tile_h)
+                                            .object_fit(ObjectFit::Fill)
+                                    }),
+                                )),
+                        )
+                        .vertical_scrollbar(&self.scroll_handle),
+                )
+            })
+            .when(!self.scrollable, |this| {
+                if self.tiles.len() <= 1 {
+                    this.when_some(self.tiles.first(), |this, tile| {
+                        this.child(
+                            img(tile.render.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Fill),
+                        )
+                    })
+                } else {
+                    let scale = self.captured.scale;
+                    let zoom = self.zoom;
+                    this.child(
+                        gpui_kit::component::v_flex()
+                            .size_full()
+                            .overflow_hidden()
+                            .children(self.tiles.iter().map(|tile| {
+                                let tile_h = px((tile.height as f32 / scale) * zoom);
+                                img(tile.render.clone())
+                                    .id(SharedString::from(format!("pin-tile-{}", tile.id)))
+                                    .flex_none()
+                                    .w_full()
+                                    .h(tile_h)
+                                    .object_fit(ObjectFit::Fill)
+                            })),
+                    )
+                }
+            })
             .child(div().absolute().inset_0().border_1().border_color(border))
             // Windows has no programmatic window drag; give it a caption strip.
             .when(cfg!(target_os = "windows"), |this| {
@@ -304,5 +436,23 @@ impl Render for PinView {
                         .window_control_area(gpui_kit::WindowControlArea::Drag),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_pin_tiles_splits_only_above_gpu_tile_limit() {
+        let short = RgbaImage::new(200, 1080);
+        let short_tiles = build_pin_tiles(&short);
+        assert_eq!(short_tiles.len(), 1);
+        assert_eq!(short_tiles[0].height, 1080);
+
+        let tall = RgbaImage::new(200, 5000);
+        let tall_tiles = build_pin_tiles(&tall);
+        let heights: Vec<u32> = tall_tiles.iter().map(|t| t.height).collect();
+        assert_eq!(heights, vec![TILE_MAX_HEIGHT, TILE_MAX_HEIGHT, 904]);
     }
 }

@@ -87,6 +87,67 @@ pub fn blocks_to_text(blocks: &[TextBlock]) -> String {
         .join("\n")
 }
 
+const TALL_OCR_THRESHOLD: u32 = 4096;
+const STRIP_HEIGHT: u32 = 3600;
+const STRIP_OVERLAP: u32 = 240;
+
+/// Recognize text across an arbitrarily tall image by slicing into overlapping
+/// vertical strips above 4096 px and deduplicating lines across strip seams.
+pub fn recognize_tall(engine: &dyn OcrEngine, image: &RgbaImage) -> Result<Vec<TextBlock>> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    if height <= TALL_OCR_THRESHOLD {
+        return engine.recognize(image);
+    }
+
+    let step = STRIP_HEIGHT - STRIP_OVERLAP;
+    let mut merged: Vec<TextBlock> = Vec::new();
+    let mut y = 0u32;
+
+    while y < height {
+        let h = STRIP_HEIGHT.min(height - y);
+        let strip = image::imageops::crop_imm(image, 0, y, width, h).to_image();
+        let mut blocks = engine.recognize(&strip)?;
+        let seam_start = y as f32;
+        let seam_end = (y + STRIP_OVERLAP) as f32;
+        for block in &mut blocks {
+            block.bounds.y += seam_start;
+        }
+
+        if y == 0 {
+            merged.extend(blocks);
+        } else {
+            let prev_tail_start = merged.len().saturating_sub(32);
+            for block in blocks {
+                let in_overlap = block.bounds.y < seam_end;
+                let duplicate = in_overlap
+                    && merged[prev_tail_start..].iter().any(|existing| {
+                        let tol = existing.bounds.height.max(block.bounds.height).max(16.0) * 0.75;
+                        let same_y = (existing.bounds.y - block.bounds.y).abs() <= tol;
+                        if !same_y {
+                            return false;
+                        }
+                        let a = existing.text.trim();
+                        let b = block.text.trim();
+                        !a.is_empty() && (a == b || a.contains(b) || b.contains(a))
+                    });
+                if !duplicate {
+                    merged.push(block);
+                }
+            }
+        }
+
+        if y + h >= height {
+            break;
+        }
+        y += step;
+    }
+
+    Ok(merged)
+}
+
 /// Where the `ocrs` backend looks for `text-detection.rten` and
 /// `text-recognition.rten`: `$SNAPIT_OCR_MODELS`, then `models/` next to the
 /// executable, then `~/.snapit/models`.
@@ -156,5 +217,80 @@ pub fn engine_with(options: &OcrOptions) -> Result<Box<dyn OcrEngine>> {
         {
             anyhow::bail!("no OCR backend available; enable the `ocrs` feature")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockOcr {
+        calls: std::sync::Mutex<Vec<(u32, u32)>>,
+    }
+
+    impl OcrEngine for MockOcr {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn recognize(&self, image: &RgbaImage) -> Result<Vec<TextBlock>> {
+            let call_ix = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(image.dimensions());
+                calls.len() - 1
+            };
+            if image.height() == 1200 {
+                return Ok(vec![TextBlock::new(
+                    "single",
+                    TextBounds::new(10.0, 20.0, 100.0, 24.0),
+                )]);
+            }
+            if call_ix == 0 {
+                Ok(vec![
+                    TextBlock::new("top-line", TextBounds::new(10.0, 100.0, 100.0, 24.0)),
+                    TextBlock::new(
+                        "seam-line",
+                        TextBounds::new(
+                            10.0,
+                            (STRIP_HEIGHT - STRIP_OVERLAP + 60) as f32,
+                            100.0,
+                            24.0,
+                        ),
+                    ),
+                ])
+            } else {
+                Ok(vec![
+                    TextBlock::new("seam-line", TextBounds::new(10.0, 60.0, 100.0, 24.0)),
+                    TextBlock::new("bottom-line", TextBounds::new(10.0, 500.0, 100.0, 24.0)),
+                ])
+            }
+        }
+    }
+
+    #[test]
+    fn recognize_tall_passes_short_images_through_directly() {
+        let engine = MockOcr {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let img = RgbaImage::new(400, 1200);
+        let blocks = recognize_tall(&engine, &img).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "single");
+        assert_eq!(*engine.calls.lock().unwrap(), vec![(400, 1200)]);
+    }
+
+    #[test]
+    fn recognize_tall_slices_deduplicates_and_restores_y() {
+        let engine = MockOcr {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let img = RgbaImage::new(400, 5000);
+        let blocks = recognize_tall(&engine, &img).unwrap();
+        let texts: Vec<_> = blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, vec!["top-line", "seam-line", "bottom-line"]);
+        assert_eq!(
+            blocks[2].bounds.y,
+            (STRIP_HEIGHT - STRIP_OVERLAP + 500) as f32
+        );
     }
 }

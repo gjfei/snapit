@@ -13,7 +13,9 @@ use gpui_kit::{
     App, Bounds, PathBuilder, Pixels, Point, SharedString, TextAlign, TextRun, Window, fill, font,
     point, px, rgb, size,
 };
-use snapit_capture::RgbaImage;
+use snapit_capture::{
+    HdrImage, PixelRect, RgbaImage, blend_hdr_srgb, f16_bits_to_f32, f32_to_f16_bits,
+};
 use snapit_store::{AnnotationConfig, AnnotationStyle, AnnotationTool};
 use tiny_skia::{
     FillRule, IntSize, LineCap, LineJoin, Paint as SkiaPaint, PathBuilder as SkiaPath, Pixmap,
@@ -342,7 +344,7 @@ impl Shape {
         }
     }
 
-    fn shift(&mut self, dx: f32, dy: f32) {
+    pub(crate) fn shift(&mut self, dx: f32, dy: f32) {
         match self {
             Self::Rect { from, to, .. }
             | Self::Arrow { from, to, .. }
@@ -1303,35 +1305,6 @@ fn utf16_range_to_byte(text: &str, range: Range<usize>) -> Range<usize> {
     start..utf16_to_byte(text, range.end).max(start)
 }
 
-/// A lazy annotation bake shared by history, clipboard and save workers.
-pub struct BakedImage {
-    source: RgbaImage,
-    shapes: Arc<Vec<Shape>>,
-    scale: f32,
-    result: OnceLock<Arc<RgbaImage>>,
-}
-
-impl BakedImage {
-    pub fn new(source: RgbaImage, shapes: Arc<Vec<Shape>>, scale: f32) -> Self {
-        Self {
-            source,
-            shapes,
-            scale,
-            result: OnceLock::new(),
-        }
-    }
-
-    pub fn get(&self) -> Arc<RgbaImage> {
-        self.result
-            .get_or_init(|| {
-                let mut image = self.source.clone();
-                bake(&mut image, &self.shapes, self.scale);
-                Arc::new(image)
-            })
-            .clone()
-    }
-}
-
 /// Rasterize committed shapes onto a cropped RGBA bitmap.
 pub fn bake(image: &mut RgbaImage, shapes: &[Shape], scale: f32) {
     if shapes.is_empty() {
@@ -1370,6 +1343,139 @@ pub fn bake(image: &mut RgbaImage, shapes: &[Shape], scale: f32) {
     }
     if let Some(baked) = rgba_from_pixmap(pixmap) {
         *image = baked;
+    }
+}
+
+/// Bake annotations into linear HDR samples without an 8-bit intermediate.
+pub fn bake_hdr(
+    image: HdrImage,
+    shapes: &[Shape],
+    scale: f32,
+) -> std::result::Result<HdrImage, String> {
+    if shapes.is_empty() {
+        return Ok(image);
+    }
+    let scale = scale.max(0.01);
+    let width = image.width();
+    let height = image.height();
+    let reference_white = image.reference_white_nits();
+    let sdr_white = image.sdr_white_nits();
+    let Some(mut layer) = Pixmap::new(width, height) else {
+        return Err("cannot allocate HDR annotation layer".to_string());
+    };
+    let bounds = PixelRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut raw = image.into_bytes();
+    for shape in shapes {
+        if let Shape::Mosaic { from, to, style } = shape {
+            let (x, y, w, h) = scaled_aabb(*from, *to, scale);
+            let block = (style.size * scale).round().max(2.0) as u32;
+            pixelate_hdr(&mut raw, width, height, (x, y, w, h), block);
+            continue;
+        }
+        layer.fill(tiny_skia::Color::TRANSPARENT);
+        match shape {
+            Shape::Rect { from, to, style } => stroke_rect(&mut layer, *from, *to, scale, *style),
+            Shape::Arrow { from, to, style } => stroke_arrow(&mut layer, *from, *to, scale, *style),
+            Shape::Line { from, to, style } => stroke_pen(&mut layer, &[*from, *to], scale, *style),
+            Shape::Pen { points, style } => stroke_pen(&mut layer, points, scale, *style),
+            Shape::Text { at, text, style } => {
+                draw_text(&mut layer, *at, text, scale, style.size, rgba(style.color))
+            }
+            Shape::Step { at, number, style } => {
+                draw_step(&mut layer, *at, *number, scale, style.size, style.color)
+            }
+            Shape::Mosaic { .. } => continue,
+        }
+        blend_hdr_srgb(
+            &mut raw,
+            width,
+            reference_white,
+            sdr_white,
+            bounds,
+            layer.data().as_chunks::<4>().0.iter().map(|pixel| {
+                let alpha = pixel[3];
+                if alpha == 0 {
+                    [0, 0, 0, 0]
+                } else if alpha == 255 {
+                    [pixel[0], pixel[1], pixel[2], 255]
+                } else {
+                    [
+                        ((u16::from(pixel[0]) * 255 + u16::from(alpha) / 2) / u16::from(alpha))
+                            .min(255) as u8,
+                        ((u16::from(pixel[1]) * 255 + u16::from(alpha) / 2) / u16::from(alpha))
+                            .min(255) as u8,
+                        ((u16::from(pixel[2]) * 255 + u16::from(alpha) / 2) / u16::from(alpha))
+                            .min(255) as u8,
+                        alpha,
+                    ]
+                }
+            }),
+        );
+    }
+    Ok(HdrImage::new(width, height, raw, reference_white).with_sdr_white(sdr_white))
+}
+
+fn pixelate_hdr(raw: &mut [u8], width: u32, height: u32, region: (i32, i32, u32, u32), block: u32) {
+    let (x, y, w, h) = region;
+    let width = width as i32;
+    let height = height as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = x.saturating_add_unsigned(w).min(width);
+    let y1 = y.saturating_add_unsigned(h).min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let block = block.max(2) as i32;
+    let mut row = y0;
+    while row < y1 {
+        let bh = block.min(y1 - row);
+        let mut col = x0;
+        while col < x1 {
+            let bw = block.min(x1 - col);
+            let average = average_hdr(raw, width as u32, col, row, col + bw, row + bh);
+            for py in row..row + bh {
+                for px in col..col + bw {
+                    let start = ((py as u32 * width as u32 + px as u32) * 6) as usize;
+                    for (channel, value) in average.iter().enumerate() {
+                        let bits = f32_to_f16_bits(*value);
+                        let at = start + channel * 2;
+                        raw[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+                    }
+                }
+            }
+            col += bw;
+        }
+        row += bh;
+    }
+}
+
+fn average_hdr(raw: &[u8], width: u32, x0: i32, y0: i32, x1: i32, y1: i32) -> [f32; 3] {
+    let mut sum = [0.0_f32; 3];
+    let mut count = 0.0_f32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let start = ((y as u32 * width + x as u32) * 6) as usize;
+            let samples = [
+                f16_bits_to_f32(u16::from_le_bytes([raw[start], raw[start + 1]])),
+                f16_bits_to_f32(u16::from_le_bytes([raw[start + 2], raw[start + 3]])),
+                f16_bits_to_f32(u16::from_le_bytes([raw[start + 4], raw[start + 5]])),
+            ];
+            for (total, sample) in sum.iter_mut().zip(samples) {
+                *total += sample;
+            }
+            count += 1.0;
+        }
+    }
+    if count == 0.0 {
+        [0.0; 3]
+    } else {
+        [sum[0] / count, sum[1] / count, sum[2] / count]
     }
 }
 
@@ -1452,6 +1558,17 @@ impl MosaicCache {
     }
 }
 
+pub(crate) fn shift_shapes_vertical(shapes: &[Shape], dy: f32) -> Vec<Shape> {
+    shapes
+        .iter()
+        .cloned()
+        .map(|mut shape| {
+            shape.shift(0.0, dy);
+            shape
+        })
+        .collect()
+}
+
 pub(crate) fn paint_layer(
     layer: &Layer,
     origin: Point<Pixels>,
@@ -1461,6 +1578,26 @@ pub(crate) fn paint_layer(
     window: &mut Window,
     cx: &mut App,
 ) {
+    paint_layer_zoomed(layer, origin, scale, 1.0, source, mosaics, window, cx);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_layer_zoomed(
+    layer: &Layer,
+    origin: Point<Pixels>,
+    scale: f32,
+    zoom: f32,
+    source: Option<MosaicSource<'_>>,
+    mosaics: &mut MosaicCache,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let zoom = if zoom.is_finite() && zoom > 0.0 {
+        zoom
+    } else {
+        1.0
+    };
+    let z = |p: [f32; 2]| [p[0] * zoom, p[1] * zoom];
     let typing = layer.is_typing();
     // Only the draft can be last, and only a draft ever gets a caret; skip
     // counting the shapes when nothing is being typed.
@@ -1472,22 +1609,31 @@ pub(crate) fn paint_layer(
     for (ix, shape) in layer.visible().enumerate() {
         match shape {
             Shape::Rect { from, to, style } => {
-                if let Some(bounds) = gpui_aabb(origin, *from, *to) {
-                    stroke_gpui_rect(window, bounds, px(style.size), rgb(style.color));
+                if let Some(bounds) = gpui_aabb(origin, z(*from), z(*to)) {
+                    stroke_gpui_rect(window, bounds, px(style.size * zoom), rgb(style.color));
                 }
             }
             Shape::Arrow { from, to, style } => {
-                paint_gpui_arrow(window, origin, *from, *to, *style);
+                let mut scaled = *style;
+                scaled.size *= zoom;
+                paint_gpui_arrow(window, origin, z(*from), z(*to), scaled);
             }
             Shape::Line { from, to, style } => paint_gpui_pen(
                 window,
                 origin,
-                &[*from, *to],
-                px(style.size),
+                &[z(*from), z(*to)],
+                px(style.size * zoom),
                 rgb(style.color),
             ),
             Shape::Pen { points, style } => {
-                paint_gpui_pen(window, origin, points, px(style.size), rgb(style.color))
+                let pts: Vec<[f32; 2]> = points.iter().map(|p| z(*p)).collect();
+                paint_gpui_pen(
+                    window,
+                    origin,
+                    &pts,
+                    px(style.size * zoom),
+                    rgb(style.color),
+                )
             }
             Shape::Mosaic { from, to, style } => {
                 if let Some(source) = source {
@@ -1495,14 +1641,26 @@ pub(crate) fn paint_layer(
                     let blocks = mosaics.blocks(key, || {
                         mosaic_blocks(*from, *to, style.size, scale, source.image)
                     });
-                    paint_gpui_mosaic(window, origin, blocks);
+                    paint_gpui_mosaic_zoomed(window, origin, blocks, zoom);
                 }
             }
             Shape::Text { at, text, style } => {
-                paint_gpui_text(window, cx, origin, *at, text, typing && ix == last, *style);
+                let mut scaled = *style;
+                scaled.size *= zoom;
+                paint_gpui_text(
+                    window,
+                    cx,
+                    origin,
+                    z(*at),
+                    text,
+                    typing && ix == last,
+                    scaled,
+                );
             }
             Shape::Step { at, number, style } => {
-                paint_gpui_step(window, cx, origin, *at, *number, *style);
+                let mut scaled = *style;
+                scaled.size *= zoom;
+                paint_gpui_step(window, cx, origin, z(*at), *number, scaled);
             }
         }
     }
@@ -1518,8 +1676,8 @@ pub(crate) fn paint_layer(
     {
         let (x, y, w, h) = shape.bounds();
         let outline = Bounds::new(
-            point(origin.x + px(x), origin.y + px(y)),
-            size(px(w), px(h)),
+            point(origin.x + px(x * zoom), origin.y + px(y * zoom)),
+            size(px(w * zoom), px(h * zoom)),
         );
         stroke_gpui_box(window, outline, rgb(0x3B82F6), px(1.));
     }
@@ -1528,7 +1686,7 @@ pub(crate) fn paint_layer(
     let handles = layer.selected_handles();
     if !handles.is_empty() {
         for (_, at) in handles {
-            let center = point(origin.x + px(at[0]), origin.y + px(at[1]));
+            let center = point(origin.x + px(at[0] * zoom), origin.y + px(at[1] * zoom));
             let box_ = Bounds::new(
                 point(
                     center.x - px(HANDLE_SIZE / 2.0),
@@ -1694,11 +1852,19 @@ fn mosaic_blocks(
     blocks
 }
 
-fn paint_gpui_mosaic(window: &mut Window, origin: Point<Pixels>, blocks: &[MosaicBlock]) {
+fn paint_gpui_mosaic_zoomed(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    blocks: &[MosaicBlock],
+    zoom: f32,
+) {
     for block in blocks {
         let bounds = Bounds::new(
-            point(origin.x + px(block.at[0]), origin.y + px(block.at[1])),
-            size(px(block.size[0]), px(block.size[1])),
+            point(
+                origin.x + px(block.at[0] * zoom),
+                origin.y + px(block.at[1] * zoom),
+            ),
+            size(px(block.size[0] * zoom), px(block.size[1] * zoom)),
         );
         window.paint_quad(fill(
             bounds,
@@ -2422,6 +2588,70 @@ mod tests {
 
     fn solid(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
         RgbaImage::from_pixel(width, height, Rgba(color))
+    }
+
+    fn hdr_sample(width: u32, height: u32, values: &[[f32; 3]]) -> HdrImage {
+        let mut raw = Vec::with_capacity(values.len() * 6);
+        for value in values {
+            for channel in value {
+                raw.extend_from_slice(&f32_to_f16_bits(*channel).to_le_bytes());
+            }
+        }
+        HdrImage::new(width, height, raw, 203.0)
+    }
+
+    #[test]
+    fn hdr_mosaic_averages_linear_samples() {
+        let image = hdr_sample(
+            2,
+            2,
+            &[
+                [1.0, 2.0, 3.0],
+                [3.0, 4.0, 5.0],
+                [3.0, 4.0, 5.0],
+                [5.0, 6.0, 7.0],
+            ],
+        );
+        let image = bake_hdr(
+            image,
+            &[Shape::Mosaic {
+                from: [0.0, 0.0],
+                to: [2.0, 2.0],
+                style: Style {
+                    color: 0,
+                    size: 2.0,
+                },
+            }],
+            1.0,
+        )
+        .unwrap();
+        for pixel in image.as_bytes().as_chunks::<6>().0 {
+            for channel in 0..3 {
+                let bits = u16::from_le_bytes([pixel[channel * 2], pixel[channel * 2 + 1]]);
+                assert_eq!(f16_bits_to_f32(bits), 3.0 + channel as f32);
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_step_leaves_uncovered_samples_untouched() {
+        let image = hdr_sample(16, 16, &vec![[0.0; 3]; 16 * 16]);
+        let before = image.as_bytes().to_vec();
+        let image = bake_hdr(
+            image,
+            &[Shape::Step {
+                at: [8.0, 8.0],
+                number: 1,
+                style: Style {
+                    color: 0xEF4444,
+                    size: 3.0,
+                },
+            }],
+            1.0,
+        )
+        .unwrap();
+        assert_ne!(image.as_bytes(), before);
+        assert_eq!(&image.as_bytes()[..6], &before[..6]);
     }
 
     #[test]
