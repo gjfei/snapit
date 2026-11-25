@@ -402,16 +402,42 @@ impl HistoryView {
 /// the default GIF viewer, the default video player and so on.
 fn open_with_system(path: &Path) {
     #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/c", "start", ""]);
-        command
-    };
-
-    if let Err(err) = command.arg(path).spawn() {
+    if let Err(err) = std::process::Command::new("open").arg(path).spawn() {
         log::error!("cannot open {}: {err}", path.display());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::GetLastError,
+            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        };
+
+        let file = path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        // ShellExecuteW treats the path as data; cmd.exe would parse shell metacharacters.
+        let opened = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                ptr::null(),
+                file.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as usize;
+        if opened <= 32 {
+            log::error!(
+                "cannot open {}: ShellExecuteW returned {opened}, error {}",
+                path.display(),
+                unsafe { GetLastError() }
+            );
+        }
     }
 }
 
