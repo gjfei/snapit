@@ -143,6 +143,12 @@ fn signed_scroll_pixels(direction: ScrollDirection, pixels: i32) -> i32 {
 }
 
 #[cfg(target_os = "windows")]
+fn wheel_wparam(direction: ScrollDirection, notches: i32) -> usize {
+    // WM_MOUSEWHEEL reads the signed delta from the high 16 bits.
+    (scroll_delta(direction, notches) as u16 as usize) << 16
+}
+
+#[cfg(target_os = "windows")]
 fn wheel_lparam(x: f32, y: f32) -> LPARAM {
     fn coordinate(value: f32) -> u16 {
         value.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32 as u16
@@ -154,6 +160,16 @@ fn wheel_lparam(x: f32, y: f32) -> LPARAM {
 #[cfg(target_os = "windows")]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn wheel_wparam_places_delta_in_the_high_word() {
+        let up = wheel_wparam(ScrollDirection::Up, 2) as u32;
+        let down = wheel_wparam(ScrollDirection::Down, 2) as u32;
+        assert_eq!(up, 240 << 16);
+        assert_eq!(down, ((-240_i32) as u16 as u32) << 16);
+        assert_eq!(up & 0xffff, 0);
+        assert_eq!(down & 0xffff, 0);
+    }
 
     #[test]
     fn wheel_coordinates_preserve_signed_virtual_desktop_positions() {
@@ -322,7 +338,7 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{ScrollDirection, scroll_delta, wheel_lparam};
+    use super::{ScrollDirection, wheel_lparam, wheel_wparam};
     use windows::Win32::{
         Foundation::{HWND, LRESULT, POINT, WPARAM},
         UI::{
@@ -394,7 +410,7 @@ mod imp {
             SendMessageTimeoutW(
                 hwnd,
                 WM_MOUSEWHEEL,
-                WPARAM(scroll_delta(direction, notches) as u16 as usize),
+                WPARAM(wheel_wparam(direction, notches)),
                 wheel_lparam(x, y),
                 SMTO_ABORTIFHUNG,
                 120,
