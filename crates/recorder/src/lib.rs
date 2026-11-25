@@ -41,8 +41,8 @@ use anyhow::{Context as _, Result, anyhow};
 use color_quant::NeuQuant;
 use gif::Repeat;
 use snapit_capture::{
-    DynamicRange, HdrImage, LiveFrameData, LiveFrameWait, LiveRecorder, OutputSize, Region,
-    RegionCapturer, RgbaImage,
+    DynamicRange, HdrImage, LiveFrameData, LiveFrameWait, LiveRecorder, OutputSize, PixelRect,
+    RasterLayer, Region, RegionCapturer, RgbaImage, WatermarkSpec,
 };
 
 mod apng;
@@ -303,6 +303,9 @@ pub struct RecordOptions {
     pub hdr: bool,
     /// MP4 target bitrate in Kbps. None or zero uses the automatic formula.
     pub mp4_bitrate_kbps: Option<u32>,
+    /// Frozen for the whole recording and rasterized after the first frame's
+    /// physical dimensions are known.
+    pub watermark: WatermarkSpec,
 }
 
 impl Default for RecordOptions {
@@ -318,6 +321,7 @@ impl Default for RecordOptions {
             click_effect: ClickEffect::default(),
             hdr: false,
             mp4_bitrate_kbps: None,
+            watermark: WatermarkSpec::default(),
         }
     }
 }
@@ -375,6 +379,11 @@ impl RecordOptions {
 
     pub fn with_mp4_bitrate_kbps(mut self, kbps: Option<u32>) -> Self {
         self.mp4_bitrate_kbps = kbps.filter(|value| *value > 0);
+        self
+    }
+
+    pub fn with_watermark(mut self, watermark: WatermarkSpec) -> Self {
+        self.watermark = watermark;
         self
     }
 }
@@ -741,6 +750,16 @@ impl FrameData {
         }
     }
 
+    fn apply_watermark(self, watermark: Option<&Arc<RasterLayer>>) -> Self {
+        let Some(watermark) = watermark else {
+            return self;
+        };
+        match self {
+            Self::Sdr(image) => Self::Sdr(watermark.apply_sdr(image)),
+            Self::Hdr(image) => Self::Hdr(watermark.apply_hdr(image)),
+        }
+    }
+
     /// Cheap rejection before the exact comparison. Equal frames necessarily
     /// have equal samples; a collision only costs the full byte comparison.
     fn likely_same_as(&self, other: &Self) -> bool {
@@ -842,6 +861,8 @@ impl AnimationSink {
         options: &RecordOptions,
         format: RecordFormat,
         first_frame_bytes: usize,
+        watermark: Option<Arc<RasterLayer>>,
+        source_dimensions: (u32, u32),
     ) -> Result<Self> {
         // Never truncate a previous recording if a stale path is reused.
         let (file, name) = match format {
@@ -871,7 +892,15 @@ impl AnimationSink {
         let writer = thread::Builder::new()
             .name(name.into())
             .spawn(move || match format {
-                RecordFormat::Gif => encode_gif(receiver, file, quality, max_width, click_effects),
+                RecordFormat::Gif => encode_gif(
+                    receiver,
+                    file,
+                    quality,
+                    max_width,
+                    click_effects,
+                    watermark,
+                    source_dimensions,
+                ),
                 RecordFormat::Apng => apng::encode(receiver, file, max_width),
                 RecordFormat::Mp4 => unreachable!(),
             })?;
@@ -986,9 +1015,15 @@ fn squared_rgb_distance(a: &[u8], b: &[u8]) -> u64 {
 impl PaletteMap {
     /// Train on a sparse spatial sample of one frame. Screen captures are fully
     /// opaque, so alpha is ignored: GIF only has a 1-bit transparency mask.
+    #[cfg(test)]
     fn train(frame: &RgbaImage, quality: u8) -> Self {
+        Self::train_with_regions(frame, quality, &[])
+    }
+
+    fn train_with_regions(frame: &RgbaImage, quality: u8, regions: &[PixelRect]) -> Self {
         let samples = quality_to_samples(quality);
-        let rgba = spatial_sample(frame, samples);
+        let mut rgba = spatial_sample(frame, samples);
+        rgba.extend(spatial_sample_regions(frame, regions, samples));
         let quant = NeuQuant::new(1, 256, &rgba);
         let palette = quant.color_map_rgb();
         Self {
@@ -1210,6 +1245,41 @@ fn spatial_sample(frame: &RgbaImage, target: usize) -> Vec<u8> {
     sample
 }
 
+fn spatial_sample_regions(frame: &RgbaImage, regions: &[PixelRect], target: usize) -> Vec<u8> {
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    let (width, height) = frame.dimensions();
+    let raw = frame.as_raw();
+    let per_tile = target.max(1).div_ceil(regions.len());
+    let mut sample = Vec::with_capacity(target.clamp(1, 65_536) * 4);
+    for region in regions {
+        let right = region.right().min(width);
+        let bottom = region.bottom().min(height);
+        if region.x >= right || region.y >= bottom {
+            continue;
+        }
+        let area = (right - region.x) as usize * (bottom - region.y) as usize;
+        let step = (area as f64 / per_tile as f64).sqrt().ceil() as usize;
+        let step = step.max(1);
+        let mut taken = 0;
+        for y in (region.y..bottom).step_by(step) {
+            for x in (region.x..right).step_by(step) {
+                let at = (y as usize * width as usize + x as usize) * 4;
+                sample.extend_from_slice(&raw[at..at + 4]);
+                taken += 1;
+                if taken == per_tile {
+                    break;
+                }
+            }
+            if taken == per_tile {
+                break;
+            }
+        }
+    }
+    sample
+}
+
 /// Quantize and append frames to the file until the channel closes.
 fn encode_gif(
     receiver: Receiver<PendingFrame>,
@@ -1217,6 +1287,8 @@ fn encode_gif(
     quality: u8,
     max_width: Option<u32>,
     click_effects: bool,
+    watermark: Option<Arc<RasterLayer>>,
+    source_dimensions: (u32, u32),
 ) -> Result<()> {
     let mut writer = BufWriter::new(file);
     let (mut t_prepare, mut t_diff, mut t_error, mut t_train, mut t_write) = (
@@ -1259,7 +1331,18 @@ fn encode_gif(
         .context("failed to set GIF looping")?;
     let mut palette = {
         let scratch = Instant::now();
-        let palette = PaletteMap::train(&first_scaled, quality);
+        let regions = watermark
+            .as_ref()
+            .map(|layer| {
+                layer.scaled_sample_regions(
+                    source_dimensions.0,
+                    source_dimensions.1,
+                    first_scaled.width(),
+                    first_scaled.height(),
+                )
+            })
+            .unwrap_or_default();
+        let palette = PaletteMap::train_with_regions(&first_scaled, quality, &regions);
         t_train += scratch.elapsed();
         palette
     };
@@ -1302,7 +1385,18 @@ fn encode_gif(
         t_error += scratch.elapsed();
         if retrain {
             let scratch = Instant::now();
-            palette = PaletteMap::train(&scaled, quality);
+            let regions = watermark
+                .as_ref()
+                .map(|layer| {
+                    layer.scaled_sample_regions(
+                        source_dimensions.0,
+                        source_dimensions.1,
+                        scaled.width(),
+                        scaled.height(),
+                    )
+                })
+                .unwrap_or_default();
+            palette = PaletteMap::train_with_regions(&scaled, quality, &regions);
             t_train += scratch.elapsed();
             if click_effects {
                 for color in pointer::CLICK_PALETTE {
@@ -1431,6 +1525,7 @@ fn open_sink(
     output: &Path,
     options: &RecordOptions,
     first_frame: &FrameData,
+    watermark: Option<&Arc<RasterLayer>>,
 ) -> Result<Box<dyn FrameSink>> {
     Ok(match options.format {
         RecordFormat::Gif | RecordFormat::Apng => Box::new(AnimationSink::new(
@@ -1438,6 +1533,8 @@ fn open_sink(
             options,
             options.format,
             first_frame.byte_len(),
+            watermark.cloned(),
+            first_frame.dimensions(),
         )?),
         // The MP4 backend picks the container profile from the frames it is
         // handed: HEVC Main10 for extended range, H.264 otherwise.
@@ -1450,9 +1547,11 @@ fn open_first_sink(
     options: &RecordOptions,
     first_frame: &FrameData,
     at: Duration,
+    watermark: Option<&Arc<RasterLayer>>,
 ) -> Result<(Box<dyn FrameSink>, RgbaImage)> {
+    let first_frame = first_frame.clone().apply_watermark(watermark);
     let thumbnail = first_frame.to_sdr();
-    let mut sink = open_sink(output, options, first_frame)?;
+    let mut sink = open_sink(output, options, &first_frame, watermark)?;
     if let Err(err) = sink.push(first_frame.clone(), at) {
         if matches!(options.format, RecordFormat::Mp4) && matches!(first_frame, FrameData::Hdr(_)) {
             log::warn!("HEVC Main10 rejected the first frame, recording SDR: {err:#}");
@@ -1463,7 +1562,7 @@ fn open_first_sink(
                 log::warn!("failed to remove the rejected HDR container: {remove_err}");
             }
             let sdr = FrameData::Sdr(Arc::new(thumbnail.clone()));
-            let mut sink = open_sink(output, options, &sdr)?;
+            let mut sink = open_sink(output, options, &sdr, watermark)?;
             sink.push(sdr, at)?;
             return Ok((sink, thumbnail));
         }
@@ -1555,6 +1654,26 @@ impl CaptureStageStats {
     }
 }
 
+fn rasterize_recording_watermark(
+    options: &RecordOptions,
+    frame: &FrameData,
+    logical_width: u32,
+    logical_height: u32,
+) -> Result<Option<Arc<RasterLayer>>> {
+    if !options.watermark.is_enabled() {
+        return Ok(None);
+    }
+    let (width, height) = frame.dimensions();
+    let scale = (width as f32 / logical_width.max(1) as f32)
+        .max(height as f32 / logical_height.max(1) as f32);
+    let layer = Arc::new(options.watermark.rasterize(width, height, scale)?);
+    log::info!(
+        "recording watermark: enabled, canvas={width}x{height}, layout_scale={scale:.3}, tiles={}",
+        layer.tiles.len()
+    );
+    Ok(Some(layer))
+}
+
 fn capture_loop(
     job: CaptureJob,
     mut ready: Option<SyncSender<std::result::Result<(), String>>>,
@@ -1624,6 +1743,7 @@ fn capture_loop(
     let mut first: Option<RgbaImage> = None;
     let mut previous: Option<FrameData> = None;
     let mut pending_duplicate_at: Option<Duration> = None;
+    let mut watermark_layer: Option<Arc<RasterLayer>> = None;
     // Presentation times must strictly increase: AVFoundation rejects two
     // samples sharing a time, and a resume can land a millisecond before the
     // pause clock has accumulated the whole stretch.
@@ -1637,8 +1757,10 @@ fn capture_loop(
                 frames: &Arc<AtomicUsize>,
                 pushed: &mut usize,
                 image: FrameData,
-                at: Duration|
+                at: Duration,
+                watermark: Option<&Arc<RasterLayer>>|
      -> Result<()> {
+        let image = image.apply_watermark(watermark);
         if sink.push(image, at)? {
             *pushed += 1;
             frames.store(*pushed, Ordering::Relaxed);
@@ -1709,8 +1831,15 @@ fn capture_loop(
                         "first capture frame {width}x{height} ({range}, output size hint \
                          {output_size:?}, logical selection {logical_width}x{logical_height})"
                     );
+                    watermark_layer = rasterize_recording_watermark(
+                        &options,
+                        &image,
+                        logical_width,
+                        logical_height,
+                    )?;
                     let sink_started = Instant::now();
-                    let (created, thumbnail) = open_first_sink(&output, &options, &image, at)?;
+                    let (created, thumbnail) =
+                        open_first_sink(&output, &options, &image, at, watermark_layer.as_ref())?;
                     let sink_elapsed = sink_started.elapsed();
                     sink = Some(created);
                     pushed = 1;
@@ -1731,7 +1860,14 @@ fn capture_loop(
                 if duplicate {
                     pending_duplicate_at = Some(at);
                 } else {
-                    push(sink, &frames, &mut pushed, image.clone(), at)?;
+                    push(
+                        sink,
+                        &frames,
+                        &mut pushed,
+                        image.clone(),
+                        at,
+                        watermark_layer.as_ref(),
+                    )?;
                     pending_duplicate_at = None;
                     previous = Some(image);
                 }
@@ -1767,6 +1903,7 @@ fn capture_loop(
                         &mut pushed,
                         image.clone(),
                         at,
+                        watermark_layer.as_ref(),
                     )?;
                     let sink_elapsed = sink_started.elapsed();
                     stage_stats.record(pointer_elapsed, Duration::ZERO, sink_elapsed, false);
@@ -1805,7 +1942,15 @@ fn capture_loop(
                 .capture()
                 .context("failed to capture region")?,
         ));
-        let (created, thumbnail) = open_first_sink(&output, &options, &probe, Duration::ZERO)?;
+        watermark_layer =
+            rasterize_recording_watermark(&options, &probe, logical_width, logical_height)?;
+        let (created, thumbnail) = open_first_sink(
+            &output,
+            &options,
+            &probe,
+            Duration::ZERO,
+            watermark_layer.as_ref(),
+        )?;
         pushed += 1;
         frames.store(pushed, Ordering::Relaxed);
         first = Some(thumbnail);
@@ -1814,7 +1959,14 @@ fn capture_loop(
         (&previous, pending_duplicate_at, sink.as_mut())
     {
         // Keep the final still stretch visible for its real duration.
-        push(created, &frames, &mut pushed, image.clone(), timestamp)?;
+        push(
+            created,
+            &frames,
+            &mut pushed,
+            image.clone(),
+            timestamp,
+            watermark_layer.as_ref(),
+        )?;
     }
     let last_frame = closing.elapsed();
 
@@ -1875,7 +2027,127 @@ fn capture_loop(
 mod tests {
 
     use super::*;
+    use snapit_capture::RasterTile;
     use std::sync::mpsc;
+
+    fn red_watermark() -> Arc<RasterLayer> {
+        Arc::new(RasterLayer {
+            tiles: vec![RasterTile {
+                bounds: PixelRect {
+                    x: 4,
+                    y: 4,
+                    width: 8,
+                    height: 8,
+                },
+                pixels: vec![[255, 0, 0, 255]; 8 * 8],
+            }],
+        })
+    }
+
+    #[test]
+    fn watermark_composition_is_opt_in_and_does_not_mutate_the_shared_source() {
+        let source = Arc::new(RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 255])));
+        let unchanged = FrameData::Sdr(source.clone()).apply_watermark(None);
+        assert!(matches!(unchanged, FrameData::Sdr(ref image) if Arc::ptr_eq(&source, image)));
+
+        let watermark = Arc::new(RasterLayer {
+            tiles: vec![RasterTile {
+                bounds: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                pixels: vec![[255, 0, 0, 128]],
+            }],
+        });
+        let composed = FrameData::Sdr(source.clone()).apply_watermark(Some(&watermark));
+        assert_eq!(source.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert!(
+            matches!(composed, FrameData::Sdr(ref image) if image.get_pixel(0, 0).0 == [128, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn animation_first_frames_include_the_watermark() {
+        for format in [RecordFormat::Gif, RecordFormat::Apng] {
+            let dir = temp_dir("watermark-first-frame");
+            let output = dir.join(format!("out.{}", format.extension()));
+            let options = RecordOptions::default()
+                .with_format(format)
+                .with_quality(90);
+            let watermark = red_watermark();
+            let first = sdr(RgbaImage::from_pixel(32, 24, image::Rgba([0, 0, 0, 255])));
+            let (sink, thumbnail) =
+                open_first_sink(&output, &options, &first, Duration::ZERO, Some(&watermark))
+                    .unwrap();
+            assert_eq!(thumbnail.get_pixel(5, 5).0, [255, 0, 0, 255]);
+            Box::new(sink).finish(Duration::from_millis(100)).unwrap();
+
+            let decoded = match format {
+                RecordFormat::Gif => {
+                    let mut options = gif::DecodeOptions::new();
+                    options.set_color_output(gif::ColorOutput::RGBA);
+                    let mut decoder = options.read_info(File::open(&output).unwrap()).unwrap();
+                    let frame = decoder.read_next_frame().unwrap().unwrap();
+                    RgbaImage::from_raw(
+                        u32::from(frame.width),
+                        u32::from(frame.height),
+                        frame.buffer.to_vec(),
+                    )
+                    .unwrap()
+                }
+                RecordFormat::Apng => image::ImageReader::open(&output)
+                    .unwrap()
+                    .decode()
+                    .unwrap()
+                    .to_rgba8(),
+                RecordFormat::Mp4 => unreachable!(),
+            };
+            assert_eq!(decoded.get_pixel(5, 5).0, [255, 0, 0, 255]);
+            assert!(
+                decoded.get_pixel(0, 0).0[..3]
+                    .iter()
+                    .all(|value| *value <= 1)
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn gif_palette_training_samples_the_composed_watermark_region() {
+        let mut frame = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 255]));
+        let color = [250, 0, 250];
+        let region = PixelRect {
+            x: 24,
+            y: 24,
+            width: 16,
+            height: 16,
+        };
+        for y in region.y..region.bottom() {
+            for x in region.x..region.right() {
+                frame.put_pixel(x, y, image::Rgba([color[0], color[1], color[2], 255]));
+            }
+        }
+        let samples = spatial_sample_regions(&frame, &[region], 64);
+        assert_eq!(samples.len(), 64 * 4);
+        assert!(
+            samples
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| { pixel[..3] == color && pixel[3] == 255 })
+        );
+        let palette = PaletteMap::train_with_regions(&frame, 90, &[region]);
+        assert!(
+            palette
+                .palette
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|entry| entry.as_slice() == color)
+        );
+    }
 
     /// A frame as the capture loop hands it to a sink.
     fn sdr(image: RgbaImage) -> FrameData {
@@ -2014,7 +2286,15 @@ mod tests {
         std::fs::write(&output, b"previous recording").unwrap();
 
         assert!(
-            AnimationSink::new(&output, &RecordOptions::default(), RecordFormat::Gif, 4).is_err()
+            AnimationSink::new(
+                &output,
+                &RecordOptions::default(),
+                RecordFormat::Gif,
+                4,
+                None,
+                (0, 0)
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"previous recording");
         let _ = std::fs::remove_dir_all(dir);
@@ -2276,7 +2556,8 @@ mod tests {
         let options = RecordOptions::default()
             .with_quality(80)
             .with_max_width(Some(32));
-        let mut sink = AnimationSink::new(&output, &options, RecordFormat::Gif, 4).unwrap();
+        let mut sink =
+            AnimationSink::new(&output, &options, RecordFormat::Gif, 4, None, (0, 0)).unwrap();
 
         let mut frame = RgbaImage::from_pixel(64, 48, image::Rgba([10, 20, 30, 255]));
         for x in 0..frame.width() {
@@ -2324,7 +2605,7 @@ mod tests {
         let (sender, receiver) = sync_channel(24);
         let writer = thread::Builder::new()
             .name("snapit-test-gif-writer".into())
-            .spawn(move || encode_gif(receiver, file, quality, max_width, false))
+            .spawn(move || encode_gif(receiver, file, quality, max_width, false, None, (0, 0)))
             .unwrap();
         for i in 0..24u64 {
             let color = if i < 10 { 12 } else { 240 };
@@ -2364,7 +2645,8 @@ mod tests {
         let dir = temp_dir("gif-partial");
         let output = dir.join("out.gif");
         let options = RecordOptions::default().with_quality(80);
-        let mut sink = AnimationSink::new(&output, &options, RecordFormat::Gif, 4).unwrap();
+        let mut sink =
+            AnimationSink::new(&output, &options, RecordFormat::Gif, 4, None, (0, 0)).unwrap();
         let base = RgbaImage::from_pixel(64, 48, image::Rgba([250, 225, 224, 255]));
         let mut lit = base.clone();
         for y in 10..20 {

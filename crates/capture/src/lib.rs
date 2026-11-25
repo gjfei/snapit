@@ -24,10 +24,16 @@ mod elements;
 #[cfg(target_os = "macos")]
 mod freeze;
 mod hdr_decode;
+mod watermark;
 mod windows;
 
 pub use elements::{ElementHit, ElementRole, accessibility_available, request_accessibility};
 pub use hdr_decode::decode_hdr_png_preview;
+pub use watermark::{
+    ComposedStamp, ElementBounds, ImageWatermark, PixelRect, RasterLayer, RasterTile,
+    TextWatermark, WatermarkElement, WatermarkElementKind, WatermarkPlacement, WatermarkSpec,
+    blend_hdr_srgb, f16_bits_to_f32, f32_to_f16_bits, load_watermark_image,
+};
 pub use windows::WindowInfo;
 
 /// A rectangle in monitor units, relative to the monitor's top-left corner.

@@ -758,6 +758,21 @@ mod hdr_sink_tests {
     use super::*;
     use crate::RecordFormat;
     use crate::video::hdr::synth_solid;
+    use snapit_capture::{PixelRect, RasterLayer, RasterTile};
+
+    fn watermark() -> Arc<RasterLayer> {
+        Arc::new(RasterLayer {
+            tiles: vec![RasterTile {
+                bounds: PixelRect {
+                    x: 280,
+                    y: 160,
+                    width: 32,
+                    height: 32,
+                },
+                pixels: vec![[0, 96, 255, 255]; 32 * 32],
+            }],
+        })
+    }
 
     /// Encode synthetic extended-range frames through the real AVAssetWriter
     /// pipeline and read the container back. The frames are built by hand, so
@@ -774,11 +789,13 @@ mod hdr_sink_tests {
             .with_format(RecordFormat::Mp4)
             .with_fps(15);
         let colours = [[240, 240, 240], [220, 40, 30], [30, 200, 60]];
+        let watermark = watermark();
         let first = FrameData::Sdr(Arc::new(RgbaImage::from_pixel(
             323,
             203,
             image::Rgba([colours[0][0], colours[0][1], colours[0][2], 255]),
-        )));
+        )))
+        .apply_watermark(Some(&watermark));
         let mut sink = open(&path, &options, &first).expect("mp4 sink");
 
         for index in 0..320 {
@@ -787,7 +804,8 @@ mod hdr_sink_tests {
                 323,
                 203,
                 image::Rgba([colour[0], colour[1], colour[2], 255]),
-            )));
+            )))
+            .apply_watermark(Some(&watermark));
             let at = match index {
                 0 => Duration::ZERO,
                 1 => Duration::from_micros(500),
@@ -825,11 +843,14 @@ mod hdr_sink_tests {
         // motion to encode rather than one infinite-length P frame.
         let colours = [[1.0, 1.0, 1.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let (width, height) = (320, 200);
-        let first = FrameData::Hdr(Arc::new(synth_solid(width, height, colours[0], 203.0)));
+        let watermark = watermark();
+        let first = FrameData::Hdr(Arc::new(synth_solid(width, height, colours[0], 203.0)))
+            .apply_watermark(Some(&watermark));
         let mut sink = open(&path, &options, &first).expect("mp4 sink");
 
         for (index, colour) in colours.into_iter().cycle().take(10).enumerate() {
-            let frame = FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)));
+            let frame = FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)))
+                .apply_watermark(Some(&watermark));
             sink.push(frame, Duration::from_millis(index as u64 * 66))
                 .expect("push");
         }

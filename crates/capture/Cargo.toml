@@ -11,6 +11,8 @@ image.workspace = true
 log.workspace = true
 png.workspace = true
 xcap.workspace = true
+fontdue = "0.9"
+tiny-skia = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

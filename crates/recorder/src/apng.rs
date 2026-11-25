@@ -288,6 +288,8 @@ mod tests {
             &super::super::RecordOptions::default(),
             RecordFormat::Apng,
             4 * 3 * 4,
+            None,
+            (0, 0),
         )
         .unwrap();
         let black = image::Rgba([0, 0, 0, 255]);
@@ -345,6 +347,8 @@ mod tests {
             &super::super::RecordOptions::default(),
             RecordFormat::Apng,
             4 * 3 * 4,
+            None,
+            (0, 0),
         )
         .unwrap();
         for (index, color) in [

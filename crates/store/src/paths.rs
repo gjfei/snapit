@@ -44,6 +44,10 @@ impl AppDirs {
         self.data_dir.join("history")
     }
 
+    pub fn watermark_dir(&self) -> PathBuf {
+        self.data_dir.join("watermarks")
+    }
+
     /// Persistent diagnostic log. Kept beside history so `SNAPIT_HOME` and the
     /// per-platform data root both contain everything needed to file a report.
     pub fn log_file(&self) -> PathBuf {
