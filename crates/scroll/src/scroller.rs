@@ -110,7 +110,8 @@ mod tests {
         assert_eq!(scroll_delta(ScrollDirection::Up, 2), 240);
         assert_eq!(scroll_delta(ScrollDirection::Down, 2), -240);
         assert_eq!(scroll_delta(ScrollDirection::Up, 0), 0);
-        assert_eq!(scroll_delta(ScrollDirection::Down, i32::MIN), -2_654_000);
+        assert_eq!(scroll_delta(ScrollDirection::Up, i32::MIN), 32_760);
+        assert_eq!(scroll_delta(ScrollDirection::Down, i32::MIN), -32_760);
     }
 
     #[cfg(not(target_os = "windows"))]
