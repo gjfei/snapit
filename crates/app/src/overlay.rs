@@ -2364,10 +2364,7 @@ impl Render for OverlayView {
                                     let (source, mosaics) = match cache.as_deref_mut() {
                                         Some(cache) => (
                                             cache.crop.as_ref().map(|(key, image)| {
-                                                annotate::MosaicSource {
-                                                    image,
-                                                    stamp: key.stamp(),
-                                                }
+                                                annotate::MosaicSource::memory(image, key.stamp())
                                             }),
                                             &mut cache.mosaics,
                                         ),

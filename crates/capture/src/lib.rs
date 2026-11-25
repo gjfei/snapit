@@ -16,19 +16,25 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 pub use image::RgbaImage;
-use image::{ImageEncoder as _, ImageFormat, imageops};
+use image::{ImageEncoder as _, imageops};
 use xcap::Monitor;
 pub use xcap::{DynamicRange, HdrImage, OutputSize};
 
+mod atomic;
+mod disk_image;
 mod elements;
 #[cfg(target_os = "macos")]
 mod freeze;
 mod hdr_decode;
+mod image_source;
 mod watermark;
 mod windows;
 
+pub use atomic::atomic_write;
+pub use disk_image::{DiskImage, cleanup_stale_disk_images};
 pub use elements::{ElementHit, ElementRole, accessibility_available, request_accessibility};
 pub use hdr_decode::decode_hdr_png_preview;
+pub use image_source::ImageSource;
 pub use watermark::{
     ComposedStamp, ElementBounds, ImageWatermark, PixelRect, RasterLayer, RasterTile,
     TextWatermark, WatermarkElement, WatermarkElementKind, WatermarkPlacement, WatermarkSpec,
@@ -620,22 +626,42 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 pub fn save_png(image: &RgbaImage, path: &Path) -> Result<()> {
-    image
-        .save_with_format(path, ImageFormat::Png)
-        .with_context(|| format!("failed to save {}", path.display()))
+    atomic_write(path, |writer| {
+        let mut encoder = png::Encoder::new(writer, image.width(), image.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Balanced);
+        encoder.set_filter(png::Filter::Adaptive);
+        let mut writer = encoder
+            .write_header()
+            .context("failed to write PNG header")?;
+        writer
+            .write_image_data(image.as_raw())
+            .context("failed to encode PNG pixels")?;
+        writer.finish().context("failed to finish PNG")
+    })
+    .with_context(|| format!("failed to save {}", path.display()))
 }
 
 /// JPEG has no alpha channel, so pixels are flattened to RGB first.
 pub fn save_jpeg(image: &RgbaImage, path: &Path, quality: u8) -> Result<()> {
-    let rgb = image::DynamicImage::ImageRgba8(image.clone()).into_rgb8();
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-        std::io::BufWriter::new(file),
-        quality.clamp(1, 100),
-    );
-    rgb.write_with_encoder(encoder)
-        .with_context(|| format!("failed to save {}", path.display()))
+    let mut rgb = Vec::with_capacity(image.as_raw().len() / 4 * 3);
+    for &pixel in image.as_raw().as_chunks::<4>().0 {
+        rgb.extend_from_slice(&pixel[..3]);
+    }
+    atomic_write(path, |writer| {
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality.clamp(1, 100));
+        encoder
+            .encode(
+                rgb.as_slice(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("failed to encode JPEG")
+    })
+    .with_context(|| format!("failed to save {}", path.display()))
 }
 
 /// HDR stills are BT.2020 primaries with the PQ transfer function, written as
@@ -695,10 +721,10 @@ pub fn save_png_hdr(hdr: &HdrImage, path: &Path) -> Result<()> {
         path.display()
     );
     let data = pq_bt2020_samples(hdr);
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    write_hdr_png(std::io::BufWriter::new(file), hdr, &data)
-        .with_context(|| format!("failed to save {}", path.display()))
+    atomic_write(path, |writer| {
+        write_hdr_png(writer, hdr, &data).context("failed to encode HDR PNG")
+    })
+    .with_context(|| format!("failed to save {}", path.display()))
 }
 
 fn write_hdr_png<W: std::io::Write>(
@@ -804,6 +830,7 @@ fn pq_lut() -> &'static [u16; PQ_STEPS] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{GenericImageView as _, ImageFormat};
     use std::io::Cursor;
 
     fn hdr_pixels(linear: &[[f32; 3]], white_nits: f32) -> HdrImage {
@@ -823,6 +850,36 @@ mod tests {
         let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
         let mantissa = (bits >> 13) & 0x3ff;
         sign | ((exponent as u16) << 10) | mantissa as u16
+    }
+
+    #[test]
+    fn public_image_saves_replace_existing_files_without_temporary_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+
+        let png = dir.path().join("capture.png");
+        std::fs::write(&png, b"old png").unwrap();
+        save_png(&image, &png).unwrap();
+        assert_eq!(image::open(&png).unwrap().to_rgba8(), image);
+
+        let jpeg = dir.path().join("capture.jpg");
+        std::fs::write(&jpeg, b"old jpeg").unwrap();
+        save_jpeg(&image, &jpeg, 90).unwrap();
+        assert_eq!(image::open(&jpeg).unwrap().dimensions(), (2, 2));
+
+        let hdr = hdr_pixels(&[[1.0, 1.0, 1.0]], 203.0);
+        let hdr_path = dir.path().join("capture-hdr.png");
+        std::fs::write(&hdr_path, b"old hdr").unwrap();
+        save_png_hdr(&hdr, &hdr_path).unwrap();
+        let reader = png::Decoder::new(std::io::BufReader::new(
+            std::fs::File::open(&hdr_path).unwrap(),
+        ))
+        .read_info()
+        .unwrap();
+        assert_eq!(reader.info().bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 
     #[test]

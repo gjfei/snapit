@@ -18,17 +18,18 @@ use gpui_kit::{
     Global, Image, ImageFormat, Pixels, SharedString, Subscription, TitlebarOptions, WeakEntity,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
-use snapit_capture::{HdrImage, RgbaImage, WatermarkSpec};
+use snapit_capture::{HdrImage, ImageSource, RgbaImage, WatermarkSpec};
 use snapit_ocr::{OcrEngine, OcrOptions};
 use snapit_recorder::{ClickEffect, RecordFormat, RecordOptions, Recorder, RecorderStart};
 use snapit_scroll::{
-    AutoScrollError, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollSpeed, ScrollStart,
+    AutoScrollError, ScrollDirection, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollSpeed,
+    ScrollStart,
 };
 use snapit_store::{
     EntryKind, ImageFormat as SaveFormat, ScrollSpeed as ConfigScrollSpeed, WatermarkTarget,
 };
 
-use crate::annotate::Shape;
+use crate::annotate::{Layer, Shape};
 use crate::appearance;
 use crate::clipboard;
 use crate::export::ExportComposition;
@@ -123,22 +124,27 @@ struct ActiveScroll {
     selection: Bounds<Pixels>,
     scale: f32,
     snapshot: Arc<ScrollSnapshot>,
+    annotations: Layer,
+    annotation_content_shift: u32,
+    annotation_reset_pending: bool,
+    annotation_auto_resume: bool,
     preview_visible: bool,
     finishing: bool,
+    pending_finish: Option<ScrollFinishAction>,
     last_warning: bool,
 }
 
 /// A cropped selection with one frozen composition shared by every export.
 #[derive(Clone)]
 pub struct Captured {
-    pub clean_sdr: Arc<RgbaImage>,
+    pub clean_sdr: Arc<ImageSource>,
     pub composition: Arc<ExportComposition>,
     pub scale: f32,
 }
 
 impl Captured {
     pub(crate) fn from_parts(
-        image: RgbaImage,
+        image: impl Into<ImageSource>,
         hdr: Option<HdrImage>,
         layout_scale: f32,
         shapes: Option<Arc<Vec<Shape>>>,
@@ -148,7 +154,7 @@ impl Captured {
     }
 
     fn new(
-        image: RgbaImage,
+        image: impl Into<ImageSource>,
         hdr: Option<HdrImage>,
         layout_scale: f32,
         shapes: Option<Arc<Vec<Shape>>>,
@@ -159,7 +165,7 @@ impl Captured {
         } else {
             1.0
         };
-        let clean_sdr = Arc::new(image);
+        let clean_sdr = Arc::new(image.into());
         let composition = Arc::new(ExportComposition::new(
             clean_sdr.clone(),
             hdr.map(Arc::new),
@@ -176,11 +182,16 @@ impl Captured {
 
     pub fn frozen(png: Arc<Vec<u8>>, preview: Arc<RgbaImage>, scale: f32, hdr: bool) -> Self {
         Self {
-            clean_sdr: preview.clone(),
+            clean_sdr: Arc::new(ImageSource::Memory(preview.clone())),
             composition: Arc::new(ExportComposition::frozen(png, preview, hdr)),
             scale: scale.max(0.1),
         }
     }
+}
+
+enum ClipboardPayload {
+    Image(Vec<u8>),
+    File(PathBuf),
 }
 
 /// The app's singleton windows (settings / history / OCR results / permissions / update).
@@ -221,8 +232,13 @@ struct PanelSlot {
     pending: bool,
 }
 
+#[derive(Default)]
 pub struct Controller {
     busy: Option<Busy>,
+    /// Identifies the async operation allowed to release `busy`. Recording and
+    /// scrolling own it directly and therefore leave this empty.
+    busy_serial: u64,
+    busy_owner: Option<u64>,
     panels: [PanelSlot; Panel::COUNT],
     selection: Option<ActiveSelection>,
     /// macOS: overlays already hidden with `orderOut` but whose GPUI teardown
@@ -237,11 +253,16 @@ pub struct Controller {
     scroll_editors: Vec<AnyWindowHandle>,
     watermark_editor: Option<AnyWindowHandle>,
     workflow_serial: u64,
+    log_operation: Option<u64>,
     ocr: OcrState,
     ocr_revision: usize,
     ocr_engine_revision: u64,
     ocr_engine: Option<Arc<dyn OcrEngine>>,
     last_capture: Option<Captured>,
+    clipboard_file: Option<PathBuf>,
+    /// Only the newest disk-backed copy may publish, replace the managed file,
+    /// or announce completion. Older workers clean up only their own output.
+    copy_serial: u64,
     /// Screen the user last captured/recorded on. Panel windows (and their
     /// notifications) open there instead of always landing on the primary
     /// display in a multi-monitor setup.
@@ -263,6 +284,8 @@ impl Controller {
     pub fn init(cx: &mut App) -> Entity<Self> {
         let controller = cx.new(|_| Self {
             busy: None,
+            busy_serial: 0,
+            busy_owner: None,
             panels: Default::default(),
             selection: None,
             pending_close: Vec::new(),
@@ -273,11 +296,14 @@ impl Controller {
             scroll_editors: Vec::new(),
             watermark_editor: None,
             workflow_serial: 0,
+            log_operation: None,
             ocr: OcrState::Idle,
             ocr_revision: 0,
             ocr_engine_revision: 0,
             ocr_engine: None,
             last_capture: None,
+            clipboard_file: None,
+            copy_serial: 0,
             last_display_id: None,
             pending_capture: None,
             queued_capture: None,
@@ -338,12 +364,102 @@ impl Controller {
             || self.scroll.is_some()
     }
 
+    /// Start an owned async phase and return the token its completion must use.
+    /// A late callback can never clear a newer operation's busy state.
+    fn begin_busy(&mut self, state: Busy) -> u64 {
+        self.busy_serial = self.busy_serial.wrapping_add(1);
+        let owner = self.busy_serial;
+        self.busy = Some(state);
+        self.busy_owner = Some(owner);
+        owner
+    }
+
+    fn finish_busy(&mut self, owner: u64) -> bool {
+        if self.busy_owner != Some(owner) {
+            return false;
+        }
+        self.busy_owner = None;
+        self.busy = None;
+        true
+    }
+
+    /// Hand the capture/selection phase over to recording or scrolling, which
+    /// manage `busy` directly. Any older callback keeps its stale token but can
+    /// no longer release the new workflow.
+    fn handoff_busy(&mut self) {
+        self.busy_owner = None;
+    }
+
+    fn retire_log_operation(&mut self) {
+        if let Some(id) = self.log_operation.take() {
+            crate::logging::retire_operation(id);
+        }
+    }
+
+    fn retire_log_operation_after_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.log_operation.take() {
+            cx.defer(move |_| {
+                crate::logging::retire_operation(id);
+            });
+        }
+    }
+
+    /// Release a selection/capture only if no export replaced its owner.
+    fn finish_selection_busy(&mut self, capture_busy: Option<u64>) {
+        if capture_busy.is_some_and(|owner| self.busy_owner == Some(owner))
+            && let Some(owner) = capture_busy
+        {
+            self.finish_busy(owner);
+        }
+    }
+
+    fn next_copy_serial(&mut self) -> u64 {
+        self.copy_serial = self.copy_serial.wrapping_add(1);
+        self.copy_serial
+    }
+
+    fn copy_is_current(&self, serial: u64) -> bool {
+        self.copy_serial == serial
+    }
+
+    fn clear_clipboard_file(&mut self, serial: u64) -> Option<PathBuf> {
+        self.copy_is_current(serial)
+            .then(|| self.clipboard_file.take())
+            .flatten()
+    }
+
+    fn replace_clipboard_file(&mut self, serial: u64, path: PathBuf) -> Option<PathBuf> {
+        if !self.copy_is_current(serial) {
+            return None;
+        }
+        self.clipboard_file.replace(path)
+    }
+
+    fn begin_ocr_attempt(&mut self) -> usize {
+        self.ocr_revision += 1;
+        self.ocr_revision
+    }
+
+    /// Claim an OCR result before any history or clipboard side effect. The
+    /// revision advances immediately so duplicate/late completions are rejected.
+    fn accept_ocr_result(&mut self, revision: usize) -> bool {
+        if self.ocr_revision != revision {
+            return false;
+        }
+        self.ocr_revision += 1;
+        true
+    }
+
     pub fn has_scroll(&self) -> bool {
         self.scroll.is_some()
     }
 
     pub fn is_finishing_scroll(&self) -> bool {
         self.scroll.as_ref().is_some_and(|active| active.finishing)
+    }
+
+    pub fn can_finish_scroll(&self) -> bool {
+        self.scroll.as_ref().is_some_and(|active| !active.finishing)
     }
 
     pub fn is_scroll_preview_visible(&self) -> bool {
@@ -354,6 +470,268 @@ impl Controller {
 
     pub fn scroll_snapshot(&self) -> Option<Arc<ScrollSnapshot>> {
         self.scroll.as_ref().map(|active| active.snapshot.clone())
+    }
+
+    pub fn set_scroll_preview_range(&mut self, start: u32, rows: u32) {
+        if let Some(session) = self
+            .scroll
+            .as_ref()
+            .and_then(|active| active.session.as_ref())
+        {
+            session.set_preview_range(start, rows);
+        }
+    }
+
+    pub fn scroll_annotations(&self) -> Option<&Layer> {
+        self.scroll.as_ref().map(|active| &active.annotations)
+    }
+
+    pub fn begin_scroll_annotation(
+        &mut self,
+        x: f32,
+        y: f32,
+        double_click: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.finishing {
+            return;
+        }
+        if active.snapshot.auto_scrolling && !active.annotation_auto_resume {
+            active.annotation_auto_resume = true;
+            if let Some(session) = active.session.as_ref() {
+                let _ = session.set_auto_scroll(false);
+            }
+            Arc::make_mut(&mut active.snapshot).auto_scrolling = false;
+        }
+        if active.annotations.select_at(x, y) {
+            if double_click && active.annotations.begin_text_edit(x, y) {
+                cx.notify();
+                return;
+            }
+            active.annotations.begin_edit(x, y);
+        } else {
+            active.annotations.pointer_down(x, y);
+        }
+        cx.notify();
+    }
+
+    pub fn move_scroll_annotation(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        let viewport = [
+            active.snapshot.width as f32 / active.scale,
+            active.snapshot.height as f32 / active.scale,
+        ];
+        let changed = if active.annotations.is_editing() {
+            active.annotations.drag_edit(x, y, viewport)
+        } else if active.annotations.is_dragging() {
+            active.annotations.pointer_move(x, y);
+            true
+        } else {
+            false
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn end_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.annotations.is_editing() {
+            active.annotations.end_edit();
+        } else if active.annotations.is_dragging() {
+            active.annotations.pointer_up();
+        }
+        if !active.annotations.is_typing() {
+            Self::resume_scroll_annotation_auto(active);
+        }
+        cx.notify();
+    }
+
+    pub fn set_scroll_annotation_tool(
+        &mut self,
+        tool: crate::annotate::Tool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.deselect();
+        active.annotations.set_tool(tool);
+        Self::resume_scroll_annotation_auto(active);
+        cx.notify();
+    }
+
+    pub fn undo_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.undo();
+        Self::resume_scroll_annotation_auto(active);
+        cx.notify();
+    }
+
+    pub fn clear_scroll_annotations(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.clear();
+        Self::resume_scroll_annotation_auto(active);
+        cx.notify();
+    }
+
+    pub fn delete_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.annotations.delete_selected() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_scroll_annotation_color(&mut self, color: u32, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.set_color(color);
+        cx.notify();
+    }
+
+    pub fn set_scroll_annotation_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.set_size(size);
+        cx.notify();
+    }
+
+    pub fn persist_scroll_annotation_defaults(&self, cx: &mut Context<Self>) {
+        if let Some(defaults) = self.scroll_annotations().map(Layer::config) {
+            AppSettings::update(cx, |config| config.annotations = defaults.clone());
+        }
+    }
+
+    pub fn commit_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.commit();
+        Self::resume_scroll_annotation_auto(active);
+        cx.notify();
+    }
+
+    pub fn cancel_scroll_annotation_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.annotations.cancel_draft();
+        Self::resume_scroll_annotation_auto(active);
+        cx.notify();
+    }
+
+    pub fn insert_scroll_annotation_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(active) = self.scroll.as_mut() {
+            active.annotations.insert_text(text);
+            cx.notify();
+        }
+    }
+
+    pub fn backspace_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        if let Some(active) = self.scroll.as_mut() {
+            active.annotations.backspace();
+            cx.notify();
+        }
+    }
+
+    pub fn replace_scroll_annotation_text(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.scroll.as_mut() {
+            active.annotations.replace_text(range, text);
+            cx.notify();
+        }
+    }
+
+    pub fn replace_and_mark_scroll_annotation_text(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.scroll.as_mut() {
+            active.annotations.replace_and_mark_text(range, text);
+            cx.notify();
+        }
+    }
+
+    pub fn unmark_scroll_annotation_text(&mut self, cx: &mut Context<Self>) {
+        if let Some(active) = self.scroll.as_mut() {
+            active.annotations.unmark_text();
+            cx.notify();
+        }
+    }
+
+    pub fn scroll_annotation_scale(&self) -> Option<f32> {
+        self.scroll.as_ref().map(|active| active.scale)
+    }
+
+    fn resume_scroll_annotation_auto(active: &mut ActiveScroll) {
+        if !active.annotation_auto_resume {
+            return;
+        }
+        active.annotation_auto_resume = false;
+        if let Some(session) = active.session.as_ref()
+            && session.set_auto_scroll(true).is_ok()
+        {
+            Arc::make_mut(&mut active.snapshot).auto_scrolling = true;
+        }
+    }
+
+    fn sync_scroll_annotation_content(&mut self, snap: &ScrollSnapshot) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        Self::sync_scroll_annotation_shapes(
+            &mut active.annotations,
+            &mut active.annotation_content_shift,
+            &mut active.annotation_reset_pending,
+            active.scale,
+            snap.content_shift,
+        );
+    }
+
+    fn sync_scroll_annotation_shapes(
+        annotations: &mut Layer,
+        content_shift: &mut u32,
+        reset_pending: &mut bool,
+        scale: f32,
+        shift: u32,
+    ) {
+        if *reset_pending {
+            if shift == 0 {
+                *reset_pending = false;
+                *content_shift = 0;
+            }
+            return;
+        }
+        if shift > *content_shift {
+            let scale = if scale.is_finite() && scale > 0.1 {
+                scale
+            } else {
+                1.0
+            };
+            annotations.translate(0.0, (shift - *content_shift) as f32 / scale);
+            *content_shift = shift;
+        }
     }
 
     /// True while an encoder is flushing after stop / duration cap.
@@ -521,6 +899,12 @@ impl Controller {
     /// Run the action a hotkey asked for while a recording was encoding. Only
     /// called on the success path; `fail` clears the queue on any error.
     fn resume_queued_capture(&mut self, cx: &mut Context<Self>) {
+        // Copy/Save may still be encoding. Keep the request queued until that
+        // operation releases its owned busy phase instead of consuming it with
+        // a rejected start_capture call.
+        if self.is_busy() || self.queued_capture.is_none() {
+            return;
+        }
         if let Some(intent) = self.queued_capture.take() {
             self.start_capture(intent, cx);
         }
@@ -572,9 +956,9 @@ impl Controller {
             return;
         }
         self.workflow_serial = self.workflow_serial.wrapping_add(1);
-        crate::logging::begin_capture();
+        self.log_operation = Some(crate::logging::begin_capture());
         log::info!("capture start: intent={intent:?}");
-        self.busy = Some(Busy::Capturing);
+        let capture_busy = self.begin_busy(Busy::Capturing);
         cx.notify();
 
         // Start the freeze on a worker first: the BGRA conversion runs on the
@@ -620,7 +1004,13 @@ impl Controller {
             let frames = capture.await;
             let frozen = started.elapsed();
             this.update(cx, |this, cx| {
-                this.busy = None;
+                if !this.finish_busy(capture_busy) {
+                    // A newer workflow owns the app now. Tear down only this
+                    // capture's pre-placed overlays, never the new selection.
+                    this.abort_capture(placed.as_ref(), cx);
+                    this.finish_pending_close(cx);
+                    return;
+                }
                 let frames = match frames {
                     Ok(frames) => frames,
                     Err(err) => {
@@ -629,6 +1019,7 @@ impl Controller {
                             t!("controller.capture_failed", error = format!("{err:#}")).to_string(),
                             cx,
                         );
+                        this.retire_log_operation();
                         return;
                     }
                 };
@@ -689,6 +1080,7 @@ impl Controller {
         if displays.is_empty() {
             self.busy = None;
             self.fail(t!("controller.overlay_failed").to_string(), cx);
+            self.retire_log_operation();
             return None;
         }
         let slots: Vec<_> = displays
@@ -761,6 +1153,7 @@ impl Controller {
         if overlays.is_empty() {
             self.busy = None;
             self.fail(t!("controller.overlay_failed").to_string(), cx);
+            self.retire_log_operation();
             return None;
         }
         self.selection = Some(ActiveSelection {
@@ -835,6 +1228,7 @@ impl Controller {
             self.close_selection(cx);
             self.finish_pending_close(cx);
             self.fail(t!("controller.overlay_failed").to_string(), cx);
+            self.retire_log_operation();
             return;
         }
         if let Some(active) = self.selection.as_mut() {
@@ -848,6 +1242,7 @@ impl Controller {
         let Some(active) = self.selection.as_ref() else {
             return;
         };
+        let capture_busy = self.busy_owner;
         let wants_still = matches!(
             command,
             SessionCommand::Copy
@@ -939,6 +1334,9 @@ impl Controller {
             && record_target.is_some();
         if !record_now && !scroll_now {
             self.close_selection(cx);
+        } else {
+            // Recording/scrolling set their own busy phase synchronously.
+            self.handoff_busy();
         }
         log::info!(
             target: "timing",
@@ -947,6 +1345,8 @@ impl Controller {
             ms(started.elapsed())
         );
 
+        let async_still =
+            matches!(command, SessionCommand::Copy | SessionCommand::Save) && image.is_some();
         match (command, image) {
             (SessionCommand::Cancel, _) => {}
             (SessionCommand::Copy, Some(captured)) => {
@@ -982,6 +1382,15 @@ impl Controller {
                 }
             }
             (_, None) => self.fail(t!("controller.selection_empty").to_string(), cx),
+        }
+        // Copy/Save replace the capture owner with an Encoding owner. Cancel,
+        // Pin, Recognize, and rejected commands explicitly release the capture
+        // phase; closing the selection itself is not a state transition.
+        if !record_now && !scroll_now {
+            self.finish_selection_busy(capture_busy);
+            if !async_still {
+                self.retire_log_operation();
+            }
         }
         // Copy and Save flush the hidden overlays from their async completion
         // (after the clipboard/file write). Every other command has no such
@@ -1064,19 +1473,19 @@ impl Controller {
         let workflow = self.workflow_serial;
         cx.spawn(async move |this, cx| {
             let composition = captured.composition.clone();
-            let preview = cx
-                .background_spawn(async move { composition.sdr_preview() })
+            let image = cx
+                .background_spawn(async move { pin::image_source(&composition) })
                 .await;
             this.update(cx, |this, cx| {
                 if controller.read(cx).workflow_serial != workflow {
                     return;
                 }
-                match preview {
-                    Ok(preview) => {
+                match image {
+                    Ok(image) => {
                         let controller = controller.clone();
                         cx.defer(move |cx| {
                             if controller.read(cx).workflow_serial == workflow {
-                                pin::open(captured, preview, placement, cx);
+                                pin::open(captured, image, placement, cx);
                             }
                         });
                     }
@@ -1097,47 +1506,108 @@ impl Controller {
             self.open_pin_async(captured, None, cx);
             return;
         }
-        match HistoryStore::global(cx).read(cx).latest_image() {
-            Some((path, scale)) => pin::open_file(path, scale, cx),
+        let latest = {
+            let store = HistoryStore::global(cx).read(cx);
+            store.entries().next().map(|entry| {
+                let (path, scale) = store.pin_source(entry);
+                (path, scale, entry.hdr)
+            })
+        };
+        match latest {
+            Some((path, scale, hdr)) => pin::open_file_with_hdr(path, scale, hdr, cx),
             None => self.fail(t!("controller.pin_nothing").to_string(), cx),
         }
     }
 
     pub(crate) fn copy_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        let busy = self.begin_busy(Busy::Encoding);
+        let copy_serial = self.next_copy_serial();
         let (width, height) = captured.clean_sdr.dimensions();
         let started = Instant::now();
+        let clipboard_dir = snapit_store::AppDirs::discover()
+            .map(|dirs| dirs.clipboard_dir())
+            .unwrap_or_else(|_| std::env::temp_dir().join("snapit").join("clipboard"));
         cx.spawn(async move |this, cx| {
             let encoded = Instant::now();
-            let png = cx
+            let payload = cx
                 .background_spawn(async move {
                     let started = Instant::now();
                     let hdr = captured.composition.has_hdr_original();
-                    let png = captured.composition.png();
-                    if hdr {
-                        log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
+                    let payload = if captured.composition.clipboard_uses_file() {
+                        log::info!("copy: clipboard disk-backed SDR PNG file reference");
+                        captured
+                            .composition
+                            .write_clipboard_png(&clipboard_dir)
+                            .map(ClipboardPayload::File)
                     } else {
-                        log::info!("copy: clipboard composed SDR PNG");
-                    }
+                        if hdr {
+                            log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
+                        } else {
+                            log::info!("copy: clipboard composed SDR PNG");
+                        }
+                        captured.composition.png().map(|png| {
+                            ClipboardPayload::Image(
+                                Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone()),
+                            )
+                        })
+                    };
                     log::info!(
                         target: "timing",
                         "copy: {width}x{height} PNG encode {:.1} ms",
                         ms(started.elapsed())
                     );
-                    png.map(|png| Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone()))
+                    payload
                 })
                 .await;
             let encode = encoded.elapsed();
             this.update(cx, |this, cx| {
-                match png {
-                    Ok(png) => {
-                        let writing = Instant::now();
+                if !this.copy_is_current(copy_serial) {
+                    // A newer copy owns the pasteboard and managed backing file.
+                    // This worker may clean only the path it generated itself.
+                    if let Ok(ClipboardPayload::File(path)) = payload {
+                        clipboard::remove_clipboard_file(&path);
+                    }
+                    if this.finish_busy(busy) {
+                        this.retire_log_operation();
+                    }
+                    return;
+                }
+                let writing = Instant::now();
+                let result = match payload {
+                    Ok(ClipboardPayload::Image(png)) => {
+                        if let Some(previous) = this.clear_clipboard_file(copy_serial) {
+                            clipboard::remove_clipboard_file(&previous);
+                        }
                         cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
                             ImageFormat::Png,
                             png,
                         )));
+                        Ok("image data")
+                    }
+                    Ok(ClipboardPayload::File(path)) => {
+                        let copied = clipboard::copy_file_reference(&path, cx)
+                            .map_err(|error| format!("{error:#}"));
+                        if copied.is_ok() {
+                            if let Some(previous) =
+                                this.replace_clipboard_file(copy_serial, path.clone())
+                            {
+                                clipboard::remove_clipboard_file(&previous);
+                            }
+                        } else {
+                            clipboard::remove_clipboard_file(&path);
+                        }
+                        copied.map(|kind| match kind {
+                            clipboard::FileCopy::File => "file reference",
+                            clipboard::FileCopy::PathText => "path text",
+                        })
+                    }
+                    Err(err) => Err(err),
+                };
+                match result {
+                    Ok(mode) => {
                         log::info!(
                             target: "timing",
-                            "copy: clipboard filled {:.1} ms after the command (worker result at {:.1} ms), write {:.1} ms",
+                            "copy: clipboard filled as {mode} {:.1} ms after the command (worker result at {:.1} ms), write {:.1} ms",
                             ms(started.elapsed()),
                             ms(encode),
                             ms(writing.elapsed())
@@ -1155,7 +1625,13 @@ impl Controller {
                 // The overlay was hidden at command time; destroy it only now
                 // that the clipboard holds the image, so the ~37 ms teardown is
                 // no longer on the critical path to a paste.
+                if this.finish_busy(busy) {
+                    this.retire_log_operation();
+                }
                 this.finish_pending_close(cx);
+                if this.busy.is_none() {
+                    this.resume_queued_capture(cx);
+                }
             })
             .ok();
             log::debug!(target: "timing", "copy command handled in {:.1} ms", ms(started.elapsed()));
@@ -1164,6 +1640,7 @@ impl Controller {
     }
 
     pub(crate) fn save_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        let busy = self.begin_busy(Busy::Encoding);
         let Captured { composition, .. } = captured;
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
@@ -1173,9 +1650,17 @@ impl Controller {
         cx.spawn(async move |this, cx| {
             let Some(mut path) = await_path(path, &this, cx).await else {
                 // Save dialog dismissed: nothing will follow to flush the
-                // hidden overlays, so release them here.
-                this.update(cx, |this, cx| this.finish_pending_close(cx))
-                    .ok();
+                // hidden overlays, so release them and the busy phase here.
+                this.update(cx, |this, cx| {
+                    if this.finish_busy(busy) {
+                        this.retire_log_operation();
+                    }
+                    this.finish_pending_close(cx);
+                    if this.busy.is_none() {
+                        this.resume_queued_capture(cx);
+                    }
+                })
+                .ok();
                 return;
             };
             let format = SaveFormat::from_path(&path).unwrap_or_else(|| {
@@ -1194,19 +1679,12 @@ impl Controller {
                     };
                     log::info!("save branch: {branch} hdr_available={hdr_available}");
                     let result = match (format, hdr_available) {
-                        (SaveFormat::Png, true) => {
-                            let png = composition.png().map_err(anyhow::Error::msg)?;
-                            std::fs::write(&path, png.as_slice())
-                                .with_context(|| format!("failed to write {}", path.display()))
+                        (SaveFormat::Png, true) | (SaveFormat::Png, false) => {
+                            composition.write_png(&path).map_err(anyhow::Error::msg)
                         }
-                        (SaveFormat::Png, false) => {
-                            let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
-                            snapit_capture::save_png(&image, &path)
-                        }
-                        (SaveFormat::Jpg, _) => {
-                            let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
-                            snapit_capture::save_jpeg(&image, &path, quality)
-                        }
+                        (SaveFormat::Jpg, _) => composition
+                            .write_jpeg(&path, quality)
+                            .map_err(anyhow::Error::msg),
                     };
                     log::info!(
                         "save result: {} ({:.1} ms) {}",
@@ -1232,7 +1710,13 @@ impl Controller {
                         cx,
                     ),
                 }
+                if this.finish_busy(busy) {
+                    this.retire_log_operation();
+                }
                 this.finish_pending_close(cx);
+                if this.busy.is_none() {
+                    this.resume_queued_capture(cx);
+                }
             })
             .ok();
         })
@@ -1248,13 +1732,12 @@ impl Controller {
             ..
         } = captured;
         self.ocr = OcrState::Running;
-        self.ocr_revision += 1;
+        let revision = self.begin_ocr_attempt();
         self.open_panel(Panel::Ocr, cx);
         let engine = self.ocr_engine.clone();
         let options = OcrOptions::default().with_languages(settings_view::ocr_languages(
             &AppSettings::get(cx).ocr.language,
         ));
-        let revision = self.ocr_revision;
         let engine_revision = self.ocr_engine_revision;
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1263,11 +1746,21 @@ impl Controller {
                         Some(engine) => engine,
                         None => Arc::from(snapit_ocr::engine_with(&options)?),
                     };
-                    let blocks = snapit_ocr::recognize_tall(engine.as_ref(), &clean_sdr)?;
+                    let blocks = snapit_ocr::recognize_rows(
+                        engine.as_ref(),
+                        clean_sdr.width(),
+                        clean_sdr.height(),
+                        |start, rows| clean_sdr.read_rows(start, rows),
+                    )?;
                     Ok::<_, anyhow::Error>((engine, blocks))
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if !this.accept_ocr_result(revision) {
+                    // Superseded (or already completed): no history, clipboard,
+                    // or OCR panel update for the stale attempt.
+                    return;
+                }
                 let text = result
                     .as_ref()
                     .ok()
@@ -1275,9 +1768,6 @@ impl Controller {
                 HistoryStore::global(cx).update(cx, |history, cx| {
                     history.add_image(composition, scale, text.clone(), cx)
                 });
-                if this.ocr_revision != revision {
-                    return;
-                }
                 this.ocr = match result {
                     Ok((engine, _)) => {
                         let name = engine.name();
@@ -1292,7 +1782,6 @@ impl Controller {
                     }
                     Err(err) => OcrState::Failed(format!("{err:#}").into()),
                 };
-                this.ocr_revision += 1;
                 cx.notify();
             })
             .ok();
@@ -1312,7 +1801,7 @@ impl Controller {
         format: RecordFormat,
         cx: &mut Context<Self>,
     ) {
-        crate::logging::begin_recording();
+        self.log_operation = Some(crate::logging::begin_recording());
         log::info!("recording start: format={format:?} display={monitor_id} region={region:?}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
@@ -1958,6 +2447,7 @@ impl Controller {
         if matches!(self.busy, Some(Busy::Encoding)) {
             self.busy = None;
         }
+        self.retire_log_operation_after_update(cx);
         cx.notify();
     }
 
@@ -1973,7 +2463,7 @@ impl Controller {
         scale: f32,
         cx: &mut Context<Self>,
     ) {
-        crate::logging::begin_scroll();
+        self.log_operation = Some(crate::logging::begin_scroll());
         log::info!("scroll start: display={monitor_id} region={region:?} scale={scale}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
@@ -1997,6 +2487,7 @@ impl Controller {
                 .to_string(),
                 cx,
             );
+            self.retire_log_operation();
             return;
         };
         self.workflow_serial = self.workflow_serial.wrapping_add(1);
@@ -2017,8 +2508,13 @@ impl Controller {
             selection,
             scale,
             snapshot: Arc::new(ScrollSnapshot::default()),
+            annotations: Layer::new(AppSettings::get(cx).annotations.clone()),
+            annotation_content_shift: 0,
+            annotation_reset_pending: false,
+            annotation_auto_resume: false,
             preview_visible: show_preview,
             finishing: false,
+            pending_finish: None,
             last_warning: false,
         });
         self.open_scroll_bar(scroll_id, display_id, display_bounds, selection, cx);
@@ -2052,6 +2548,7 @@ impl Controller {
                 t!("controller.scroll_start_failed", error = "overlay").to_string(),
                 cx,
             );
+            self.retire_log_operation();
         }
     }
 
@@ -2089,8 +2586,12 @@ impl Controller {
                         active.start = None;
                         active.snapshot = snap;
                         active.session = Some(session);
+                        let pending_finish = active.pending_finish.take();
                         cx.notify();
                         Self::tick_scroll(scroll_id, cx);
+                        if let Some(action) = pending_finish {
+                            this.finish_scroll(action, cx);
+                        }
                     }
                     Err(err) => {
                         this.finish_scroll_ui(cx);
@@ -2099,6 +2600,7 @@ impl Controller {
                                 .to_string(),
                             cx,
                         );
+                        this.retire_log_operation();
                     }
                 }
             })
@@ -2112,36 +2614,43 @@ impl Controller {
             loop {
                 cx.background_executor().timer(SCROLL_TICK).await;
                 let keep_ticking = this.update(cx, |this, cx| {
-                    let Some(active) = this.scroll.as_mut() else {
-                        return false;
-                    };
-                    if active.id != scroll_id || active.finishing {
-                        return false;
-                    }
-                    let Some(session) = active.session.as_ref() else {
-                        return false;
-                    };
-                    let snap = session.snapshot();
-                    let warn_now = snap.warning.is_some();
-                    let changed = snap.preview_revision != active.snapshot.preview_revision
-                        || snap.status != active.snapshot.status
-                        || snap.warning != active.snapshot.warning
-                        || snap.auto_scrolling != active.snapshot.auto_scrolling
-                        || snap.paused != active.snapshot.paused
-                        || snap.height != active.snapshot.height
-                        || snap.started != active.snapshot.started;
-                    active.snapshot = snap;
-                    if warn_now != active.last_warning {
-                        active.last_warning = warn_now;
-                        if let Some(frame) = active.frame.as_ref() {
-                            let view = frame.view.clone();
-                            frame
-                                .window
-                                .update(cx, |_, _, cx| {
-                                    view.update(cx, |view, cx| view.set_live_warning(warn_now, cx));
-                                })
-                                .ok();
+                    let (changed, warn_changed, warn_now, frame, snap) = {
+                        let Some(active) = this.scroll.as_mut() else {
+                            return false;
+                        };
+                        if active.id != scroll_id || active.finishing {
+                            return false;
                         }
+                        let Some(session) = active.session.as_ref() else {
+                            return false;
+                        };
+                        let snap = session.snapshot();
+                        let warn_now = snap.warning.is_some();
+                        let changed = snap.preview_revision != active.snapshot.preview_revision
+                            || snap.status != active.snapshot.status
+                            || snap.warning != active.snapshot.warning
+                            || snap.auto_scrolling != active.snapshot.auto_scrolling
+                            || snap.direction != active.snapshot.direction
+                            || snap.auto_direction != active.snapshot.auto_direction
+                            || snap.paused != active.snapshot.paused
+                            || snap.height != active.snapshot.height
+                            || snap.content_shift != active.snapshot.content_shift
+                            || snap.started != active.snapshot.started;
+                        let warn_changed = warn_now != active.last_warning;
+                        active.last_warning = warn_now;
+                        active.snapshot = snap.clone();
+                        let frame = active.frame.clone();
+                        (changed, warn_changed, warn_now, frame, snap)
+                    };
+                    this.sync_scroll_annotation_content(&snap);
+                    if warn_changed && let Some(frame) = frame {
+                        let view = frame.view.clone();
+                        frame
+                            .window
+                            .update(cx, |_, _, cx| {
+                                view.update(cx, |view, cx| view.set_live_warning(warn_now, cx));
+                            })
+                            .ok();
                     }
                     if changed {
                         cx.notify();
@@ -2307,6 +2816,36 @@ impl Controller {
         }
     }
 
+    pub fn set_scroll_auto_direction(
+        &mut self,
+        direction: ScrollDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        let Some(session) = active.session.as_ref() else {
+            return;
+        };
+        let enabled =
+            !active.snapshot.auto_scrolling || active.snapshot.auto_direction != direction;
+        match session.set_auto_scroll_direction(enabled, direction) {
+            Ok(()) => {
+                active.snapshot = session.snapshot();
+                cx.notify();
+            }
+            Err(AutoScrollError::NeedsAccessibility) => {
+                log::warn!("auto-scroll requested without accessibility permission");
+                permissions::request(Permission::Accessibility);
+                self.open_panel(Panel::Permissions, cx);
+                self.inform(t!("scroll.accessibility_needed").to_string(), cx);
+            }
+            Err(err) => {
+                self.fail(format!("{err}"), cx);
+            }
+        }
+    }
+
     pub fn toggle_scroll_preview(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self.scroll.as_mut() else {
             return;
@@ -2336,6 +2875,10 @@ impl Controller {
         };
         if let Some(session) = active.session.as_ref() {
             session.reset();
+            active.annotations.clear();
+            active.annotation_content_shift = 0;
+            active.annotation_reset_pending = true;
+            active.annotation_auto_resume = false;
             active.snapshot = session.snapshot();
             cx.notify();
         }
@@ -2357,6 +2900,7 @@ impl Controller {
         self.busy = None;
         self.finish_scroll_ui(cx);
         log::info!("scroll capture discarded");
+        self.retire_log_operation();
         self.resume_queued_capture(cx);
     }
 
@@ -2368,7 +2912,12 @@ impl Controller {
             return;
         }
         if active.session.is_none() {
-            self.cancel_scroll(cx);
+            if active.start.is_some() {
+                active.pending_finish = Some(action);
+                cx.notify();
+            } else {
+                self.cancel_scroll(cx);
+            }
             return;
         }
         let needs_watermark = matches!(
@@ -2398,6 +2947,7 @@ impl Controller {
                                 .to_string(),
                             cx,
                         );
+                        self.retire_log_operation();
                         self.resume_queued_capture(cx);
                         return;
                     }
@@ -2409,6 +2959,9 @@ impl Controller {
             WatermarkSpec::default()
         };
         let session = active.session.take().expect("checked above");
+        let mut annotations = active.annotations.clone();
+        let mut annotation_content_shift = active.annotation_content_shift;
+        let mut annotation_reset_pending = active.annotation_reset_pending;
         let scale = active.scale;
         let display_id = active.display_id;
         active.finishing = true;
@@ -2418,7 +2971,21 @@ impl Controller {
         cx.spawn(async move |this, cx| {
             let handle = std::thread::Builder::new()
                 .name("snapit-scroll-finish".into())
-                .spawn(move || session.finish());
+                .spawn(move || {
+                    session.finish().map(|result| {
+                        result.map(|(image, content_shift)| {
+                            Self::sync_scroll_annotation_shapes(
+                                &mut annotations,
+                                &mut annotation_content_shift,
+                                &mut annotation_reset_pending,
+                                scale,
+                                content_shift,
+                            );
+                            annotations.commit();
+                            (image, Arc::new(annotations.committed().to_vec()))
+                        })
+                    })
+                });
             let image = match handle {
                 Ok(handle) => {
                     while !handle.is_finished() {
@@ -2435,12 +3002,21 @@ impl Controller {
             };
             this.update(cx, |this, cx| {
                 this.finish_scroll_ui(cx);
+                let hands_off_export = matches!(&image, Ok(Some(_)))
+                    && matches!(action, ScrollFinishAction::Copy | ScrollFinishAction::Save);
                 match image {
-                    Ok(Some(image)) => {
+                    Ok(Some((image, shapes))) => {
                         if action == ScrollFinishAction::Edit {
-                            this.open_scroll_editor(image, scale, display_id, cx);
+                            this.open_scroll_editor(
+                                ImageSource::from(image),
+                                scale,
+                                display_id,
+                                shapes,
+                                cx,
+                            );
                         } else {
-                            let captured = Captured::new(image, None, scale, None, watermark);
+                            let captured =
+                                Captured::new(image, None, scale, Some(shapes), watermark);
                             match action {
                                 ScrollFinishAction::Copy => {
                                     this.remember(&captured, cx);
@@ -2469,6 +3045,9 @@ impl Controller {
                         );
                     }
                 }
+                if !hands_off_export {
+                    this.retire_log_operation();
+                }
                 this.resume_queued_capture(cx);
             })
             .ok();
@@ -2490,7 +3069,7 @@ impl Controller {
                 }
             });
         }
-        if matches!(self.busy, Some(Busy::Encoding)) {
+        if matches!(self.busy, Some(Busy::Encoding)) && self.busy_owner.is_none() {
             self.busy = None;
         }
         cx.notify();
@@ -2498,26 +3077,33 @@ impl Controller {
 
     fn open_scroll_editor(
         &mut self,
-        image: RgbaImage,
+        image: ImageSource,
         scale: f32,
         display_id: Option<gpui_kit::DisplayId>,
+        shapes: Arc<Vec<Shape>>,
         cx: &mut Context<Self>,
     ) {
-        let controller = cx.entity();
-        cx.defer(
-            move |cx| match crate::scroll_editor::open(image, scale, display_id, cx) {
-                Ok(handle) => {
-                    controller.update(cx, |this, cx| {
-                        this.scroll_editors.push(handle);
-                        this.sync_dock_visible(cx);
-                    });
-                    cx.activate(true);
-                }
-                Err(err) => {
-                    log::error!("failed to open scroll editor: {err:#}");
-                }
-            },
-        );
+        // The editor does not read the controller while it is constructed, so
+        // open it synchronously and handle failure before this update returns.
+        // Deferring used to silently lose the long image after scroll teardown.
+        match crate::scroll_editor::open(image, scale, display_id, shapes, cx) {
+            Ok(handle) => {
+                self.scroll_editors.push(handle);
+                self.sync_dock_visible(cx);
+                cx.activate(true);
+            }
+            Err(err) => {
+                log::error!("failed to open scroll editor: {err:#}");
+                self.fail(
+                    t!(
+                        "controller.scroll_failed",
+                        error = format!("editor: {err:#}")
+                    )
+                    .to_string(),
+                    cx,
+                );
+            }
+        }
     }
 
     pub fn open_watermark_editor(
@@ -2928,6 +3514,254 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snapit-controller-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn upward_stitching_moves_annotations_in_logical_coordinates_once() {
+        let mut annotations = Layer::default();
+        annotations.set_tool(crate::annotate::Tool::Line);
+        annotations.pointer_down(10.0, 10.0);
+        annotations.pointer_move(30.0, 10.0);
+        annotations.pointer_up();
+        let mut content_shift = 0;
+        let mut reset_pending = false;
+
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            2.0,
+            200,
+        );
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            2.0,
+            200,
+        );
+        assert_eq!(content_shift, 200);
+        assert_eq!(
+            annotations.committed()[0].extents(),
+            (10.0, 110.0, 20.0, 0.0)
+        );
+
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            2.0,
+            260,
+        );
+        assert_eq!(
+            annotations.committed()[0].extents(),
+            (10.0, 140.0, 20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn reset_ignores_stale_content_shifts_before_the_new_origin() {
+        let mut annotations = Layer::default();
+        annotations.set_tool(crate::annotate::Tool::Line);
+        annotations.pointer_down(10.0, 10.0);
+        annotations.pointer_move(30.0, 10.0);
+        annotations.pointer_up();
+        let mut content_shift = 400;
+        let mut reset_pending = true;
+
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            1.0,
+            900,
+        );
+        assert!(reset_pending);
+        assert_eq!(content_shift, 400);
+        assert_eq!(
+            annotations.committed()[0].extents(),
+            (10.0, 10.0, 20.0, 0.0)
+        );
+
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            1.0,
+            0,
+        );
+        assert!(!reset_pending);
+        assert_eq!(content_shift, 0);
+        assert_eq!(
+            annotations.committed()[0].extents(),
+            (10.0, 10.0, 20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn cancel_releases_capture_busy_for_the_next_capture() {
+        let mut controller = Controller::default();
+        let first = controller.begin_busy(Busy::Capturing);
+        assert!(controller.is_busy());
+
+        controller.finish_selection_busy(Some(first));
+        assert!(!controller.is_busy());
+
+        let second = controller.begin_busy(Busy::Capturing);
+        assert_ne!(first, second);
+        assert!(controller.finish_busy(second));
+        assert!(!controller.is_busy());
+    }
+
+    #[test]
+    fn pin_and_recognize_release_capture_busy_synchronously() {
+        let mut controller = Controller::default();
+        for _ in 0..2 {
+            let capture = controller.begin_busy(Busy::Capturing);
+            controller.finish_selection_busy(Some(capture));
+            assert!(!controller.is_busy());
+        }
+    }
+
+    #[test]
+    fn copy_export_holds_encoding_until_its_own_completion() {
+        let mut controller = Controller::default();
+        let capture = controller.begin_busy(Busy::Capturing);
+        let copy = controller.begin_busy(Busy::Encoding);
+
+        // Closing the selection must not release the copy that replaced it.
+        controller.finish_selection_busy(Some(capture));
+        assert_eq!(controller.busy, Some(Busy::Encoding));
+        assert!(controller.is_busy());
+        assert!(!controller.finish_busy(capture));
+        assert!(controller.finish_busy(copy));
+        assert!(!controller.is_busy());
+
+        let next = controller.begin_busy(Busy::Capturing);
+        assert!(controller.finish_busy(next));
+    }
+
+    #[test]
+    fn save_export_holds_encoding_until_its_own_completion() {
+        let mut controller = Controller::default();
+        let capture = controller.begin_busy(Busy::Capturing);
+        let save = controller.begin_busy(Busy::Encoding);
+
+        controller.finish_selection_busy(Some(capture));
+        assert_eq!(controller.busy, Some(Busy::Encoding));
+        assert!(controller.finish_busy(save));
+        assert!(!controller.is_busy());
+
+        let next = controller.begin_busy(Busy::Capturing);
+        assert!(controller.finish_busy(next));
+    }
+
+    #[test]
+    fn stale_completion_cannot_release_a_new_capture() {
+        let mut controller = Controller::default();
+        let old_capture = controller.begin_busy(Busy::Capturing);
+        let new_capture = controller.begin_busy(Busy::Capturing);
+
+        // A delayed Cancel/failure from the old selection cannot clear the new
+        // capture's busy state.
+        controller.finish_selection_busy(Some(old_capture));
+        assert!(!controller.finish_busy(old_capture));
+        assert_eq!(controller.busy, Some(Busy::Capturing));
+        assert_eq!(controller.busy_owner, Some(new_capture));
+        assert!(controller.finish_busy(new_capture));
+    }
+
+    #[test]
+    fn stale_export_completion_cannot_release_a_newer_export() {
+        let mut controller = Controller::default();
+        let old_save = controller.begin_busy(Busy::Encoding);
+        let new_copy = controller.begin_busy(Busy::Encoding);
+
+        assert!(!controller.finish_busy(old_save));
+        assert_eq!(controller.busy, Some(Busy::Encoding));
+        assert_eq!(controller.busy_owner, Some(new_copy));
+        assert!(controller.finish_busy(new_copy));
+        assert!(!controller.is_busy());
+    }
+
+    #[test]
+    fn recording_handoff_detaches_the_selection_busy_owner() {
+        let mut controller = Controller::default();
+        let capture = controller.begin_busy(Busy::Capturing);
+        controller.handoff_busy();
+        controller.busy = Some(Busy::Capturing); // recording owns the phase now
+
+        assert!(!controller.finish_busy(capture));
+        assert_eq!(controller.busy, Some(Busy::Capturing));
+    }
+
+    #[test]
+    fn stale_copy_cannot_replace_or_delete_the_current_backing_file() {
+        let dir = temp_dir("copy-owner");
+        let old_path = dir.join("snapit-copy-old.png");
+        let new_path = dir.join("snapit-copy-new.png");
+        std::fs::write(&old_path, b"old").unwrap();
+        std::fs::write(&new_path, b"new").unwrap();
+        let mut controller = Controller::default();
+
+        let previous = controller.next_copy_serial();
+        assert!(
+            controller
+                .replace_clipboard_file(previous, old_path.clone())
+                .is_none()
+        );
+        let old = controller.next_copy_serial();
+        let new = controller.next_copy_serial();
+        assert!(controller.copy_is_current(new));
+        assert!(!controller.copy_is_current(old));
+        assert!(controller.clear_clipboard_file(old).is_none());
+        assert!(
+            controller
+                .replace_clipboard_file(old, dir.join("snapit-copy-stale.png"))
+                .is_none()
+        );
+        assert_eq!(controller.clipboard_file, Some(old_path.clone()));
+        assert!(old_path.exists());
+
+        assert_eq!(
+            controller.replace_clipboard_file(new, new_path.clone()),
+            Some(old_path.clone())
+        );
+        clipboard::remove_clipboard_file(&old_path);
+        assert!(!old_path.exists());
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_copy_cleans_only_its_own_generated_file() {
+        let dir = temp_dir("copy-cleanup");
+        let stale_path = dir.join("snapit-copy-stale.png");
+        let current_path = dir.join("snapit-copy-current.png");
+        std::fs::write(&stale_path, b"stale").unwrap();
+        std::fs::write(&current_path, b"current").unwrap();
+
+        clipboard::remove_clipboard_file(&stale_path);
+        clipboard::remove_clipboard_file(&stale_path); // missing is already clean
+        assert!(!stale_path.exists());
+        assert_eq!(std::fs::read(&current_path).unwrap(), b"current");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn out_of_order_ocr_completion_records_only_the_latest_attempt() {
+        let mut controller = Controller::default();
+        let old = controller.begin_ocr_attempt();
+        let new = controller.begin_ocr_attempt();
+        let mut history_entries = 0;
+
+        // The newer worker finishes first; the older result then arrives late.
+        for revision in [new, old, new] {
+            if controller.accept_ocr_result(revision) {
+                history_entries += 1;
+            }
+        }
+        assert_eq!(history_entries, 1);
     }
 
     #[test]

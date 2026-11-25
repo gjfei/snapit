@@ -1,4 +1,10 @@
-use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use gpui_kit::AppContext as _;
 use gpui_kit::assets::IconName as LucideIcon;
@@ -16,13 +22,13 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, AnyWindowHandle, App, Bounds, ClipboardEntry, Context, CursorStyle, DisplayId,
-    ElementId, Entity, ExternalPaths, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    AnyElement, AnyWindowHandle, App, AsyncApp, Bounds, ClipboardEntry, Context, CursorStyle,
+    DisplayId, ElementId, Entity, ExternalPaths, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement as _, PathPromptOptions, PinchEvent, Pixels, Point, Render, RenderImage,
     ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas,
-    container_query, div, fill, img, point, prelude::FluentBuilder as _, px, rgb, size,
+    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions,
+    canvas, container_query, div, fill, img, point, prelude::FluentBuilder as _, px, rgb, size,
 };
 use snapit_capture::ElementBounds;
 use snapit_store::{
@@ -342,6 +348,83 @@ impl CanvasGesture {
     }
 }
 
+struct PendingWatermarkAssets {
+    directory: PathBuf,
+    names: Vec<String>,
+    saved_references: BTreeSet<String>,
+}
+
+impl PendingWatermarkAssets {
+    fn new(watermark: &snapit_store::WatermarkConfig) -> Self {
+        Self {
+            directory: PathBuf::new(),
+            names: Vec::new(),
+            saved_references: watermark
+                .templates
+                .values()
+                .flat_map(|template| watermark_image_references(&template.preset))
+                .collect(),
+        }
+    }
+
+    fn track(&mut self, directory: &Path, source: String) {
+        if self.directory.as_os_str().is_empty() {
+            self.directory = directory.to_path_buf();
+        }
+        if !self.names.contains(&source) {
+            self.names.push(source);
+        }
+    }
+
+    fn cleanup(&mut self, retained: &BTreeSet<String>) {
+        for name in self.names.drain(..) {
+            if retained.contains(&name) || self.saved_references.contains(&name) {
+                continue;
+            }
+            let path = self.directory.join(&name);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!(
+                    "failed to remove unused watermark image {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for PendingWatermarkAssets {
+    fn drop(&mut self) {
+        self.cleanup(&BTreeSet::new());
+    }
+}
+
+fn watermark_image_references(preset: &WatermarkPreset) -> BTreeSet<String> {
+    preset
+        .elements
+        .iter()
+        .filter(|element| element.kind == WatermarkKind::Image)
+        .map(|element| element.image.source.clone())
+        .collect()
+}
+
+fn watermark_retained_references(
+    preset: &WatermarkPreset,
+    undo: &[WatermarkPreset],
+    redo: &[WatermarkPreset],
+    slider: Option<&WatermarkPreset>,
+) -> BTreeSet<String> {
+    let mut retained = watermark_image_references(preset);
+    for snapshot in undo.iter().chain(redo) {
+        retained.extend(watermark_image_references(snapshot));
+    }
+    if let Some(snapshot) = slider {
+        retained.extend(watermark_image_references(snapshot));
+    }
+    retained
+}
+
 pub(crate) struct WatermarkEditor {
     window_handle: AnyWindowHandle,
     target: WatermarkTarget,
@@ -364,7 +447,13 @@ pub(crate) struct WatermarkEditor {
     syncing_controls: bool,
     backdrop: PreviewBackdrop,
     zoom_override: Option<f32>,
-    preview: Option<std::result::Result<StampPreview, String>>,
+    preview: Option<StampPreview>,
+    preview_revision: u64,
+    requested_preview_revision: u64,
+    preview_pending: bool,
+    preview_error: Option<String>,
+    preview_task: Option<Task<()>>,
+    pending_assets: PendingWatermarkAssets,
     preview_layout: Rc<Cell<Option<PreviewLayout>>>,
     gesture: Option<CanvasGesture>,
     snap_guides: Vec<SnapGuide>,
@@ -605,6 +694,12 @@ impl WatermarkEditor {
             backdrop: PreviewBackdrop::Checkerboard,
             zoom_override: None,
             preview: None,
+            preview_revision: 0,
+            requested_preview_revision: 0,
+            preview_pending: false,
+            preview_error: None,
+            preview_task: None,
+            pending_assets: PendingWatermarkAssets::new(&AppSettings::get(cx).watermark),
             preview_layout: Rc::new(Cell::new(None)),
             gesture: None,
             snap_guides: Vec::new(),
@@ -758,9 +853,37 @@ impl WatermarkEditor {
     }
 
     fn refresh_preview(&mut self, cx: &mut Context<Self>) {
-        self.preview = Some(build_stamp_preview(
-            &self.preset,
-            AppSettings::watermark_dir(cx),
+        let revision = self.requested_preview_revision.wrapping_add(1);
+        self.requested_preview_revision = revision;
+        self.preview_pending = true;
+        self.preview_error = None;
+        let preset = self.preset.clone();
+        let image_dir = AppSettings::watermark_dir(cx).to_path_buf();
+        self.preview_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let result = cx
+                    .background_spawn(async move { build_stamp_preview(&preset, &image_dir) })
+                    .await;
+                this.update(cx, |editor, cx| {
+                    if editor.requested_preview_revision != revision {
+                        return;
+                    }
+                    editor.preview_pending = false;
+                    match result {
+                        Ok(preview) => {
+                            editor.preview_revision = revision;
+                            editor.preview = Some(preview);
+                            editor.preview_error = None;
+                        }
+                        Err(error) => {
+                            log::warn!("watermark stamp preview failed: {error}");
+                            editor.preview_error = Some(error);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            },
         ));
         cx.notify();
     }
@@ -821,7 +944,7 @@ impl WatermarkEditor {
         if self.preset.elements.is_empty() {
             return (0.0, 0.0);
         }
-        if let Some(Ok(preview)) = &self.preview {
+        if let Some(preview) = &self.preview {
             let (ox, oy) = preview.origin;
             let (_, h) = preview.logical_size;
             return (ox.round(), (oy + h + 12.0).round());
@@ -960,7 +1083,7 @@ impl WatermarkEditor {
         if self.preset.elements.len() < 2 {
             return;
         }
-        let Some(Ok(preview)) = &self.preview else {
+        let Some(preview) = &self.preview else {
             return;
         };
         let scale = self.preset.scale.max(0.1);
@@ -990,6 +1113,7 @@ impl WatermarkEditor {
             }
             match crate::settings_view::import_watermark_image(path, dir) {
                 Ok((source, natural_w, _)) => {
+                    self.pending_assets.track(dir, source.clone());
                     if last_id.is_none() {
                         self.push_undo_snapshot();
                     }
@@ -1045,6 +1169,7 @@ impl WatermarkEditor {
                 ClipboardEntry::Image(image) => {
                     match crate::settings_view::import_watermark_image_bytes(&image.bytes, &dir) {
                         Ok((source, natural_w, _)) => {
+                            self.pending_assets.track(&dir, source.clone());
                             if !changed {
                                 self.push_undo_snapshot();
                             }
@@ -1083,11 +1208,22 @@ impl WatermarkEditor {
         }
     }
 
+    fn preview_is_fresh(&self) -> bool {
+        self.preview.is_some()
+            && !self.preview_pending
+            && self.preview_revision == self.requested_preview_revision
+            && self.preview_error.is_none()
+    }
+
     fn can_save(&self) -> bool {
-        preset_is_valid(&self.preset) && matches!(self.preview, Some(Ok(_)))
+        preset_is_valid(&self.preset) && self.preview_is_fresh()
     }
 
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.preview_is_fresh() {
+            cx.notify();
+            return false;
+        }
         if self.preset.elements.is_empty() {
             self.error = Some(t!("settings.watermark.elements.required").to_string());
             cx.notify();
@@ -1114,6 +1250,13 @@ impl WatermarkEditor {
                 self.target,
             );
         });
+        let retained = AppSettings::get(cx)
+            .watermark
+            .templates
+            .values()
+            .flat_map(|template| watermark_image_references(&template.preset))
+            .collect();
+        self.pending_assets.cleanup(&retained);
         log::info!(
             "watermark stamp design saved: target={} template={:?} elements={}",
             self.target.as_str(),
@@ -1178,7 +1321,7 @@ impl WatermarkEditor {
         let Some(layout) = self.preview_layout.get() else {
             return;
         };
-        let Some(Ok(preview)) = self.preview.clone() else {
+        let Some(preview) = self.preview.clone() else {
             return;
         };
 
@@ -1432,7 +1575,7 @@ impl WatermarkEditor {
 
     fn update_hover_cursor(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let mut next = CursorStyle::Arrow;
-        if let (Some(layout), Some(Ok(preview))) = (self.preview_layout.get(), &self.preview) {
+        if let (Some(layout), Some(preview)) = (self.preview_layout.get(), &self.preview) {
             if let Some(rect) = self.selected_screen_rect(&layout, preview) {
                 match self.hit_test_handles(pos, rect) {
                     HandleHit::Rotate => next = CursorStyle::OpenHand,
@@ -1516,7 +1659,7 @@ impl WatermarkEditor {
         let count = self.preset.elements.len();
         let at_limit = count >= WatermarkPreset::MAX_ELEMENTS;
         let has_selection = self.selected_index().is_some();
-        let can_align = count >= 2 && matches!(self.preview, Some(Ok(_)));
+        let can_align = count >= 2 && self.preview.is_some();
 
         let align_button = |id: &'static str, icon: LucideIcon, key: &'static str, op: AlignOp| {
             let editor = editor.clone();
@@ -1791,16 +1934,8 @@ impl WatermarkEditor {
     }
 
     fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let stamp = self
-            .preview
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .cloned();
-        let error = self
-            .preview
-            .as_ref()
-            .and_then(|result| result.as_ref().err())
-            .cloned();
+        let stamp = self.preview.clone();
+        let error = self.preview_error.clone();
         let preview_layout = self.preview_layout.clone();
         let selected_id = self.selected_id.clone();
         let drag_camera = self.gesture.as_ref().map(|g| g.locked_camera());
@@ -2130,16 +2265,12 @@ impl WatermarkEditor {
     }
 
     fn render_center_pane(&self, cx: &mut Context<Self>) -> AnyElement {
-        let stamp_size = self
-            .preview
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .map(|preview| {
-                format!(
-                    "{:.0} × {:.0} px",
-                    preview.logical_size.0, preview.logical_size.1
-                )
-            });
+        let stamp_size = self.preview.as_ref().map(|preview| {
+            format!(
+                "{:.0} × {:.0} px",
+                preview.logical_size.0, preview.logical_size.1
+            )
+        });
         let zoom_pct = self
             .zoom_override
             .or_else(|| self.preview_layout.get().map(|layout| layout.zoom))
@@ -2845,6 +2976,7 @@ fn add_images(editor: Entity<WatermarkEditor>, cx: &mut App) {
 }
 
 fn replace_image(editor: Entity<WatermarkEditor>, element_id: String, cx: &mut App) {
+    let editor = editor.downgrade();
     let picked = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -2861,37 +2993,69 @@ fn replace_image(editor: Entity<WatermarkEditor>, element_id: String, cx: &mut A
         else {
             return;
         };
+        let dir = cx.update(|cx| AppSettings::watermark_dir(cx).to_path_buf());
+        let import = cx.background_spawn({
+            let path = path.clone();
+            let dir = dir.clone();
+            async move { crate::settings_view::import_watermark_image(&path, &dir) }
+        });
+        let result = import.await;
+        if let Ok((source, _, _)) = &result
+            && editor
+                .update(cx, |editor, _| {
+                    editor.pending_assets.track(&dir, source.clone());
+                })
+                .is_err()
+        {
+            let _ = std::fs::remove_file(dir.join(source));
+            return;
+        }
         cx.update(|cx| {
-            let dir = AppSettings::watermark_dir(cx).to_path_buf();
-            let result = crate::settings_view::import_watermark_image(&path, &dir);
-            let window_handle = editor.read(cx).window_handle;
-            let _ = window_handle.update(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| match result {
-                    Ok((source, natural_w, _)) => {
-                        editor.push_undo_snapshot();
-                        if let Some(element) = editor
-                            .preset
-                            .elements
-                            .iter_mut()
-                            .find(|el| el.id == element_id)
-                        {
-                            element.kind = WatermarkKind::Image;
-                            element.image.source = source;
-                            element.image.width = initial_image_width(natural_w);
-                            element.scale = 1.0;
-                        }
-                        editor.error = None;
-                        editor.sync_controls(window, cx);
-                        editor.refresh_preview(cx);
-                    }
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        log::warn!("watermark image import failed: {message}");
-                        editor.error = Some(message);
-                        cx.notify();
-                    }
+            let Ok(window_handle) = editor.update(cx, |editor, _| editor.window_handle) else {
+                return;
+            };
+            if !window_handle
+                .update(cx, |_, window, cx| {
+                    editor
+                        .update(cx, |editor, cx| match result {
+                            Ok((source, natural_w, _)) => {
+                                editor.push_undo_snapshot();
+                                if let Some(element) = editor
+                                    .preset
+                                    .elements
+                                    .iter_mut()
+                                    .find(|el| el.id == element_id)
+                                {
+                                    element.kind = WatermarkKind::Image;
+                                    element.image.source = source;
+                                    element.image.width = initial_image_width(natural_w);
+                                    element.scale = 1.0;
+                                }
+                                editor.error = None;
+                                editor.sync_controls(window, cx);
+                                editor.refresh_preview(cx);
+                            }
+                            Err(err) => {
+                                let message = format!("{err:#}");
+                                log::warn!("watermark image import failed: {message}");
+                                editor.error = Some(message);
+                                cx.notify();
+                            }
+                        })
+                        .is_ok()
+                })
+                .is_ok_and(|applied| applied)
+            {
+                let _ = editor.update(cx, |editor, _| {
+                    let retained = watermark_retained_references(
+                        &editor.preset,
+                        &editor.undo_stack,
+                        &editor.redo_stack,
+                        editor.slider_undo_snapshot.as_ref(),
+                    );
+                    editor.pending_assets.cleanup(&retained);
                 });
-            });
+            }
         });
     })
     .detach();
@@ -3337,6 +3501,110 @@ mod tests {
         apply_align_op(&mut elements, &sizes, AlignOp::Column);
         assert_eq!(elements[1].y, 10.0);
         assert_eq!(elements[0].y, 60.0);
+    }
+
+    #[test]
+    fn pending_imports_are_removed_on_drop_but_saved_references_survive() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let pending = directory.join("pending.png");
+        let existing = directory.join("existing.png");
+        std::fs::write(&pending, b"pending").unwrap();
+        std::fs::write(&existing, b"existing").unwrap();
+
+        let mut watermark = snapit_store::WatermarkConfig::default();
+        let mut preset = WatermarkPreset::default();
+        preset.elements = vec![snapit_store::WatermarkElement::new_image(
+            "saved-image",
+            "existing.png",
+            120.0,
+        )];
+        let mut saved_template = snapit_store::WatermarkTemplate::default();
+        saved_template.name = "Saved".into();
+        saved_template.preset = preset;
+        watermark.templates.insert("saved".into(), saved_template);
+        let mut assets = PendingWatermarkAssets::new(&watermark);
+        assets.track(&directory, "pending.png".into());
+        assets.track(&directory, "existing.png".into());
+        drop(assets);
+        assert!(!pending.exists());
+        assert!(existing.exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn saving_retains_referenced_imports_and_clears_pending_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-saved-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["used.png", "unused.png"] {
+            std::fs::write(directory.join(name), b"image").unwrap();
+        }
+        let mut assets = PendingWatermarkAssets::new(&snapit_store::WatermarkConfig::default());
+        assets.track(&directory, "used.png".into());
+        assets.track(&directory, "unused.png".into());
+        assets.cleanup(&BTreeSet::from(["used.png".into()]));
+        assert!(directory.join("used.png").exists());
+        assert!(!directory.join("unused.png").exists());
+        assert!(assets.names.is_empty());
+        drop(assets);
+        assert!(directory.join("used.png").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn successful_replacement_keeps_its_managed_image() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-replaced-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["replacement.png", "undo.png", "redo.png", "slider.png"] {
+            std::fs::write(directory.join(name), b"image").unwrap();
+        }
+        let mut assets = PendingWatermarkAssets::new(&snapit_store::WatermarkConfig::default());
+        for name in ["replacement.png", "undo.png", "redo.png", "slider.png"] {
+            assets.track(&directory, name.into());
+        }
+        let image_preset = |name: &str| {
+            let mut preset = WatermarkPreset::default();
+            preset.elements = vec![snapit_store::WatermarkElement::new_image(
+                "image", name, 120.0,
+            )];
+            preset
+        };
+        let preset = image_preset("replacement.png");
+        let undo = image_preset("undo.png");
+        let redo = image_preset("redo.png");
+        let slider = image_preset("slider.png");
+        assets.cleanup(&watermark_retained_references(
+            &preset,
+            &[undo],
+            &[redo],
+            Some(&slider),
+        ));
+        drop(assets);
+        for name in ["replacement.png", "undo.png", "redo.png", "slider.png"] {
+            assert!(directory.join(name).exists());
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

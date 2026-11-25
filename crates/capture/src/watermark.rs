@@ -305,6 +305,8 @@ impl WatermarkSpec {
             self.tiled,
             self.tile_spacing_x,
             self.tile_spacing_y,
+            0,
+            height,
         )?;
         log::info!(
             "watermark raster: canvas={width}x{height}, scale={scale:.3}, design_scale={design_scale:.3}, elements={}, tile={}x{}, tiles={}, {:.2} ms",
@@ -315,6 +317,41 @@ impl WatermarkSpec {
             started.elapsed().as_secs_f64() * 1000.0
         );
         Ok(layer)
+    }
+
+    pub fn rasterize_rows(
+        &self,
+        width: u32,
+        height: u32,
+        start: u32,
+        rows: u32,
+        layout_scale: f32,
+    ) -> Result<RasterLayer> {
+        if !self.is_enabled() || width == 0 || height == 0 || rows == 0 {
+            return Ok(RasterLayer::default());
+        }
+        let start = start.min(height);
+        let rows = rows.min(height - start);
+        let scale = if layout_scale.is_finite() && layout_scale > 0.0 {
+            layout_scale
+        } else {
+            1.0
+        };
+        let stamp = self.compose_stamp(scale)?;
+        layout_tiles(
+            &stamp.image,
+            width,
+            height,
+            scale,
+            self.placement,
+            self.margin_x,
+            self.margin_y,
+            self.tiled,
+            self.tile_spacing_x,
+            self.tile_spacing_y,
+            start,
+            rows,
+        )
     }
 }
 
@@ -561,15 +598,21 @@ fn blend_hdr_pixel(
 }
 
 pub fn load_watermark_image(path: &Path) -> Result<Arc<RgbaImage>> {
-    let metadata = fs::metadata(path)
+    use std::io::Read as _;
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open watermark image {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read watermark image {}", path.display()))?;
     ensure!(
-        metadata.len() <= MAX_IMAGE_BYTES,
+        bytes.len() as u64 <= MAX_IMAGE_BYTES,
         "watermark image exceeds 16 MiB"
     );
-    let reader = ImageReader::open(path)
-        .with_context(|| format!("failed to open watermark image {}", path.display()))?
-        .with_guessed_format()?;
+    let reader = ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+        .with_guessed_format()
+        .with_context(|| format!("failed to open watermark image {}", path.display()))?;
     let format = reader.format().context("watermark image has no format")?;
     ensure!(
         matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg),
@@ -577,8 +620,7 @@ pub fn load_watermark_image(path: &Path) -> Result<Arc<RgbaImage>> {
     );
     let (width, height) = reader.into_dimensions()?;
     validate_image_dimensions(width, height)?;
-    let image = ImageReader::open(path)?
-        .with_guessed_format()?
+    let image = ImageReader::with_format(std::io::Cursor::new(bytes.as_slice()), format)
         .decode()
         .with_context(|| format!("failed to decode watermark image {}", path.display()))?
         .to_rgba8();
@@ -587,7 +629,7 @@ pub fn load_watermark_image(path: &Path) -> Result<Arc<RgbaImage>> {
         image.width(),
         image.height(),
         format_args!("{format:?}"),
-        metadata.len()
+        bytes.len()
     );
     Ok(Arc::new(image))
 }
@@ -655,14 +697,56 @@ fn composite_rgba_onto(canvas: &mut RgbaImage, overlay: &RgbaImage, dst_x: u32, 
     }
 }
 
+fn fit_image_dimensions(
+    source_width: u32,
+    source_height: u32,
+    requested_width: f32,
+    scale: f32,
+) -> Result<(u32, u32)> {
+    validate_image_dimensions(source_width, source_height)?;
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "watermark image scale must be finite and positive"
+    );
+    let natural_width = requested_width as f64 * f64::from(scale);
+    ensure!(
+        requested_width.is_finite() && requested_width > 0.0 && natural_width.is_finite(),
+        "watermark image width must be finite and positive"
+    );
+    let aspect = f64::from(source_height) / f64::from(source_width);
+    let natural_height = natural_width * aspect;
+    ensure!(
+        natural_height.is_finite() && natural_height > 0.0,
+        "watermark image height must be finite and positive"
+    );
+    let fit = 1.0_f64
+        .min(MAX_IMAGE_SIDE as f64 / natural_width)
+        .min(MAX_IMAGE_SIDE as f64 / natural_height)
+        .min((MAX_IMAGE_PIXELS as f64 / natural_width / natural_height).sqrt());
+    let fitted_width = natural_width * fit;
+    let fitted_height = natural_height * fit;
+    let (width, height) = if fitted_width * fitted_height > MAX_IMAGE_PIXELS as f64 {
+        // Rounding both axes up can cross the pixel budget by a few pixels.
+        // Flooring the already-fitted dimensions keeps the same uniform scale
+        // approximation without silently exceeding the allocation limit.
+        (
+            fitted_width.floor().max(1.0) as u32,
+            fitted_height.floor().max(1.0) as u32,
+        )
+    } else {
+        (
+            fitted_width.round().max(1.0) as u32,
+            fitted_height.round().max(1.0) as u32,
+        )
+    };
+    validate_image_dimensions(width, height)?;
+    Ok((width, height))
+}
+
 fn render_image(image: &ImageWatermark, scale: f32, opacity: f32) -> Result<RgbaImage> {
     let (source_width, source_height) = image.image.dimensions();
-    validate_image_dimensions(source_width, source_height)?;
-    let target_width =
-        ((image.width.max(1.0) as f64 * scale as f64).round() as u32).clamp(1, MAX_IMAGE_SIDE);
-    let target_height = ((target_width as f64 * source_height as f64 / source_width as f64).round()
-        as u32)
-        .clamp(1, MAX_IMAGE_SIDE);
+    let (target_width, target_height) =
+        fit_image_dimensions(source_width, source_height, image.width, scale)?;
     let mut rendered = imageops::resize(
         &*image.image,
         target_width,
@@ -710,6 +794,10 @@ fn rounded_rect_coverage(px: f32, py: f32, width: f32, height: f32, radius: f32)
 }
 
 fn render_text(text: &TextWatermark, scale: f32, opacity: f32) -> Result<RgbaImage> {
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "watermark text scale must be finite and positive"
+    );
     let fonts = if text.bold {
         bold_font_chain()
     } else {
@@ -826,8 +914,25 @@ fn render_text(text: &TextWatermark, scale: f32, opacity: f32) -> Result<RgbaIma
     min_y = min_y.floor() - pad_top;
     max_x = max_x.ceil() + pad_right;
     max_y = max_y.ceil() + pad_bottom;
-    let width = (max_x - min_x).ceil().clamp(1.0, MAX_IMAGE_SIDE as f32) as u32;
-    let height = (max_y - min_y).ceil().clamp(1.0, MAX_IMAGE_SIDE as f32) as u32;
+    let measured_width = max_x - min_x;
+    let measured_height = max_y - min_y;
+    ensure!(
+        measured_width.is_finite()
+            && measured_height.is_finite()
+            && measured_width > 0.0
+            && measured_height > 0.0,
+        "watermark text canvas must be finite and positive"
+    );
+    ensure!(
+        measured_width <= MAX_IMAGE_SIDE as f32 && measured_height <= MAX_IMAGE_SIDE as f32,
+        "watermark text canvas exceeds {MAX_IMAGE_SIDE} pixels per side"
+    );
+    let width = measured_width.ceil() as u32;
+    let height = measured_height.ceil() as u32;
+    ensure!(
+        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
+        "watermark text canvas exceeds {MAX_IMAGE_PIXELS} pixels"
+    );
 
     let total = width as usize * height as usize;
     let mut glyph_mask = vec![0u8; total];
@@ -1211,6 +1316,8 @@ fn layout_tiles(
     tiled: bool,
     spacing_x: f32,
     spacing_y: f32,
+    range_start: u32,
+    range_rows: u32,
 ) -> Result<RasterLayer> {
     let tile_width = base.width();
     let tile_height = base.height();
@@ -1240,7 +1347,8 @@ fn layout_tiles(
         | WatermarkPlacement::BottomCenter
         | WatermarkPlacement::BottomRight => extent - size - margin,
     };
-    let mut positions = Vec::new();
+    let range_end = range_start.saturating_add(range_rows).min(canvas_height);
+    let mut layer = RasterLayer::default();
     if tiled {
         let step_x = tile_width as f32 + spacing_x.max(0.0) * scale;
         let step_y = tile_height as f32 + spacing_y.max(0.0) * scale;
@@ -1256,40 +1364,68 @@ fn layout_tiles(
             (((canvas_width as f32 - margin_x - tile_width as f32) / step_x).floor() as usize)
                 .saturating_add(1)
         };
-        let rows = if margin_y >= canvas_height as f32 {
+        let first_row = if margin_y >= canvas_height as f32
+            || tile_height as f32 >= canvas_height as f32 - margin_y
+        {
             0
-        } else if tile_height as f32 >= canvas_height as f32 - margin_y {
+        } else {
+            (((range_start as f32 - margin_y).max(0.0) / step_y).floor() as usize).min(
+                (((canvas_height as f32 - margin_y - tile_height as f32) / step_y).floor()
+                    as usize)
+                    .saturating_add(1),
+            )
+        };
+        let row_end = if margin_y >= canvas_height as f32
+            || tile_height as f32 >= canvas_height as f32 - margin_y
+        {
             1
         } else {
-            (((canvas_height as f32 - margin_y - tile_height as f32) / step_y).floor() as usize)
+            (((range_end.saturating_sub(1) as f32 - margin_y).max(0.0) / step_y).floor() as usize)
                 .saturating_add(1)
+                .min(
+                    (((canvas_height as f32 - margin_y - tile_height as f32) / step_y).floor()
+                        as usize)
+                        .saturating_add(1),
+                )
         };
+        // Row-bounded export must enforce the same allocation budget as a full
+        // raster. Check the requested span, not the whole canvas: a large image
+        // is safe when each strip stays below MAX_TILES.
         ensure!(
-            columns.saturating_mul(rows) <= MAX_TILES,
+            columns.saturating_mul(row_end.saturating_sub(first_row)) <= MAX_TILES,
             "watermark tiling would create too many tiles"
         );
-        for row in 0..rows {
+        for row in first_row..row_end {
+            let y = margin_y + row as f32 * step_y;
+            if (y + tile_height as f32).max(0.0) <= range_start as f32 || y >= range_end as f32 {
+                continue;
+            }
             for column in 0..columns {
-                positions.push((
-                    margin_x + column as f32 * step_x,
-                    margin_y + row as f32 * step_y,
-                ));
+                let x = margin_x + column as f32 * step_x;
+                if let Some(tile) = clip_tile(
+                    base,
+                    x.round() as i64,
+                    y.round() as i64,
+                    canvas_width,
+                    canvas_height,
+                    range_start,
+                    range_rows,
+                ) {
+                    layer.tiles.push(tile);
+                }
             }
         }
     } else {
-        positions.push((
-            anchor(canvas_width as f32, tile_width as f32, margin_x).clamp(0.0, max_x),
-            anchor_y(canvas_height as f32, tile_height as f32, margin_y).clamp(0.0, max_y),
-        ));
-    }
-    let mut layer = RasterLayer::default();
-    for (x, y) in positions {
+        let x = anchor(canvas_width as f32, tile_width as f32, margin_x).clamp(0.0, max_x);
+        let y = anchor_y(canvas_height as f32, tile_height as f32, margin_y).clamp(0.0, max_y);
         if let Some(tile) = clip_tile(
             base,
             x.round() as i64,
             y.round() as i64,
             canvas_width,
             canvas_height,
+            range_start,
+            range_rows,
         ) {
             layer.tiles.push(tile);
         }
@@ -1303,11 +1439,16 @@ fn clip_tile(
     y: i64,
     canvas_width: u32,
     canvas_height: u32,
+    range_start: u32,
+    range_rows: u32,
 ) -> Option<RasterTile> {
+    let range_end = range_start.saturating_add(range_rows).min(canvas_height);
     let left = x.max(0).min(canvas_width as i64) as u32;
-    let top = y.max(0).min(canvas_height as i64) as u32;
+    let top = y.max(range_start as i64).min(range_end as i64) as u32;
     let right = (x + base.width() as i64).max(0).min(canvas_width as i64) as u32;
-    let bottom = (y + base.height() as i64).max(0).min(canvas_height as i64) as u32;
+    let bottom = (y + base.height() as i64)
+        .max(range_start as i64)
+        .min(range_end as i64) as u32;
     if right <= left || bottom <= top {
         return None;
     }
@@ -1323,7 +1464,7 @@ fn clip_tile(
     Some(RasterTile {
         bounds: PixelRect {
             x: left,
-            y: top,
+            y: top - range_start,
             width,
             height,
         },
@@ -1444,6 +1585,36 @@ mod tests {
     }
 
     #[test]
+    fn image_fit_preserves_aspect_ratio_at_extreme_ratios() {
+        assert_eq!(
+            fit_image_dimensions(8_000, 1, 100_000.0, 1.0).unwrap(),
+            (8_192, 1)
+        );
+        assert_eq!(
+            fit_image_dimensions(1, 8_000, 100_000.0, 1.0).unwrap(),
+            (1, 8_192)
+        );
+        assert_eq!(fit_image_dimensions(3, 1, 10.0, 1.0).unwrap(), (10, 3));
+    }
+
+    #[test]
+    fn image_fit_obeys_the_pixel_budget_without_independent_clamping() {
+        let (width, height) = fit_image_dimensions(4_000, 4_000, 20_000.0, 1.0).unwrap();
+        assert_eq!((width, height), (8_192, 8_192));
+        assert!(u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS);
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(fit_image_dimensions(4, 4, invalid, 1.0).is_err());
+            assert!(fit_image_dimensions(4, 4, 4.0, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn overlong_text_returns_an_error_instead_of_dropping_glyphs() {
+        let error = render_text(&sample_text(&"W".repeat(10_000)), 1.0, 1.0).unwrap_err();
+        assert!(error.to_string().contains("text canvas exceeds"));
+    }
+
+    #[test]
     fn text_watermark_raster_has_visible_colored_pixels() {
         let spec = WatermarkSpec {
             elements: vec![WatermarkElement {
@@ -1466,6 +1637,148 @@ mod tests {
                 .iter()
                 .any(|pixel| pixel[3] > 0 && pixel[..3] == [250, 204, 21])
         );
+    }
+
+    #[test]
+    fn tiled_rows_match_full_rasterization_across_strip_boundaries() {
+        let spec = WatermarkSpec {
+            elements: vec![WatermarkElement {
+                kind: WatermarkElementKind::Text(sample_text("SnapIt")),
+                x: 0.0,
+                y: 0.0,
+                rotation_degrees: 0.0,
+                scale: 1.0,
+                opacity: 1.0,
+            }],
+            tiled: true,
+            tile_spacing_x: 13.0,
+            tile_spacing_y: 9.0,
+            ..WatermarkSpec::default()
+        };
+        let width = 160;
+        let height = 97;
+        let scale = 1.5;
+        let mut full = RgbaImage::new(width, height);
+        spec.rasterize(width, height, scale)
+            .unwrap()
+            .apply_sdr_mut(&mut full);
+        for start in [0, 17, 32, 63, 96] {
+            let rows = (height - start).min(23);
+            let mut strip = RgbaImage::new(width, rows);
+            let layer = spec
+                .rasterize_rows(width, height, start, rows, scale)
+                .unwrap();
+            for tile in &layer.tiles {
+                for row in 0..tile.bounds.height as usize {
+                    let source = row * tile.bounds.width as usize;
+                    let target_y = tile.bounds.y + row as u32;
+                    let target = (target_y * width + tile.bounds.x) as usize;
+                    for (dst, src) in strip
+                        .as_mut()
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .skip(target)
+                        .take(tile.bounds.width as usize)
+                        .zip(&tile.pixels[source..source + tile.bounds.width as usize])
+                    {
+                        blend_straight_rgba_pixel(dst, *src);
+                    }
+                }
+            }
+            let expected = image::imageops::crop_imm(&full, 0, start, width, rows).to_image();
+            if strip != expected {
+                let mismatch = strip
+                    .pixels()
+                    .zip(expected.pixels())
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap();
+                panic!(
+                    "strip starting at row {start} differs at pixel {mismatch}: {:?} != {:?}",
+                    strip
+                        .get_pixel(mismatch as u32 % width, mismatch as u32 / width)
+                        .0,
+                    expected
+                        .get_pixel(mismatch as u32 % width, mismatch as u32 / width)
+                        .0
+                );
+            }
+        }
+    }
+
+    fn tiled_pixel_spec() -> WatermarkSpec {
+        WatermarkSpec {
+            elements: vec![WatermarkElement {
+                kind: WatermarkElementKind::Image(ImageWatermark {
+                    image: Arc::new(RgbaImage::from_pixel(
+                        1,
+                        1,
+                        image::Rgba([255, 255, 255, 255]),
+                    )),
+                    width: 1.0,
+                    corner_radius: 0.0,
+                }),
+                x: 0.0,
+                y: 0.0,
+                rotation_degrees: 0.0,
+                scale: 1.0,
+                opacity: 1.0,
+            }],
+            margin_x: 0.0,
+            margin_y: 0.0,
+            tiled: true,
+            tile_spacing_x: 0.0,
+            tile_spacing_y: 0.0,
+            ..WatermarkSpec::default()
+        }
+    }
+
+    #[test]
+    fn row_rasterization_enforces_the_tile_budget_for_the_requested_span() {
+        let spec = tiled_pixel_spec();
+        for (start, rows) in [(0, 5_000), (2_500, 1)] {
+            let error = spec
+                .rasterize_rows(5_000, 5_000, start, rows, 1.0)
+                .unwrap_err();
+            assert!(error.to_string().contains("too many tiles"), "{error:#}");
+        }
+
+        // The budget is per strip, not per full canvas: 64 * 64 is exactly the
+        // limit and must remain usable even though the full 64 * 5000 is not.
+        assert_eq!(
+            spec.rasterize_rows(64, 5_000, 100, 64, 1.0)
+                .unwrap()
+                .tiles
+                .len(),
+            MAX_TILES
+        );
+        assert!(
+            spec.rasterize_rows(64, 5_000, 100, 65, 1.0)
+                .unwrap_err()
+                .to_string()
+                .contains("too many tiles")
+        );
+    }
+
+    #[test]
+    fn row_rasterization_counts_an_oversized_base_in_each_column() {
+        let base = RgbaImage::new(1, 5_000);
+        let error = layout_tiles(
+            &base,
+            5_000,
+            5_000,
+            1.0,
+            WatermarkPlacement::TopLeft,
+            0.0,
+            0.0,
+            true,
+            0.0,
+            0.0,
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("too many tiles"), "{error:#}");
     }
 
     #[test]
@@ -1669,6 +1982,8 @@ mod tests {
             false,
             10.0,
             10.0,
+            0,
+            8,
         )
         .unwrap();
         assert_eq!(layer.tiles.len(), 1);
@@ -1693,6 +2008,8 @@ mod tests {
             false,
             10.0,
             10.0,
+            0,
+            8,
         )
         .unwrap();
         assert_eq!(
@@ -1720,6 +2037,8 @@ mod tests {
             true,
             2.0,
             1.0,
+            0,
+            6,
         )
         .unwrap();
         assert_eq!(layer.tiles.len(), 4);
@@ -1751,6 +2070,8 @@ mod tests {
             false,
             1.0,
             1.0,
+            0,
+            1,
         )
         .unwrap();
         let mut image = RgbaImage::from_raw(1, 1, vec![0, 0, 0, 255]).unwrap();
@@ -1772,6 +2093,8 @@ mod tests {
             false,
             1.0,
             1.0,
+            0,
+            1,
         )
         .unwrap();
         let mut transparent = RgbaImage::from_raw(1, 1, vec![0, 0, 0, 0]).unwrap();
@@ -1797,6 +2120,8 @@ mod tests {
             true,
             1.0,
             1.0,
+            0,
+            8,
         )
         .unwrap();
         assert_eq!(layer.tiles.len(), 1);
@@ -1833,6 +2158,8 @@ mod tests {
             false,
             1.0,
             1.0,
+            0,
+            2,
         )
         .unwrap();
         let result = layer.apply_hdr_owned(image);

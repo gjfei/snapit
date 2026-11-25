@@ -124,6 +124,12 @@ fn main() {
         }
     };
 
+    // The single-instance lock is held, so no peer can be writing these files.
+    // Cleanup retains the newest file because the pasteboard may still contain
+    // its persistent file URL from the previous launch.
+    clipboard::cleanup_clipboard_files(&dirs.clipboard_dir());
+    snapit_capture::cleanup_stale_disk_images();
+
     // Register the OS callbacks before the event loop can produce any hotkey or
     // menu event; see `events::install` for why the ordering is required.
     let (events, incoming) = events::install();

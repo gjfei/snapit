@@ -538,7 +538,16 @@ mod tests {
             Ok(engine) => {
                 assert_eq!(engine.name(), "Windows.Media.Ocr");
                 let image = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
-                let _ = engine.recognize(&image);
+                let blocks = engine
+                    .recognize(&image)
+                    .expect("constructed Windows.Media.Ocr engine should recognize a bitmap");
+                for block in blocks {
+                    assert!(!block.text.trim().is_empty());
+                    assert!(block.bounds.x.is_finite() && block.bounds.x >= 0.0);
+                    assert!(block.bounds.y.is_finite() && block.bounds.y >= 0.0);
+                    assert!(block.bounds.width.is_finite() && block.bounds.width >= 0.0);
+                    assert!(block.bounds.height.is_finite() && block.bounds.height >= 0.0);
+                }
             }
             Err(err) => {
                 let msg = format!("{err:#}");

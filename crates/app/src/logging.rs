@@ -10,11 +10,12 @@
 //! # Correlation IDs
 //!
 //! A screenshot or recording spawns background work, so a plain thread-local
-//! would not follow the work across threads. We keep the active operation id in
-//! an atomic slot: [`begin_capture`]/[`begin_recording`] publish a fresh id and
-//! [`clear_operation`] retires it. The logger stamps every line with the active
-//! id, so one capture's freeze → HDR decision → crop → encode → save lines can
-//! be grepped with a single tag, e.g. `grep '\[cap#12\]' snapit.log`.
+//! would not follow the work across threads. We keep the active operation kind
+//! and id in one atomic encoded value: [`begin_capture`]/[`begin_recording`]
+//! publish a fresh id and [`retire_operation`] retires only that id. The logger
+//! takes one consistent snapshot, so one capture's freeze → HDR decision → crop
+//! → encode → save lines can be grepped with a single tag, e.g.
+//! `grep '\[cap#12\]' snapit.log`.
 
 use std::{
     fs::{File, OpenOptions},
@@ -28,10 +29,34 @@ use chrono::Local;
 /// Max size before the current log is rotated to `snapit.log.old` (8 MiB).
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
-/// 0 means "no operation active". Format is `cap` / `rec` plus a monotonic id.
+const KIND_BITS: u32 = 2;
+const KIND_MASK: u64 = (1 << KIND_BITS) - 1;
+const MAX_OPERATION_ID: u64 = u64::MAX >> KIND_BITS;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static ACTIVE_KIND: AtomicU64 = AtomicU64::new(0); // 0 none, 1 capture, 2 recording
-static ACTIVE_ID: AtomicU64 = AtomicU64::new(0);
+/// 0 means idle; otherwise `(id << 2) | kind`. Kind and id are always read in
+/// one load, rather than from two independently racing atomics.
+static ACTIVE_OPERATION: AtomicU64 = AtomicU64::new(0);
+
+fn encode_operation(id: u64, kind: u64) -> Option<u64> {
+    (id != 0 && id <= MAX_OPERATION_ID && (1..=3).contains(&kind))
+        .then_some((id << KIND_BITS) | kind)
+}
+
+fn decode_operation(encoded: u64) -> Option<(u64, u64)> {
+    let kind = encoded & KIND_MASK;
+    let id = encoded >> KIND_BITS;
+    encode_operation(id, kind).map(|_| (id, kind))
+}
+
+/// The CAS result for retiring `id`: `None` means a newer operation owns the
+/// slot, while `Some(0)` means this operation was retired.
+#[allow(dead_code)] // Used by the retirement API and its lifecycle tests.
+fn retire_matching(encoded: u64, id: u64) -> Option<u64> {
+    decode_operation(encoded)
+        .is_some_and(|(current, _)| current == id)
+        .then_some(0)
+}
 
 /// Publish a new capture id and return it for callers that want to log it too.
 pub fn begin_capture() -> u64 {
@@ -49,21 +74,41 @@ pub fn begin_scroll() -> u64 {
 }
 
 fn begin(kind: u64) -> u64 {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    ACTIVE_ID.store(id, Ordering::Relaxed);
-    ACTIVE_KIND.store(kind, Ordering::Relaxed);
+    let id = NEXT_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0 && current < MAX_OPERATION_ID).then_some(current + 1)
+        })
+        .expect("operation id space exhausted");
+    let encoded = encode_operation(id, kind).expect("valid operation kind");
+    ACTIVE_OPERATION.store(encoded, Ordering::Relaxed);
     id
 }
 
-fn tag() -> Option<String> {
-    let kind = ACTIVE_KIND.load(Ordering::Relaxed);
-    let id = ACTIVE_ID.load(Ordering::Relaxed);
-    match (kind, id) {
-        (1, n) if n != 0 => Some(format!("cap#{n}")),
-        (2, n) if n != 0 => Some(format!("rec#{n}")),
-        (3, n) if n != 0 => Some(format!("scr#{n}")),
-        _ => None,
+/// Retire the active operation only if `id` still owns the correlation slot.
+/// Returns `false` when a later capture/record/scroll has replaced it.
+#[allow(dead_code)] // Controller/scroll lifecycle integration calls this next.
+pub fn retire_operation(id: u64) -> bool {
+    let mut current = ACTIVE_OPERATION.load(Ordering::Acquire);
+    loop {
+        let Some(next) = retire_matching(current, id) else {
+            return false;
+        };
+        match ACTIVE_OPERATION.compare_exchange(current, next, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
     }
+}
+
+fn tag() -> Option<String> {
+    let (id, kind) = decode_operation(ACTIVE_OPERATION.load(Ordering::Acquire))?;
+    Some(match kind {
+        1 => format!("cap#{id}"),
+        2 => format!("rec#{id}"),
+        3 => format!("scr#{id}"),
+        _ => unreachable!("decode_operation validates the kind"),
+    })
 }
 
 struct FileSink {
@@ -409,10 +454,67 @@ mod tests {
     }
 
     #[test]
-    fn scroll_tag_formats_with_scr_prefix() {
-        let id = begin_scroll();
-        assert_eq!(tag(), Some(format!("scr#{id}")));
-        ACTIVE_KIND.store(0, Ordering::Relaxed);
-        ACTIVE_ID.store(0, Ordering::Relaxed);
+    fn operation_encoding_round_trips_without_mixed_kind_and_id() {
+        for (id, kind, expected) in [
+            (1, 1, "cap#1"),
+            (2, 2, "rec#2"),
+            (3, 3, "scr#3"),
+            (MAX_OPERATION_ID, 3, "scr#4611686018427387903"),
+        ] {
+            let encoded = encode_operation(id, kind).unwrap();
+            assert_eq!(decode_operation(encoded), Some((id, kind)));
+            let (decoded_id, decoded_kind) = decode_operation(encoded).unwrap();
+            assert_eq!(
+                Some(match decoded_kind {
+                    1 => format!("cap#{decoded_id}"),
+                    2 => format!("rec#{decoded_id}"),
+                    3 => format!("scr#{decoded_id}"),
+                    _ => unreachable!(),
+                }),
+                Some(expected.to_string())
+            );
+        }
+        assert_eq!(encode_operation(0, 1), None);
+        assert_eq!(encode_operation(MAX_OPERATION_ID + 1, 1), None);
+        assert_eq!(encode_operation(1, 0), None);
+        assert_eq!(encode_operation(1, 4), None);
+        assert_eq!(decode_operation(0), None);
+        assert_eq!(decode_operation(3), None);
+    }
+
+    #[test]
+    fn retiring_an_old_operation_cannot_clear_a_newer_snapshot() {
+        let capture = encode_operation(7, 1).unwrap();
+        let recording = encode_operation(8, 2).unwrap();
+        assert_eq!(retire_matching(capture, 7), Some(0));
+        assert_eq!(retire_matching(capture, 8), None);
+        assert_eq!(retire_matching(recording, 7), None);
+        assert_eq!(retire_matching(recording, 8), Some(0));
+        assert_eq!(retire_matching(0, 7), None);
+    }
+
+    #[test]
+    fn concurrent_retirement_uses_a_compare_exchange_loop() {
+        let initial = encode_operation(7, 3).unwrap();
+        let newer = encode_operation(8, 1).unwrap();
+        let mut current = initial;
+        let mut attempts = 0;
+        let retired = loop {
+            let Some(next) = retire_matching(current, 7) else {
+                break false;
+            };
+            attempts += 1;
+            match current {
+                // Simulate a new operation publishing between the load and CAS.
+                value if value == initial && attempts == 1 => current = newer,
+                value if value == initial => {
+                    current = next;
+                    break true;
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert!(!retired);
+        assert_eq!(current, newer);
     }
 }

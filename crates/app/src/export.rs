@@ -1,13 +1,13 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use anyhow::{Result, ensure};
 use snapit_capture::{
-    HdrImage, ImageWatermark, RgbaImage, TextWatermark, WatermarkElement, WatermarkElementKind,
-    WatermarkPlacement, WatermarkSpec, load_watermark_image,
+    HdrImage, ImageSource, ImageWatermark, RgbaImage, TextWatermark, WatermarkElement,
+    WatermarkElementKind, WatermarkPlacement, WatermarkSpec, load_watermark_image,
 };
 use snapit_store::{
     WatermarkKind as ConfigKind, WatermarkPlacement as ConfigPlacement, WatermarkPreset,
@@ -106,18 +106,19 @@ pub fn watermark_spec(config: &WatermarkPreset, image_dir: &Path) -> Result<Wate
 }
 
 pub struct ExportComposition {
-    clean_sdr: Arc<RgbaImage>,
-    hdr_source: Mutex<Option<Arc<HdrImage>>>,
+    clean_sdr: Arc<ImageSource>,
+    hdr_source: Option<Arc<HdrImage>>,
     shapes: Arc<Vec<Shape>>,
     watermark: Arc<WatermarkSpec>,
     layout_scale: f32,
     result: OnceLock<std::result::Result<Arc<ExportResult>, String>>,
+    result_lock: Mutex<()>,
     frozen_png: Option<Arc<Vec<u8>>>,
     frozen_hdr: bool,
 }
 
 pub enum ExportResult {
-    Sdr(Arc<RgbaImage>),
+    Sdr(Arc<ImageSource>),
     Hdr(HdrExport),
 }
 
@@ -129,33 +130,37 @@ pub struct HdrExport {
 
 impl ExportComposition {
     pub fn new(
-        clean_sdr: Arc<RgbaImage>,
+        clean_sdr: impl Into<ImageSource>,
         hdr: Option<Arc<HdrImage>>,
         shapes: Arc<Vec<Shape>>,
         watermark: Arc<WatermarkSpec>,
         layout_scale: f32,
     ) -> Self {
         Self {
-            clean_sdr,
-            hdr_source: Mutex::new(hdr),
+            clean_sdr: Arc::new(clean_sdr.into()),
+            hdr_source: hdr,
             shapes,
             watermark,
             layout_scale,
             result: OnceLock::new(),
+            result_lock: Mutex::new(()),
             frozen_png: None,
             frozen_hdr: false,
         }
     }
 
     pub fn frozen(png: Arc<Vec<u8>>, preview: Arc<RgbaImage>, hdr: bool) -> Self {
-        let result = Arc::new(ExportResult::Sdr(preview.clone()));
+        let result = Arc::new(ExportResult::Sdr(Arc::new(ImageSource::Memory(
+            preview.clone(),
+        ))));
         Self {
-            clean_sdr: preview,
-            hdr_source: Mutex::new(None),
+            clean_sdr: Arc::new(ImageSource::Memory(preview)),
+            hdr_source: None,
             shapes: Arc::new(Vec::new()),
             watermark: Arc::new(WatermarkSpec::default()),
             layout_scale: 1.0,
             result: OnceLock::from(Ok::<_, String>(result)),
+            result_lock: Mutex::new(()),
             frozen_png: Some(png),
             frozen_hdr: hdr,
         }
@@ -165,73 +170,198 @@ impl ExportComposition {
         self.frozen_hdr || matches!(self.result().map(|result| result.is_hdr()), Ok(true))
     }
 
+    pub fn dimensions(&self) -> (u32, u32) {
+        self.hdr_source
+            .as_ref()
+            .map(|image| (image.width(), image.height()))
+            .unwrap_or_else(|| self.clean_sdr.dimensions())
+    }
+
     pub fn result(&self) -> std::result::Result<Arc<ExportResult>, String> {
-        self.result
-            .get_or_init(|| {
-                let started = std::time::Instant::now();
-                let hdr = self
-                    .hdr_source
-                    .lock()
-                    .expect("HDR export source lock poisoned")
-                    .take();
-                let has_shapes = !self.shapes.is_empty();
-                let has_watermark = self.watermark.is_enabled();
-                let result = match hdr {
-                    Some(hdr) if has_shapes || has_watermark => {
-                        let image = Arc::try_unwrap(hdr).unwrap_or_else(|hdr| (*hdr).clone());
-                        let image = bake_hdr(image, &self.shapes, self.layout_scale)?;
-                        let layer = self
-                            .watermark
-                            .rasterize(image.width(), image.height(), self.layout_scale)
-                            .map_err(|err| format!("{err:#}"))?;
-                        let image = Arc::new(layer.apply_hdr_owned(image));
-                        log::info!(
-                            "export composition: HDR annotations={has_shapes} watermark={has_watermark} {:.1} ms",
-                            started.elapsed().as_secs_f64() * 1000.0
-                        );
-                        ExportResult::Hdr(HdrExport {
-                            image,
-                            preview: OnceLock::new(),
-                            png: OnceLock::new(),
-                        })
+        let _serial = self
+            .result_lock
+            .lock()
+            .expect("export result lock poisoned");
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        let started = std::time::Instant::now();
+        let has_shapes = !self.shapes.is_empty();
+        let has_watermark = self.watermark.is_enabled();
+        let result = match self.hdr_source.as_ref() {
+            Some(hdr) if has_shapes || has_watermark => {
+                let image = bake_hdr((**hdr).clone(), &self.shapes, self.layout_scale)?;
+                let layer = self
+                    .watermark
+                    .rasterize(image.width(), image.height(), self.layout_scale)
+                    .map_err(|err| format!("{err:#}"))?;
+                let image = Arc::new(layer.apply_hdr_owned(image));
+                log::info!(
+                    "export composition: HDR annotations={has_shapes} watermark={has_watermark} {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                ExportResult::Hdr(HdrExport {
+                    image,
+                    preview: OnceLock::new(),
+                    png: OnceLock::new(),
+                })
+            }
+            Some(hdr) => ExportResult::Hdr(HdrExport {
+                image: hdr.clone(),
+                preview: OnceLock::new(),
+                png: OnceLock::new(),
+            }),
+            None => {
+                let image = if self.clean_sdr.is_disk() && (has_shapes || has_watermark) {
+                    let output = snapit_capture::DiskImage::create(
+                        self.clean_sdr.width(),
+                        self.clean_sdr.height(),
+                    )
+                    .map_err(|error| format!("{error:#}"))?;
+                    let rows_per_batch = (8 * 1024 * 1024
+                        / (self.clean_sdr.width() as usize * 4).max(1))
+                    .clamp(1, 2048) as u32;
+                    for start in (0..self.clean_sdr.height()).step_by(rows_per_batch as usize) {
+                        let rows = rows_per_batch.min(self.clean_sdr.height() - start);
+                        let strip = crate::annotate::bake_strip(
+                            &self.clean_sdr,
+                            start,
+                            rows,
+                            &self.shapes,
+                            &self.watermark,
+                            self.layout_scale,
+                        )
+                        .map_err(|error| format!("{error:#}"))?;
+                        output
+                            .write_rows_at(start, &strip)
+                            .map_err(|error| format!("{error:#}"))?;
                     }
-                    Some(hdr) => ExportResult::Hdr(HdrExport {
-                        image: hdr,
-                        preview: OnceLock::new(),
-                        png: OnceLock::new(),
-                    }),
-                    None => {
-                        let image = if has_shapes || has_watermark {
-                            let mut image = (*self.clean_sdr).clone();
-                            bake(&mut image, &self.shapes, self.layout_scale);
-                            let layer = self
-                                .watermark
-                                .rasterize(image.width(), image.height(), self.layout_scale)
-                                .map_err(|err| format!("{err:#}"))?;
-                            {
-                                layer.apply_sdr_mut(&mut image);
-                                Arc::new(image)
-                            }
-                        } else {
-                            self.clean_sdr.clone()
-                        };
-                        log::info!(
-                            "export composition: SDR annotations={has_shapes} watermark={has_watermark} {:.1} ms",
-                            started.elapsed().as_secs_f64() * 1000.0
-                        );
-                        ExportResult::Sdr(image)
+                    Arc::new(ImageSource::Disk(Arc::new(output)))
+                } else if has_shapes || has_watermark {
+                    let mut image = self
+                        .clean_sdr
+                        .memory()
+                        .expect("disk composition handled above")
+                        .as_ref()
+                        .clone();
+                    bake(&mut image, &self.shapes, self.layout_scale);
+                    let layer = self
+                        .watermark
+                        .rasterize(image.width(), image.height(), self.layout_scale)
+                        .map_err(|err| format!("{err:#}"))?;
+                    {
+                        layer.apply_sdr_mut(&mut image);
+                        Arc::new(ImageSource::Memory(Arc::new(image)))
                     }
+                } else {
+                    self.clean_sdr.clone()
                 };
-                Ok(Arc::new(result))
-            })
-            .clone()
+                log::info!(
+                    "export composition: SDR annotations={has_shapes} watermark={has_watermark} {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                ExportResult::Sdr(image)
+            }
+        };
+        let result = Ok::<_, String>(Arc::new(result));
+        let _ = self.result.set(result.clone());
+        result
     }
 
     pub fn sdr_preview(&self) -> std::result::Result<Arc<RgbaImage>, String> {
         Ok(match self.result()?.as_ref() {
-            ExportResult::Sdr(image) => image.clone(),
+            ExportResult::Sdr(image) => match image.as_ref() {
+                ImageSource::Memory(image) => image.clone(),
+                ImageSource::Disk(image) => Arc::new(
+                    image
+                        .thumbnail(2048, 2048)
+                        .map_err(|error| format!("{error:#}"))?,
+                ),
+            },
             ExportResult::Hdr(export) => export.sdr_preview(),
         })
+    }
+
+    pub fn write_png(&self, path: &std::path::Path) -> std::result::Result<(), String> {
+        if let Some(png) = &self.frozen_png {
+            return std::fs::write(path, png.as_slice()).map_err(|error| format!("{error:#}"));
+        }
+        match self.result()?.as_ref() {
+            ExportResult::Sdr(image) => {
+                image.encode_png(path).map_err(|error| format!("{error:#}"))
+            }
+            ExportResult::Hdr(export) => {
+                std::fs::write(path, export.png()?.as_slice()).map_err(|error| format!("{error:#}"))
+            }
+        }
+    }
+
+    pub fn clipboard_uses_file(&self) -> bool {
+        match self.result().ok().as_deref() {
+            Some(ExportResult::Sdr(image)) => matches!(image.as_ref(), ImageSource::Disk(_)),
+            _ => false,
+        }
+    }
+
+    pub fn write_clipboard_png(&self, dir: &Path) -> std::result::Result<PathBuf, String> {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{error:#}"))?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100 {
+            let path = dir.join(format!(
+                "snapit-copy-{}-{nonce}-{attempt}.png",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("{error:#}")),
+            }
+            if let Err(error) = self.write_png(&path) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            return Ok(path);
+        }
+        Err("failed to reserve a clipboard image file".to_string())
+    }
+
+    pub fn write_jpeg(&self, path: &Path, quality: u8) -> std::result::Result<(), String> {
+        const MAX_JPEG_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+        let (width, height) = self.dimensions();
+        let source_bytes = u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(4);
+        if source_bytes > MAX_JPEG_SOURCE_BYTES {
+            return Err(
+                "JPEG export of this image exceeds the bounded in-memory encoder budget; save as PNG instead"
+                    .to_string(),
+            );
+        }
+        match self.result()?.as_ref() {
+            ExportResult::Sdr(image) => match image.as_ref() {
+                ImageSource::Memory(image) => snapit_capture::save_jpeg(image, path, quality)
+                    .map_err(|error| format!("{error:#}")),
+                ImageSource::Disk(image) => {
+                    let rgba = image
+                        .read_rows(0, height)
+                        .map_err(|error| format!("{error:#}"))?;
+                    snapit_capture::save_jpeg(&rgba, path, quality)
+                        .map_err(|error| format!("{error:#}"))
+                }
+            },
+            ExportResult::Hdr(export) => {
+                let preview = export.sdr_preview();
+                snapit_capture::save_jpeg(&preview, path, quality)
+                    .map_err(|error| format!("{error:#}"))
+            }
+        }
     }
 
     pub fn png(&self) -> std::result::Result<Arc<Vec<u8>>, String> {
@@ -239,9 +369,15 @@ impl ExportComposition {
             return Ok(png.clone());
         }
         match self.result()?.as_ref() {
-            ExportResult::Sdr(image) => snapit_capture::encode_png(image)
-                .map(Arc::new)
-                .map_err(|err| format!("{err:#}")),
+            ExportResult::Sdr(image) => match image.as_ref() {
+                ImageSource::Memory(image) => snapit_capture::encode_png(image)
+                    .map(Arc::new)
+                    .map_err(|err| format!("{err:#}")),
+                ImageSource::Disk(_) => Err(
+                    "disk-backed PNG must be written to a file instead of copied into memory"
+                        .to_string(),
+                ),
+            },
             ExportResult::Hdr(export) => export.png(),
         }
     }
@@ -425,6 +561,38 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_hdr_composition_keeps_one_hdr_result() {
+        let source = hdr_sample(256, 192, 2.0);
+        let composition = Arc::new(ExportComposition::new(
+            Arc::new(source.to_sdr()),
+            Some(Arc::new(source)),
+            Arc::new(Vec::new()),
+            Arc::new(text_watermark()),
+            1.0,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let composition = composition.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    composition.result().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let first = &results[0];
+        for result in &results {
+            assert!(result.is_hdr());
+            assert!(Arc::ptr_eq(first, result));
+        }
+    }
+
+    #[test]
     fn frozen_history_png_is_returned_verbatim() {
         let bytes = Arc::new(vec![1_u8, 2, 3, 4]);
         let preview = Arc::new(RgbaImage::new(2, 2));
@@ -447,5 +615,90 @@ mod tests {
         let preview = composition.sdr_preview().unwrap();
         assert_ne!(preview.as_raw(), clean.as_raw());
         assert_eq!(preview.get_pixel(47, 31).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn disk_composition_matches_memory_composition() {
+        let source = RgbaImage::from_fn(96, 160, |x, y| {
+            image::Rgba([x as u8 * 2, y as u8, (x + y) as u8, 255])
+        });
+        let shapes = Arc::new(vec![Shape::Rect {
+            from: [8.0, 20.0],
+            to: [70.0, 130.0],
+            style: crate::annotate::Style::default(),
+        }]);
+        let watermark = Arc::new(text_watermark());
+        let memory =
+            ExportComposition::new(source.clone(), None, shapes.clone(), watermark.clone(), 1.0);
+        let disk = ExportComposition::new(
+            ImageSource::Disk(Arc::new(
+                snapit_capture::DiskImage::from_image(&source).unwrap(),
+            )),
+            None,
+            shapes,
+            watermark,
+            1.0,
+        );
+        let expected = memory.result().unwrap();
+        let actual = disk.result().unwrap();
+        let ExportResult::Sdr(expected) = expected.as_ref() else {
+            panic!("expected SDR");
+        };
+        let ExportResult::Sdr(actual) = actual.as_ref() else {
+            panic!("expected SDR");
+        };
+        assert!(actual.is_disk());
+        for start in [0, 31, 97, 159] {
+            let rows = (160 - start).min(37);
+            assert_eq!(
+                actual.read_rows(start, rows).unwrap(),
+                expected.read_rows(start, rows).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn disk_clipboard_export_keeps_png_on_disk() {
+        let source = RgbaImage::from_pixel(32, 64, image::Rgba([20, 40, 60, 255]));
+        let composition = ExportComposition::new(
+            ImageSource::Disk(Arc::new(
+                snapit_capture::DiskImage::from_image(&source).unwrap(),
+            )),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(WatermarkSpec::default()),
+            1.0,
+        );
+        assert!(composition.clipboard_uses_file());
+        assert!(composition.png().is_err());
+        let dir = std::env::temp_dir().join(format!(
+            "snapit-export-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let path = composition.write_clipboard_png(&dir).unwrap();
+        assert!(path.exists());
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_jpeg_export_fails_before_materializing_the_image() {
+        let image = snapit_capture::DiskImage::create(8192, 2049).unwrap();
+        let composition = ExportComposition::new(
+            ImageSource::Disk(Arc::new(image)),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(WatermarkSpec::default()),
+            1.0,
+        );
+        let error = composition
+            .write_jpeg(Path::new("unused.jpg"), 90)
+            .unwrap_err();
+        assert!(error.contains("save as PNG"));
     }
 }

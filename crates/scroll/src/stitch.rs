@@ -11,15 +11,20 @@
 //!   micro-scroll drift while handling fast jumps cleanly.
 //! - Places stitch seams in the minimum-difference row near the middle of the
 //!   overlap band, avoiding drop shadows cast by sticky headers/footers.
-//! - Absorbs macOS/Windows rubber-band bounce and emits incremental downscaled
-//!   preview tiles capped at 1024 px height per tile.
+//! - Absorbs macOS/Windows rubber-band bounce and publishes one bounded,
+//!   downscaled preview of the currently visible canvas range.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
+use crate::paged_rows::PagedRows;
+use anyhow::{Context as _, Result, bail};
 use image::RgbaImage;
+use snapit_capture::DiskImage;
 
 const PREVIEW_MAX_WIDTH: u32 = 320;
-const PREVIEW_TILE_MAX_HEIGHT: u32 = 1024;
 const FINE_MAX_WIDTH: usize = 512;
 const COARSE_STRIDE: usize = 4;
 const MAX_FINE_ROWS: usize = 64;
@@ -27,6 +32,7 @@ const MAX_COARSE_CANDIDATES: usize = 6;
 const MAX_MATCH_MAD: f32 = 7.5;
 const MIN_INLIER_RATIO: f32 = 0.88;
 const INLIER_THRESHOLD: u8 = 12;
+static NEXT_PREVIEW_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollDirection {
@@ -41,14 +47,24 @@ pub enum ScrollWarning {
     LowTexture,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeedOutcome {
     Initial,
     Unchanged,
-    Moved,
-    Stitched { dy: i32, total_height: u32 },
+    Moved {
+        dy: i32,
+    },
+    Stitched {
+        dy: i32,
+        total_height: u32,
+    },
     Warning(ScrollWarning),
+    DimensionsChanged {
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
     MaxHeightReached,
+    Failed(String),
 }
 
 /// One vertical slice of the downscaled live preview, with a stable id and
@@ -229,19 +245,12 @@ fn sample_grid(raw: &[u8], w: usize, h: usize) -> [u32; 64] {
     grid
 }
 
+#[derive(Clone)]
 struct Anchor {
     profile: Arc<FrameProfile>,
     /// Virtual y coordinate (in canvas active-band space) where `profile`'s
     /// `active_top` currently lands.
     y: i32,
-}
-
-struct TileChunk {
-    id: u64,
-    revision: u64,
-    /// Start row in full assembled canvas (from top of header).
-    /// Stored lazily via slice bounds relative to active/header/footer.
-    image: Arc<RgbaImage>,
 }
 
 /// Real-time stateful stitcher for one scrolling screenshot session.
@@ -255,12 +264,8 @@ pub struct Stitcher {
     cand_bottom_votes: Option<(u32, u32)>,
     header_rows: Vec<u8>,
     footer_rows: Vec<u8>,
-    /// Active rows at y >= 0, stored top-to-bottom.
-    below: Vec<u8>,
+    rows: PagedRows,
     below_rows: u32,
-    /// Active rows at y < 0, stored bottom-to-top (row `-1` is at index `0`)
-    /// so prepending upwards is an O(1) append.
-    above: Vec<u8>,
     above_rows: u32,
     committed: Option<Anchor>,
     prev: Option<Anchor>,
@@ -271,8 +276,9 @@ pub struct Stitcher {
     frames: usize,
     max_height_hit: bool,
     preview_revision: u64,
-    next_tile_id: u64,
-    tiles: Vec<TileChunk>,
+    preview_range: (u32, u32),
+    preview: Option<PreviewTile>,
+    preview_dirty: bool,
 }
 
 impl Stitcher {
@@ -287,9 +293,8 @@ impl Stitcher {
             cand_bottom_votes: None,
             header_rows: Vec::new(),
             footer_rows: Vec::new(),
-            below: Vec::new(),
+            rows: PagedRows::new(0),
             below_rows: 0,
-            above: Vec::new(),
             above_rows: 0,
             committed: None,
             prev: None,
@@ -300,8 +305,9 @@ impl Stitcher {
             frames: 0,
             max_height_hit: false,
             preview_revision: 0,
-            next_tile_id: 1,
-            tiles: Vec::new(),
+            preview_range: (0, 1),
+            preview: None,
+            preview_dirty: true,
         }
     }
 
@@ -325,19 +331,47 @@ impl Stitcher {
         (self.fixed_top, self.fixed_bottom)
     }
 
+    pub fn content_shift(&self) -> u32 {
+        self.above_rows
+    }
+
     pub fn preview_revision(&self) -> u64 {
         self.preview_revision
     }
 
-    pub fn preview_tiles(&self) -> Vec<PreviewTile> {
-        self.tiles
-            .iter()
-            .map(|tile| PreviewTile {
-                id: tile.id,
-                revision: tile.revision,
-                image: tile.image.clone(),
-            })
-            .collect()
+    pub fn preview_tile(&self) -> Option<PreviewTile> {
+        self.preview.clone()
+    }
+
+    pub fn preview_range(&self) -> (u32, u32) {
+        self.preview_range
+    }
+
+    pub fn set_preview_range(&mut self, start: u32, rows: u32) {
+        let height = self.total_height();
+        let start = start.min(height);
+        let rows = rows.max(1).min(height.saturating_sub(start).max(1));
+        if self.preview_range != (start, rows) {
+            self.preview_range = (start, rows);
+            self.preview_dirty = true;
+        }
+    }
+
+    pub fn refresh_preview(&mut self) -> Result<()> {
+        if !self.preview_dirty || self.width == 0 {
+            return Ok(());
+        }
+        let (start, rows) = self.preview_range;
+        let prev_w = self.width.clamp(1, PREVIEW_MAX_WIDTH);
+        let image = Arc::new(self.render_preview_slice(prev_w, start, start + rows)?);
+        self.preview_revision = NEXT_PREVIEW_REVISION.fetch_add(1, Ordering::Relaxed);
+        self.preview = Some(PreviewTile {
+            id: 0,
+            revision: self.preview_revision,
+            image,
+        });
+        self.preview_dirty = false;
+        Ok(())
     }
 
     /// Feed one captured SDR RGBA frame. Returns what changed.
@@ -346,23 +380,29 @@ impl Stitcher {
         if w == 0 || h == 0 {
             return FeedOutcome::Unchanged;
         }
-        let curr = Arc::new(FrameProfile::from_image(image, self.config.scale));
-
         if self.committed.is_none() {
-            self.initialize(curr);
-            return FeedOutcome::Initial;
+            return match self
+                .initialize(Arc::new(FrameProfile::from_image(image, self.config.scale)))
+            {
+                Ok(()) => FeedOutcome::Initial,
+                Err(error) => FeedOutcome::Failed(format!("{error:#}")),
+            };
         }
 
         if w != self.width || h != self.frame_height {
             log::warn!(
-                "scroll frame dimension changed {}x{} -> {}x{}; ignoring frame",
+                "scroll frame dimension changed {}x{} -> {}x{}; aborting session",
                 self.width,
                 self.frame_height,
                 w,
                 h
             );
-            return FeedOutcome::Unchanged;
+            return FeedOutcome::DimensionsChanged {
+                expected: (self.width, self.frame_height),
+                actual: (w, h),
+            };
         }
+        let curr = Arc::new(FrameProfile::from_image(image, self.config.scale));
 
         if self
             .prev
@@ -375,7 +415,10 @@ impl Stitcher {
         self.frames += 1;
         let (eff_top, eff_bottom) =
             if let Some(prev_profile) = self.prev.as_ref().map(|p| p.profile.clone()) {
-                self.update_fixed_margins(&prev_profile, &curr)
+                match self.update_fixed_margins(&prev_profile, &curr) {
+                    Ok(margins) => margins,
+                    Err(error) => return FeedOutcome::Failed(format!("{error:#}")),
+                }
             } else {
                 (self.fixed_top, self.fixed_bottom)
             };
@@ -418,7 +461,10 @@ impl Stitcher {
                 match prev_match {
                     Some((prev_y, Ok(dy))) => {
                         if let Some(prev_profile) = self.prev.as_ref().map(|p| p.profile.clone()) {
-                            hit_cap |= self.commit_frame(prev_profile, prev_y);
+                            match self.commit_frame(prev_profile, prev_y) {
+                                Ok(hit) => hit_cap |= hit,
+                                Err(error) => return FeedOutcome::Failed(format!("{error:#}")),
+                            }
                         }
                         (prev_y, dy)
                     }
@@ -449,6 +495,22 @@ impl Stitcher {
 
         let next_y = base_y + shift;
         let step_from_prev = next_y - self.viewport_y;
+        let before_h = self.total_height();
+        let pending_direction = self
+            .prev
+            .as_ref()
+            .zip(self.committed.as_ref())
+            .map(|(prev, committed)| (prev.y - committed.y).signum())
+            .filter(|direction| *direction != 0);
+        if pending_direction
+            .is_some_and(|direction| step_from_prev != 0 && direction != step_from_prev.signum())
+        {
+            let previous: Anchor = self.prev.as_ref().expect("checked pending anchor").clone();
+            match self.commit_frame(previous.profile, previous.y) {
+                Ok(hit) => hit_cap |= hit,
+                Err(error) => return FeedOutcome::Failed(format!("{error:#}")),
+            }
+        }
         if step_from_prev > 0 {
             self.direction = ScrollDirection::Down;
             self.last_dy = Some(step_from_prev);
@@ -464,17 +526,32 @@ impl Stitcher {
         let anchor_y = self.committed.as_ref().map_or(0, |a| a.y);
         let delta_from_anchor = next_y - anchor_y;
 
-        let before_h = self.total_height();
         if delta_from_anchor.abs() >= commit_threshold {
-            hit_cap |= self.commit_frame(curr.clone(), next_y);
+            match self.commit_frame(curr.clone(), next_y) {
+                Ok(hit) => hit_cap |= hit,
+                Err(error) => return FeedOutcome::Failed(format!("{error:#}")),
+            }
         } else {
             // Even before committing a brand new anchor, update footer if we
             // are at the bottommost position so preview/end stays fresh.
             if next_y + active_h as i32 >= self.below_rows as i32 {
                 self.update_footer(&curr);
+                if self.fixed_bottom > 0 {
+                    let footer_start = self.total_height() - self.fixed_bottom;
+                    if let Err(error) =
+                        self.refresh_preview_range(footer_start, self.total_height())
+                    {
+                        return FeedOutcome::Failed(format!("{error:#}"));
+                    }
+                }
             }
             if next_y <= -(self.above_rows as i32) {
                 self.update_header(&curr);
+                if self.fixed_top > 0
+                    && let Err(error) = self.refresh_preview_range(0, self.fixed_top)
+                {
+                    return FeedOutcome::Failed(format!("{error:#}"));
+                }
             }
         }
 
@@ -482,6 +559,9 @@ impl Stitcher {
             profile: curr,
             y: next_y,
         });
+        if let Err(error) = self.refresh_preview() {
+            return FeedOutcome::Failed(format!("{error:#}"));
+        }
 
         let after_h = self.total_height();
         if hit_cap || self.max_height_hit {
@@ -494,55 +574,92 @@ impl Stitcher {
                 total_height: after_h,
             }
         } else {
-            FeedOutcome::Moved
+            FeedOutcome::Moved { dy: step_from_prev }
         }
     }
 
     /// Commit any un-spliced trailing/leading scroll delta (called after idle or
     /// right before assembling the final image).
-    pub fn flush_pending(&mut self) -> bool {
+    pub fn flush_pending(&mut self) -> Result<bool> {
         let Some(prev) = self.prev.as_ref() else {
-            return false;
+            return Ok(false);
         };
         let committed_y = self.committed.as_ref().map_or(prev.y, |a| a.y);
         if prev.y == committed_y {
-            return false;
+            return Ok(false);
         }
         let before = self.total_height();
         let profile = prev.profile.clone();
         let y = prev.y;
-        self.commit_frame(profile, y);
-        self.total_height() != before
+        self.commit_frame(profile, y)?;
+        Ok(self.total_height() != before)
     }
 
-    /// Assemble the complete stitched RGBA image.
-    pub fn assemble(&mut self) -> Option<RgbaImage> {
-        self.flush_pending();
+    /// Assemble the complete stitched RGBA image. Intended for tests and small
+    /// legacy callers; production uses `assemble_disk` to keep RAM bounded.
+    pub fn assemble(&mut self) -> Result<Option<RgbaImage>> {
+        self.flush_pending()?;
         if self.width == 0 || self.total_height() == 0 {
-            return None;
+            return Ok(None);
         }
         let stride = self.width as usize * 4;
         let total_h = self.total_height();
         let mut out = Vec::with_capacity(total_h as usize * stride);
         out.extend_from_slice(&self.header_rows);
-        for row in (0..self.above_rows as usize).rev() {
-            let start = row * stride;
-            out.extend_from_slice(&self.above[start..start + stride]);
+        let mut row = vec![0u8; stride];
+        for y in -(self.above_rows as i32)..0 {
+            row.copy_from_slice(&self.rows.read_row(y)?);
+            out.extend_from_slice(&row);
         }
-        out.extend_from_slice(&self.below);
+        let mut active = vec![0u8; self.below_rows as usize * stride];
+        self.rows.copy_to(0, self.below_rows, &mut active)?;
+        out.extend_from_slice(&active);
         out.extend_from_slice(&self.footer_rows);
-        RgbaImage::from_raw(self.width, total_h, out)
+        Ok(RgbaImage::from_raw(self.width, total_h, out))
     }
 
-    fn initialize(&mut self, first: Arc<FrameProfile>) {
+    pub fn assemble_disk(&mut self) -> Result<Option<DiskImage>> {
+        self.flush_pending()?;
+        if self.width == 0 || self.total_height() == 0 {
+            return Ok(None);
+        }
+        let output = DiskImage::create(self.width, self.total_height())?;
+        if self.fixed_top > 0 {
+            let header = RgbaImage::from_raw(self.width, self.fixed_top, self.header_rows.clone())
+                .context("invalid stitched header")?;
+            output.write_rows_at(0, &header)?;
+        }
+        let active = self.rows.assemble()?.context("missing active canvas")?;
+        let active_rows = self.above_rows + self.below_rows;
+        let batch_rows = (8 * 1024 * 1024 / (self.width as usize * 4).max(1)) as u32;
+        for start in (0..active_rows).step_by(batch_rows as usize) {
+            let rows = batch_rows.min(active_rows - start);
+            let image = active.read_rows(start, rows)?;
+            output.write_rows_at(self.fixed_top + start, &image)?;
+        }
+        if self.fixed_bottom > 0 {
+            let footer =
+                RgbaImage::from_raw(self.width, self.fixed_bottom, self.footer_rows.clone())
+                    .context("invalid stitched footer")?;
+            output.write_rows_at(self.total_height() - self.fixed_bottom, &footer)?;
+        }
+        Ok(Some(output))
+    }
+
+    fn initialize(&mut self, first: Arc<FrameProfile>) -> Result<()> {
+        if first.height > self.config.max_height {
+            bail!(
+                "first frame height {} exceeds configured maximum {}",
+                first.height,
+                self.config.max_height
+            );
+        }
         self.width = first.width;
         self.frame_height = first.height;
         self.frames = 1;
-        let stride = first.row_bytes();
-        self.below.clear();
-        self.below.extend_from_slice(first.image.as_raw());
+        self.rows = PagedRows::new(first.width);
+        self.rows.append_down(0, first.image.as_raw())?;
         self.below_rows = first.height;
-        self.above.clear();
         self.above_rows = 0;
         self.header_rows.clear();
         self.footer_rows.clear();
@@ -562,22 +679,26 @@ impl Stitcher {
             profile: first,
             y: 0,
         });
-        let _ = stride;
-        self.rebuild_all_preview_tiles();
+        self.preview_dirty = true;
+        self.refresh_preview()
     }
 
     /// Update consensus on fixed top/bottom sticky bars. Only textured static
     /// bands qualify so plain whitespace is never misclassified.
     /// Returns temporary `(search_top, search_bottom)` margins to shield shift
     /// estimation even on the very first moving frame.
-    fn update_fixed_margins(&mut self, prev: &FrameProfile, curr: &FrameProfile) -> (u32, u32) {
+    fn update_fixed_margins(
+        &mut self,
+        prev: &FrameProfile,
+        curr: &FrameProfile,
+    ) -> Result<(u32, u32)> {
         let h = self.frame_height as usize;
         if h < 96 || prev.fine_w == 0 {
-            return (self.fixed_top, self.fixed_bottom);
+            return Ok((self.fixed_top, self.fixed_bottom));
         }
         let max_band = (h * 35 / 100).min(h / 2 - 24);
         if max_band < 8 {
-            return (self.fixed_top, self.fixed_bottom);
+            return Ok((self.fixed_top, self.fixed_bottom));
         }
         let mut row_diff = vec![0.0_f32; h];
         for (y, diff) in row_diff.iter_mut().enumerate().take(h) {
@@ -592,7 +713,7 @@ impl Stitcher {
         }
         let moving_rows = row_diff.iter().filter(|&&d| d > 5.0).count();
         if moving_rows < h / 6 {
-            return (self.fixed_top, self.fixed_bottom);
+            return Ok((self.fixed_top, self.fixed_bottom));
         }
 
         // Top sticky scan: stop at 4 consecutive moving rows. Include textured
@@ -677,50 +798,47 @@ impl Stitcher {
         if (next_top != self.fixed_top || next_bottom != self.fixed_bottom)
             && next_top + next_bottom + min_active <= self.frame_height
         {
-            self.apply_fixed_margins(next_top, next_bottom, curr);
+            self.apply_fixed_margins(next_top, next_bottom, curr)?;
         }
 
         let eff_top = self.fixed_top.max(cand_top);
         let eff_bottom = self.fixed_bottom.max(cand_bottom);
         if eff_top + eff_bottom + min_active <= self.frame_height {
-            (eff_top, eff_bottom)
+            Ok((eff_top, eff_bottom))
         } else {
-            (self.fixed_top, self.fixed_bottom)
+            Ok((self.fixed_top, self.fixed_bottom))
         }
     }
 
     /// Re-slice the already-captured initial canvas rows once fixed top/bottom
     /// margins are discovered on the first moving frames.
-    fn apply_fixed_margins(&mut self, new_top: u32, new_bottom: u32, curr: &FrameProfile) {
-        let stride = curr.row_bytes();
+    fn apply_fixed_margins(
+        &mut self,
+        new_top: u32,
+        new_bottom: u32,
+        curr: &FrameProfile,
+    ) -> Result<()> {
         let old_top = self.fixed_top;
         let old_bottom = self.fixed_bottom;
         if new_top > old_top {
-            let delta = (new_top - old_top) as usize;
-            let take = delta.min(self.below_rows as usize);
+            let take = (new_top - old_top).min(self.above_rows + self.below_rows);
             if take > 0 {
-                // In `below`, row 0 was `old_top`. Moving `take` rows to
-                // `header_rows` shifts canvas row indices by `-take`, while each
-                // anchor's `active_top` shifts by `+take` — they cancel out, so
-                // `committed.y`, `prev.y`, and `viewport_y` remain unchanged.
-                self.header_rows
-                    .extend_from_slice(&self.below[..take * stride]);
-                self.below.drain(..take * stride);
-                self.below_rows -= take as u32;
+                let from_above = take.min(self.above_rows);
+                self.rows.trim_top_with_origin_shift(take, from_above)?;
+                self.above_rows -= from_above;
+                self.below_rows -= take - from_above;
+                self.fixed_top += take;
+                self.update_header(curr);
             }
-            self.fixed_top = new_top;
         }
         if new_bottom > old_bottom {
-            let delta = (new_bottom - old_bottom) as usize;
-            let take = delta.min(self.below_rows as usize);
+            let take = (new_bottom - old_bottom).min(self.below_rows);
             if take > 0 {
-                let split = (self.below_rows as usize - take) * stride;
-                let mut new_footer = self.below.split_off(split);
-                new_footer.extend_from_slice(&self.footer_rows);
-                self.footer_rows = new_footer;
-                self.below_rows -= take as u32;
+                self.rows.trim_bottom(take)?;
+                self.below_rows -= take;
+                self.fixed_bottom += take;
+                self.update_footer(curr);
             }
-            self.fixed_bottom = new_bottom;
         }
         log::info!(
             "scroll fixed margins updated: top={} bottom={} (active_h={})",
@@ -728,7 +846,7 @@ impl Stitcher {
             self.fixed_bottom,
             self.frame_height - self.fixed_top - self.fixed_bottom
         );
-        self.rebuild_all_preview_tiles();
+        self.rebuild_all_preview_tiles()
     }
 
     fn update_header(&mut self, curr: &FrameProfile) {
@@ -752,12 +870,12 @@ impl Stitcher {
 
     /// Splice `frame` whose active top lands at virtual `y` into `below`/`above`.
     /// Returns true if the height cap was reached.
-    fn commit_frame(&mut self, frame: Arc<FrameProfile>, y: i32) -> bool {
+    fn commit_frame(&mut self, frame: Arc<FrameProfile>, y: i32) -> Result<bool> {
         let active_top = self.fixed_top;
         let active_bottom = self.frame_height - self.fixed_bottom;
         let active_h = active_bottom.saturating_sub(active_top);
         if active_h == 0 {
-            return false;
+            return Ok(false);
         }
         let stride = frame.row_bytes();
         let top_extent = -(self.above_rows as i32);
@@ -768,14 +886,12 @@ impl Stitcher {
         // span, move anchor without adding duplicate rows.
         if y >= top_extent && y_end <= bottom_extent {
             self.committed = Some(Anchor { profile: frame, y });
-            return false;
+            return Ok(false);
         }
 
-        let max_active = self
-            .config
-            .max_height
-            .saturating_sub(self.fixed_top + self.fixed_bottom);
+        let max_active = self.max_active_height();
         let mut hit_cap = false;
+        let mut did_splice = false;
 
         // Downward growth: y_end > bottom_extent
         if y_end > bottom_extent {
@@ -786,41 +902,57 @@ impl Stitcher {
             } else {
                 let allow_end = if needed > room {
                     hit_cap = true;
+                    log::info!(
+                        "scroll configured height cap: width={} max={} active_max={}",
+                        self.width,
+                        self.config.max_height,
+                        max_active
+                    );
                     bottom_extent + room as i32
                 } else {
                     y_end
                 };
 
-                // Choose minimum-difference seam row in the middle 30%..70% of the
-                // overlap between [0..bottom_extent] and [y..allow_end].
-                let overlap_start = y.max(top_extent);
-                let overlap_end = bottom_extent.min(allow_end);
-                let seam_y = if overlap_end > overlap_start + 8 {
-                    self.best_seam_down(&frame, y, active_top, overlap_start, overlap_end)
-                } else {
-                    bottom_extent
-                };
+                if y <= bottom_extent && allow_end >= y {
+                    // Choose minimum-difference seam row in the middle 30%..70% of the
+                    // overlap between [0..bottom_extent] and [y..allow_end].
+                    let overlap_start = y.max(top_extent);
+                    let overlap_end = bottom_extent.min(allow_end);
+                    let seam_y = if overlap_end > overlap_start + 8 {
+                        self.best_seam_down(&frame, y, active_top, overlap_start, overlap_end)?
+                    } else {
+                        bottom_extent
+                    };
 
-                // Overwrite existing `below` rows from `seam_y.max(0)`..`bottom_extent`,
-                // then append new rows `bottom_extent`..`allow_end`.
-                let overwrite_start = seam_y.max(0);
-                for cy in overwrite_start..bottom_extent {
-                    let src_row = (cy - y) as u32 + active_top;
-                    let src = frame.raw_rows(src_row, src_row + 1);
-                    let dst_off = cy as usize * stride;
-                    if dst_off + stride <= self.below.len() {
-                        self.below[dst_off..dst_off + stride].copy_from_slice(src);
+                    // Overwrite existing `below` rows from `seam_y.max(0)`..`bottom_extent`,
+                    // then append new rows `bottom_extent`..`allow_end`.
+                    let overwrite_start = seam_y.max(0);
+                    if overwrite_start < bottom_extent {
+                        let src_start = (overwrite_start - y) as u32 + active_top;
+                        let src_end = (bottom_extent - y) as u32 + active_top;
+                        self.rows.write_rows(
+                            overwrite_start,
+                            (bottom_extent - overwrite_start) as u32,
+                            frame.raw_rows(src_start, src_end),
+                        )?;
                     }
+                    if allow_end > bottom_extent {
+                        let src_start = (bottom_extent - y) as u32 + active_top;
+                        let src_end = (allow_end - y) as u32 + active_top;
+                        self.rows
+                            .append_down(bottom_extent, frame.raw_rows(src_start, src_end))?;
+                        self.below_rows += (allow_end - bottom_extent) as u32;
+                    }
+                    self.update_footer(&frame);
+                    let dirty_start = self.active_to_canvas(overwrite_start.max(0));
+                    let dirty_end = self.active_to_canvas(allow_end);
+                    self.refresh_preview_range(dirty_start, dirty_end)?;
+                    if self.fixed_bottom > 0 {
+                        let footer_start = self.total_height() - self.fixed_bottom;
+                        self.refresh_preview_range(footer_start, self.total_height())?;
+                    }
+                    did_splice = true;
                 }
-                if allow_end > bottom_extent {
-                    let src_start = (bottom_extent - y) as u32 + active_top;
-                    let src_end = (allow_end - y) as u32 + active_top;
-                    self.below
-                        .extend_from_slice(frame.raw_rows(src_start, src_end));
-                    self.below_rows += (allow_end - bottom_extent) as u32;
-                }
-                self.update_footer(&frame);
-                self.refresh_bottom_preview_tiles();
             }
         }
 
@@ -830,6 +962,12 @@ impl Stitcher {
             let room = max_active.saturating_sub(self.above_rows + self.below_rows);
             let allow_new = if delta_up > room {
                 hit_cap = true;
+                log::info!(
+                    "scroll configured height cap: width={} max={} active_max={}",
+                    self.width,
+                    self.config.max_height,
+                    max_active
+                );
                 room
             } else {
                 delta_up
@@ -838,156 +976,154 @@ impl Stitcher {
             // least 24 px or non-trivial texture in the newly exposed top band.
             let allow_y = top_extent - allow_new as i32;
             let newly_exposed_has_texture = {
-                let start_r = active_top as usize;
-                let end_r = (active_top + allow_new).min(active_bottom) as usize;
-                frame.row_grad[start_r..end_r].iter().any(|&g| g >= 1.5)
+                let start_r = (allow_y.max(y) - y) as u32 + active_top;
+                let end_r = (top_extent.min(y_end) - y) as u32 + active_top;
+                frame.row_grad[start_r as usize..end_r as usize]
+                    .iter()
+                    .any(|&g| g >= 1.5)
             };
-            if allow_new > 0
+            if y_end >= top_extent
+                && allow_y <= y_end
+                && allow_new > 0
                 && (self.upward_established || allow_new >= 24 || newly_exposed_has_texture)
             {
                 self.upward_established = true;
                 let overlap_start = top_extent;
-                let overlap_end = (y + active_h as i32).min(bottom_extent);
+                let overlap_end = y_end.min(bottom_extent);
                 let seam_y = if overlap_end > overlap_start + 8 {
-                    self.best_seam_up(&frame, y, active_top, overlap_start, overlap_end)
+                    self.best_seam_up(&frame, y, active_top, overlap_start, overlap_end)?
                 } else {
                     top_extent
                 };
 
                 // Overwrite existing rows in [top_extent .. seam_y] (which may
                 // span `above` and/or top of `below`).
-                for cy in top_extent..seam_y {
-                    let src_row = (cy - y) as u32 + active_top;
-                    let src = frame.raw_rows(src_row, src_row + 1);
-                    if cy < 0 {
-                        let idx = (-cy - 1) as usize;
-                        let dst_off = idx * stride;
-                        if dst_off + stride <= self.above.len() {
-                            self.above[dst_off..dst_off + stride].copy_from_slice(src);
-                        }
-                    } else {
-                        let dst_off = cy as usize * stride;
-                        if dst_off + stride <= self.below.len() {
-                            self.below[dst_off..dst_off + stride].copy_from_slice(src);
-                        }
-                    }
+                if top_extent < seam_y {
+                    let src_start = (top_extent - y) as u32 + active_top;
+                    let src_end = (seam_y - y) as u32 + active_top;
+                    self.rows.write_rows(
+                        top_extent,
+                        (seam_y - top_extent) as u32,
+                        frame.raw_rows(src_start, src_end),
+                    )?;
                 }
-
-                // Append rows y = -above_rows - 1 down to allow_y into `above`.
-                for cy in (allow_y..top_extent).rev() {
+                // Prepend the newly exposed rows in top-to-bottom order.
+                let mut pixels = Vec::with_capacity(allow_new as usize * stride);
+                for cy in allow_y..top_extent {
                     let src_row = (cy - y) as u32 + active_top;
-                    self.above
-                        .extend_from_slice(frame.raw_rows(src_row, src_row + 1));
-                    self.above_rows += 1;
+                    pixels.extend_from_slice(frame.raw_rows(src_row, src_row + 1));
                 }
+                self.rows.prepend_up(top_extent, &pixels)?;
+                self.above_rows += allow_new;
                 self.update_header(&frame);
-                self.rebuild_all_preview_tiles();
+                self.rebuild_all_preview_tiles()?;
+                did_splice = true;
             }
         }
 
-        self.committed = Some(Anchor { profile: frame, y });
-        hit_cap
+        if did_splice {
+            self.committed = Some(Anchor { profile: frame, y });
+        }
+        Ok(hit_cap)
+    }
+
+    fn active_to_canvas(&self, y: i32) -> u32 {
+        let active_index = if y < 0 {
+            (self.above_rows as i64 + i64::from(y)).clamp(0, self.above_rows as i64) as u32
+        } else {
+            (self.above_rows as i64 + i64::from(y))
+                .clamp(0, (self.above_rows + self.below_rows) as i64) as u32
+        };
+        self.fixed_top.saturating_add(active_index)
+    }
+
+    fn max_active_height(&self) -> u32 {
+        self.config
+            .max_height
+            .saturating_sub(self.fixed_top + self.fixed_bottom)
     }
 
     fn best_seam_down(
-        &self,
+        &mut self,
         frame: &FrameProfile,
         frame_y: i32,
         active_top: u32,
         overlap_start: i32,
         overlap_end: i32,
-    ) -> i32 {
+    ) -> Result<i32> {
         let span = overlap_end - overlap_start;
         let lo = overlap_start + span * 3 / 10;
         let hi = (overlap_start + span * 7 / 10).max(lo + 1);
-        let stride = frame.row_bytes();
         let mut best_y = (lo + hi) / 2;
         let mut best_diff = u64::MAX;
         let step_x = (self.width as usize / 64).max(1);
         for cy in lo..hi {
             let src_row = (cy - frame_y) as u32 + active_top;
             let src = frame.raw_rows(src_row, src_row + 1);
-            let existing = if cy >= 0 {
-                let off = cy as usize * stride;
-                &self.below[off..off + stride]
-            } else {
-                let idx = (-cy - 1) as usize;
-                let off = idx * stride;
-                &self.above[off..off + stride]
-            };
-            let diff = sampled_row_diff(existing, src, step_x);
+            let existing = self.rows.read_row(cy)?;
+            let diff = sampled_row_diff(&existing, src, step_x);
             if diff < best_diff {
                 best_diff = diff;
                 best_y = cy;
             }
         }
-        best_y
+        Ok(best_y)
     }
 
     fn best_seam_up(
-        &self,
+        &mut self,
         frame: &FrameProfile,
         frame_y: i32,
         active_top: u32,
         overlap_start: i32,
         overlap_end: i32,
-    ) -> i32 {
+    ) -> Result<i32> {
         // Same mid-overlap minimum-difference search.
         self.best_seam_down(frame, frame_y, active_top, overlap_start, overlap_end)
     }
 
     /// Read one full-canvas row (0..total_height) without assembling the full
     /// output buffer.
-    fn canvas_row(&self, y: u32) -> &[u8] {
+    fn canvas_row(&mut self, y: u32) -> Result<Vec<u8>> {
         let stride = self.width as usize * 4;
         let y = y as usize;
         let h_top = self.fixed_top as usize;
         if y < h_top {
             let off = y * stride;
-            return &self.header_rows[off..off + stride];
+            return Ok(self.header_rows[off..off + stride].to_vec());
         }
         let y = y - h_top;
         let above_len = self.above_rows as usize;
         if y < above_len {
-            let idx = above_len - 1 - y;
-            let off = idx * stride;
-            return &self.above[off..off + stride];
+            let row = -(above_len as i64) + y as i64;
+            return self.rows.read_row(row as i32);
         }
         let y = y - above_len;
         let below_len = self.below_rows as usize;
         if y < below_len {
-            let off = y * stride;
-            return &self.below[off..off + stride];
+            return self.rows.read_row(y as i32);
         }
         let y = y - below_len;
         let off = y * stride;
-        &self.footer_rows[off..off + stride]
-    }
-
-    fn preview_dimensions(&self) -> (u32, u32, u32) {
-        let full_w = self.width.max(1);
-        let full_h = self.total_height().max(1);
-        let prev_w = full_w.clamp(1, PREVIEW_MAX_WIDTH);
-        let prev_h = ((full_h as f64 * prev_w as f64 / full_w as f64).round() as u32).max(1);
-        (prev_w, prev_h, full_h)
+        Ok(self.footer_rows[off..off + stride].to_vec())
     }
 
     fn render_preview_slice(
-        &self,
+        &mut self,
         prev_w: u32,
-        prev_h: u32,
-        full_h: u32,
-        py0: u32,
-        py1: u32,
-    ) -> RgbaImage {
-        let tile_h = (py1 - py0).max(1);
-        let mut rgba = vec![0u8; prev_w as usize * tile_h as usize * 4];
+        source_y0: u32,
+        source_y1: u32,
+    ) -> Result<RgbaImage> {
+        let source_y1 = source_y1.max(source_y0 + 1).min(self.total_height().max(1));
         let full_w = self.width as usize;
+        let source_h = source_y1 - source_y0;
+        let tile_h =
+            ((source_h as u64 * prev_w as u64).div_ceil(full_w.max(1) as u64) as u32).max(1);
+        let mut rgba = vec![0u8; prev_w as usize * tile_h as usize * 4];
         for dy in 0..tile_h {
-            let py = py0 + dy;
-            let src_y =
-                ((py as u64 * full_h as u64) / prev_h as u64).min((full_h - 1) as u64) as u32;
-            let src_row = self.canvas_row(src_y);
+            let source_y = source_y0
+                + ((dy as u64 * full_w.max(1) as u64 / prev_w as u64) as u32).min(source_h - 1);
+            let src_row = self.canvas_row(source_y)?;
             let dst_off = dy as usize * prev_w as usize * 4;
             for px in 0..prev_w {
                 let src_x =
@@ -997,55 +1133,17 @@ impl Stitcher {
                 rgba[d..d + 4].copy_from_slice(&src_row[s..s + 4]);
             }
         }
-        RgbaImage::from_raw(prev_w, tile_h, rgba).expect("preview tile buffer size matches")
+        RgbaImage::from_raw(prev_w, tile_h, rgba).context("preview tile buffer size mismatch")
     }
 
-    fn rebuild_all_preview_tiles(&mut self) {
-        let (prev_w, prev_h, full_h) = self.preview_dimensions();
-        let count = prev_h.div_ceil(PREVIEW_TILE_MAX_HEIGHT) as usize;
-        self.tiles.clear();
-        for ix in 0..count {
-            let py0 = ix as u32 * PREVIEW_TILE_MAX_HEIGHT;
-            let py1 = (py0 + PREVIEW_TILE_MAX_HEIGHT).min(prev_h);
-            let id = self.next_tile_id;
-            self.next_tile_id += 1;
-            let image = Arc::new(self.render_preview_slice(prev_w, prev_h, full_h, py0, py1));
-            self.tiles.push(TileChunk {
-                id,
-                revision: 1,
-                image,
-            });
-        }
-        self.preview_revision = self.preview_revision.wrapping_add(1);
+    fn rebuild_all_preview_tiles(&mut self) -> Result<()> {
+        self.preview_dirty = true;
+        self.refresh_preview()
     }
 
-    /// Update only the bottom tile(s) when scrolling downward.
-    fn refresh_bottom_preview_tiles(&mut self) {
-        if self.tiles.is_empty() {
-            self.rebuild_all_preview_tiles();
-            return;
-        }
-        let (prev_w, prev_h, full_h) = self.preview_dimensions();
-        let needed = prev_h.div_ceil(PREVIEW_TILE_MAX_HEIGHT) as usize;
-        let first_dirty = self.tiles.len().saturating_sub(1);
-        for ix in first_dirty..needed {
-            let py0 = ix as u32 * PREVIEW_TILE_MAX_HEIGHT;
-            let py1 = (py0 + PREVIEW_TILE_MAX_HEIGHT).min(prev_h);
-            let image = Arc::new(self.render_preview_slice(prev_w, prev_h, full_h, py0, py1));
-            if let Some(existing) = self.tiles.get_mut(ix) {
-                existing.revision = existing.revision.wrapping_add(1);
-                existing.image = image;
-            } else {
-                let id = self.next_tile_id;
-                self.next_tile_id += 1;
-                self.tiles.push(TileChunk {
-                    id,
-                    revision: 1,
-                    image,
-                });
-            }
-        }
-        self.preview_revision = self.preview_revision.wrapping_add(1);
+    fn refresh_preview_range(&mut self, _start: u32, _end: u32) -> Result<()> {
+        self.preview_dirty = true;
+        Ok(())
     }
 }
 
@@ -1383,7 +1481,7 @@ mod tests {
             let frame = viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false);
             let _ = stitcher.feed(frame);
         }
-        let result = stitcher.assemble().unwrap();
+        let result = stitcher.assemble().unwrap().unwrap();
         assert_eq!(result.dimensions(), (400, 1800));
         assert_eq!(result.as_raw(), doc.as_raw());
     }
@@ -1397,9 +1495,44 @@ mod tests {
             let frame = viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false);
             let _ = stitcher.feed(frame);
         }
-        let result = stitcher.assemble().unwrap();
+        let result = stitcher.assemble().unwrap().unwrap();
         assert_eq!(result.dimensions(), (360, 1400));
+        let first = result
+            .as_raw()
+            .iter()
+            .zip(doc.as_raw())
+            .position(|(a, b)| a != b);
+        assert_eq!(
+            first.map(|index| (index / 4, index % 4)),
+            None,
+            "pixel mismatch"
+        );
+    }
+
+    #[test]
+    fn changing_direction_preserves_the_complete_document() {
+        let doc = make_document(360, 1800);
+        let view_h = 440;
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [520, 400, 220, 60, 0, 240, 600, 820, 1000, 1180, 1360] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false));
+        }
+        assert!(stitcher.content_shift() > 0);
+        let result = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(result.dimensions(), doc.dimensions());
         assert_eq!(result.as_raw(), doc.as_raw());
+    }
+
+    #[test]
+    fn upward_scroll_keeps_sticky_margins_once() {
+        let doc = make_document(420, 1300);
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [700, 884, 700, 520, 340, 120, 0] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, 500, 48, 36, true, true));
+        }
+        let result = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(result.height(), 1384);
+        assert_eq!(stitcher.fixed_margins(), (48, 36));
     }
 
     #[test]
@@ -1421,7 +1554,7 @@ mod tests {
             );
             let _ = stitcher.feed(frame);
         }
-        let result = stitcher.assemble().unwrap();
+        let result = stitcher.assemble().unwrap().unwrap();
         let (ft, fb) = stitcher.fixed_margins();
         assert!(ft >= sticky_top - 4 && ft <= sticky_top + 4, "ft={ft}");
         assert!(
@@ -1462,7 +1595,7 @@ mod tests {
             let frame = viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false);
             let _ = stitcher.feed(frame);
         }
-        let result = stitcher.assemble().unwrap();
+        let result = stitcher.assemble().unwrap().unwrap();
         assert_eq!(result.dimensions(), (360, 1000));
         assert_eq!(result.as_raw(), doc.as_raw());
     }
@@ -1478,7 +1611,7 @@ mod tests {
         ));
         assert!(matches!(
             stitcher.feed(viewport_frame(&doc, 160, view_h, 0, 0, false, false)),
-            FeedOutcome::Stitched { .. } | FeedOutcome::Moved
+            FeedOutcome::Stitched { .. } | FeedOutcome::Moved { .. }
         ));
         // Jump far past overlap -> TooFast warning
         let outcome = stitcher.feed(viewport_frame(&doc, 800, view_h, 0, 0, false, false));
@@ -1486,25 +1619,194 @@ mod tests {
         // Scroll back into overlap with anchor (340) -> recovers cleanly
         let recover = stitcher.feed(viewport_frame(&doc, 340, view_h, 0, 0, false, false));
         assert!(
-            matches!(recover, FeedOutcome::Stitched { .. } | FeedOutcome::Moved),
+            matches!(
+                recover,
+                FeedOutcome::Stitched { .. } | FeedOutcome::Moved { .. }
+            ),
             "expected recovery, got {recover:?}"
         );
     }
 
     #[test]
-    fn max_height_and_incremental_preview_tiles_work() {
+    fn dimension_change_is_an_explicit_failure() {
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        assert_eq!(
+            stitcher.feed(RgbaImage::new(320, 240)),
+            FeedOutcome::Initial
+        );
+        assert_eq!(
+            stitcher.feed(RgbaImage::new(321, 240)),
+            FeedOutcome::DimensionsChanged {
+                expected: (320, 240),
+                actual: (321, 240),
+            }
+        );
+    }
+
+    #[test]
+    fn reset_preview_never_reuses_revisions() {
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        stitcher.feed(RgbaImage::new(320, 1200));
+        let old_revision = stitcher.preview_revision();
+        stitcher = Stitcher::new(StitchConfig::default());
+        stitcher.feed(RgbaImage::new(320, 1200));
+        assert_ne!(stitcher.preview_revision(), old_revision);
+        assert_eq!(
+            stitcher.preview_tile().unwrap().image.dimensions(),
+            (320, 1)
+        );
+    }
+
+    #[test]
+    fn canvas_height_is_bounded_only_by_the_configured_limit() {
+        let mut stitcher = Stitcher::new(StitchConfig::default().with_max_height(30_000));
+        stitcher.width = 16_384;
+        stitcher.frame_height = 256;
+        stitcher.fixed_top = 32;
+        stitcher.fixed_bottom = 32;
+        assert_eq!(stitcher.max_active_height(), 29_936);
+    }
+
+    #[test]
+    fn cap_truncated_jump_keeps_the_previous_anchor() {
+        let mut stitcher = Stitcher::new(StitchConfig::default().with_max_height(300));
+        stitcher.width = 4;
+        stitcher.frame_height = 100;
+        let initial = Arc::new(FrameProfile::from_image(RgbaImage::new(4, 100), 1.0));
+        stitcher.committed = Some(Anchor {
+            profile: initial,
+            y: 0,
+        });
+        let frame = Arc::new(FrameProfile::from_image(RgbaImage::new(4, 100), 1.0));
+
+        stitcher.rows = PagedRows::new(4);
+        stitcher.rows.append_down(0, &vec![0; 100 * 16]).unwrap();
+        stitcher.below_rows = 100;
+        assert!(stitcher.commit_frame(frame.clone(), 500).unwrap());
+        assert_eq!(stitcher.below_rows, 100);
+        assert_eq!(stitcher.committed.as_ref().unwrap().y, 0);
+
+        stitcher.rows = PagedRows::new(4);
+        stitcher.rows.append_down(0, &vec![0; 225 * 16]).unwrap();
+        stitcher.below_rows = 225;
+        assert!(stitcher.commit_frame(frame.clone(), 250).unwrap());
+        assert_eq!(stitcher.below_rows, 225);
+        assert_eq!(stitcher.committed.as_ref().unwrap().y, 0);
+
+        stitcher.rows = PagedRows::new(4);
+        stitcher.rows.prepend_up(0, &vec![0; 225 * 16]).unwrap();
+        stitcher.below_rows = 0;
+        stitcher.above_rows = 225;
+        assert!(stitcher.commit_frame(frame, -400).unwrap());
+        assert_eq!(stitcher.above_rows, 225);
+        assert_eq!(stitcher.committed.as_ref().unwrap().y, 0);
+    }
+
+    #[test]
+    fn delayed_sticky_margins_keep_upward_origin_and_height_cap() {
+        let mut frame = RgbaImage::new(4, 300);
+        for y in 0..300 {
+            let value = (y % 251) as u8;
+            for x in 0..4 {
+                frame.put_pixel(x, y, image::Rgba([value, x as u8, y as u8, 255]));
+            }
+        }
+        let profile = Arc::new(FrameProfile::from_image(frame.clone(), 1.0));
+        let mut stitcher = Stitcher::new(StitchConfig::default().with_max_height(300));
+        stitcher.width = 4;
+        stitcher.frame_height = 300;
+        stitcher.rows = PagedRows::new(4);
+        stitcher.rows.append_down(-100, frame.as_raw()).unwrap();
+        stitcher.above_rows = 100;
+        stitcher.below_rows = 200;
+
+        stitcher.apply_fixed_margins(40, 20, &profile).unwrap();
+
+        assert_eq!(stitcher.fixed_margins(), (40, 20));
+        assert_eq!(stitcher.above_rows, 60);
+        assert_eq!(stitcher.content_shift(), 60);
+        assert_eq!(stitcher.below_rows, 180);
+        assert_eq!(stitcher.total_height(), 300);
+        assert_eq!(stitcher.header_rows, profile.raw_rows(0, 40));
+        assert_eq!(stitcher.footer_rows, profile.raw_rows(280, 300));
+    }
+
+    #[test]
+    fn upward_canvas_rows_and_flush_preserve_final_content_shift() {
+        let doc = make_document(360, 1400);
+        let view_h = 440;
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [960, 820, 640, 460, 280, 120, 0, 35] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false));
+        }
+        let shift_before_flush = stitcher.content_shift();
+        stitcher.flush_pending().unwrap();
+        let shift = stitcher.content_shift();
+        assert!(shift >= shift_before_flush);
+        assert_eq!(shift, stitcher.above_rows);
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        for y in 0..assembled.height() {
+            let stride = assembled.width() as usize * 4;
+            let offset = y as usize * stride;
+            assert_eq!(
+                stitcher.canvas_row(y).unwrap(),
+                assembled.as_raw()[offset..offset + stride],
+                "canvas row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_frame_cannot_bypass_the_height_limit() {
+        let mut stitcher = Stitcher::new(StitchConfig::default().with_max_height(300));
+        assert!(matches!(
+            stitcher.feed(RgbaImage::new(32, 301)),
+            FeedOutcome::Failed(_)
+        ));
+        assert_eq!(stitcher.total_height(), 0);
+        assert_eq!(stitcher.width(), 0);
+    }
+
+    #[test]
+    fn visible_preview_matches_its_assembled_source_rows() {
+        let doc = make_document(640, 3200);
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in (0..=2700).step_by(200) {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, 500, 0, 0, false, false));
+        }
+        stitcher.set_preview_range(700, 900);
+        stitcher.refresh_preview().unwrap();
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        let tile = stitcher.preview_tile().unwrap();
+        assert_eq!(stitcher.preview_range(), (700, 900));
+        assert!(tile.image.width() <= PREVIEW_MAX_WIDTH);
+        for py in 0..tile.image.height() {
+            let sy = 700
+                + (u64::from(py) * u64::from(assembled.width()) / u64::from(tile.image.width()))
+                    as u32;
+            for px in 0..tile.image.width() {
+                let sx = (u64::from(px) * u64::from(assembled.width())
+                    / u64::from(tile.image.width())) as u32;
+                assert_eq!(
+                    tile.image.get_pixel(px, py),
+                    assembled.get_pixel(sx, sy.min(1599)),
+                    "pixel ({px}, {py})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_height_and_bounded_visible_preview_work() {
         let doc = make_document(640, 3200);
         let mut stitcher = Stitcher::new(StitchConfig::default().with_max_height(1500));
         for scroll_y in (0..=2700).step_by(200) {
             let _ = stitcher.feed(viewport_frame(&doc, scroll_y, 500, 0, 0, false, false));
         }
-        let assembled = stitcher.assemble().unwrap();
+        let assembled = stitcher.assemble().unwrap().unwrap();
         assert!(assembled.height() <= 1500);
-        let tiles = stitcher.preview_tiles();
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert!(tile.image.width() <= PREVIEW_MAX_WIDTH);
-            assert!(tile.image.height() <= PREVIEW_TILE_MAX_HEIGHT);
-        }
+        let tile = stitcher.preview_tile().unwrap();
+        assert!(tile.image.width() <= PREVIEW_MAX_WIDTH);
+        assert_eq!(tile.image.dimensions(), (320, 1));
     }
 }

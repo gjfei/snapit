@@ -42,7 +42,7 @@ use gpui_kit::{
     prelude::{InteractiveElement as _, StatefulInteractiveElement as _},
     px, rgb, size,
 };
-use snapit_capture::{RgbaImage, load_watermark_image};
+use snapit_capture::RgbaImage;
 use snapit_recorder::{CLICK_DURATION, ClickEffect, ClickEffectGroup};
 use snapit_store::{
     Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ScrollConfig, ScrollSpeed,
@@ -142,6 +142,7 @@ pub fn ocr_languages(value: &str) -> Vec<String> {
 struct WatermarkPreview {
     target: WatermarkTarget,
     preset: WatermarkPreset,
+    image_versions: Vec<Option<(u64, Option<std::time::SystemTime>)>>,
     result: std::result::Result<Arc<RenderImage>, String>,
 }
 
@@ -878,16 +879,20 @@ impl SettingsView {
             .cloned()
             .ok_or_else(|| "watermark template is unavailable".to_string())?;
         preset.sanitize();
+        let image_dir = AppSettings::watermark_dir(cx);
+        let image_versions = watermark_image_versions(&preset, image_dir);
         if let Some(cached) = &self.watermark_preview[target_index]
             && cached.target == target
             && cached.preset == preset
+            && cached.image_versions == image_versions
         {
             return cached.result.clone();
         }
-        let result = build_watermark_preview(target, &preset, AppSettings::watermark_dir(cx));
+        let result = build_watermark_preview(target, &preset, image_dir);
         self.watermark_preview[target_index] = Some(WatermarkPreview {
             target,
             preset,
+            image_versions,
             result: result.clone(),
         });
         result
@@ -1909,6 +1914,22 @@ fn watermark_target_label(target: WatermarkTarget) -> SharedString {
     .into()
 }
 
+fn watermark_image_versions(
+    preset: &WatermarkPreset,
+    image_dir: &std::path::Path,
+) -> Vec<Option<(u64, Option<std::time::SystemTime>)>> {
+    preset
+        .elements
+        .iter()
+        .filter(|element| element.kind == snapit_store::WatermarkKind::Image)
+        .map(|element| {
+            std::fs::metadata(image_dir.join(&element.image.source))
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()))
+        })
+        .collect()
+}
+
 pub(crate) fn build_watermark_preview(
     target: WatermarkTarget,
     preset: &WatermarkPreset,
@@ -2309,6 +2330,22 @@ fn watermark_preview_setting(
 
 static WATERMARK_PASTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
+fn watermark_image_dimensions(bytes: &[u8]) -> anyhow::Result<(u32, u32)> {
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("invalid watermark image")?
+        .into_dimensions()
+        .context("invalid watermark image")?;
+    let (width, height) = dimensions;
+    anyhow::ensure!(
+        (1..=8192).contains(&width)
+            && (1..=8192).contains(&height)
+            && u64::from(width) * u64::from(height) <= 64 * 1024 * 1024,
+        "watermark image dimensions are invalid or too large"
+    );
+    Ok(dimensions)
+}
+
 pub(crate) fn import_watermark_image_bytes(
     bytes: &[u8],
     directory: &std::path::Path,
@@ -2318,16 +2355,11 @@ pub(crate) fn import_watermark_image_bytes(
         bytes.len() <= MAX_BYTES,
         "watermark image exceeds the 16 MiB limit"
     );
+    let (width, height) = watermark_image_dimensions(bytes)?;
     let rgba = image::load_from_memory(bytes)
         .context("invalid watermark image")?
         .to_rgba8();
-    let (width, height) = rgba.dimensions();
-    anyhow::ensure!(
-        (1..=8192).contains(&width)
-            && (1..=8192).contains(&height)
-            && u64::from(width) * u64::from(height) <= 64_000_000,
-        "watermark image dimensions are invalid or too large"
-    );
+    debug_assert_eq!(rgba.dimensions(), (width, height));
     std::fs::create_dir_all(directory).context("failed to create the watermark folder")?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2340,9 +2372,14 @@ pub(crate) fn import_watermark_image_bytes(
         .create_new(true)
         .open(directory.join(&name))
         .context("failed to create the managed watermark image")?;
-    image::DynamicImage::ImageRgba8(rgba)
+    let write_result = image::DynamicImage::ImageRgba8(rgba)
         .write_to(&mut output, image::ImageFormat::Png)
-        .context("failed to write pasted watermark image")?;
+        .context("failed to write pasted watermark image");
+    if let Err(error) = write_result {
+        drop(output);
+        let _ = std::fs::remove_file(directory.join(&name));
+        return Err(error);
+    }
     Ok((name, width, height))
 }
 
@@ -2350,27 +2387,52 @@ pub(crate) fn import_watermark_image(
     source: &std::path::Path,
     directory: &std::path::Path,
 ) -> anyhow::Result<(String, u32, u32)> {
-    let extension = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .filter(|value| matches!(value.as_str(), "png" | "jpg" | "jpeg"))
-        .ok_or_else(|| anyhow::anyhow!("watermark images must be PNG or JPEG"))?;
-    let image = load_watermark_image(source).context("invalid watermark image")?;
-    let (width, height) = image.dimensions();
+    use std::io::{Read as _, Write as _};
+
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    let file = std::fs::File::open(source).context("failed to open the watermark image")?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read the watermark image")?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "watermark image exceeds the 16 MiB limit"
+    );
+    let format = match image::guess_format(&bytes).context("invalid watermark image")? {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        _ => anyhow::bail!("watermark images must be PNG or JPEG"),
+    };
+    let (width, height) = watermark_image_dimensions(&bytes)?;
+    let rgba = image::load_from_memory(&bytes)
+        .context("invalid watermark image")?
+        .to_rgba8();
+    debug_assert_eq!(rgba.dimensions(), (width, height));
     std::fs::create_dir_all(directory).context("failed to create the watermark folder")?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let name = format!("watermark-{}-{nonce}.{extension}", std::process::id());
-    let mut input = std::fs::File::open(source).context("failed to open the watermark image")?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join(&name))
-        .context("failed to create the managed watermark image")?;
-    std::io::copy(&mut input, &mut output).context("failed to copy the watermark image")?;
+    let name = format!("watermark-{}-{nonce}.{format}", std::process::id());
+    let destination = directory.join(&name);
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .context("failed to create the managed watermark image")?;
+        std::io::Write::write_all(&mut output, &bytes)
+            .context("failed to copy the watermark image")?;
+        output
+            .flush()
+            .context("failed to flush the managed watermark image")?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&destination);
+        return Err(error);
+    }
     Ok((name, width, height))
 }
 
@@ -2970,6 +3032,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("managed file name"));
+    }
+
+    #[test]
+    fn watermark_file_import_persists_the_exact_bytes_it_validated() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.jpg");
+        let original = RgbaImage::from_pixel(3, 2, image::Rgba([20, 40, 60, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        original
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let expected = bytes.into_inner();
+        std::fs::write(&source, &expected).unwrap();
+        let managed = directory.join("managed");
+        let (name, width, height) = import_watermark_image(&source, &managed).unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(std::fs::read(managed.join(name)).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn watermark_import_rejects_oversized_dimensions_before_decoding() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-dimensions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = RgbaImage::new(1, 8193);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let bytes = bytes.into_inner();
+        let error = watermark_image_dimensions(&bytes).unwrap_err();
+        assert!(error.to_string().contains("dimensions"));
+        let source = directory.join("source.png");
+        std::fs::write(&source, &bytes).unwrap();
+        assert!(import_watermark_image(&source, &directory.join("managed")).is_err());
+        assert!(!directory.join("managed").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn watermark_preview_identity_changes_when_a_managed_image_is_replaced() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapit-watermark-version-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut preset = WatermarkPreset::default();
+        preset.elements = vec![snapit_store::WatermarkElement::new_image(
+            "el-1",
+            "managed.png",
+            120.0,
+        )];
+        let path = directory.join("managed.png");
+        std::fs::write(&path, b"first").unwrap();
+        let first = watermark_image_versions(&preset, &directory);
+        std::fs::write(&path, b"second version").unwrap();
+        let second = watermark_image_versions(&preset, &directory);
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -14,7 +14,8 @@ use gpui_kit::{
     point, px, rgb, size,
 };
 use snapit_capture::{
-    HdrImage, PixelRect, RgbaImage, blend_hdr_srgb, f16_bits_to_f32, f32_to_f16_bits,
+    HdrImage, ImageSource, PixelRect, RgbaImage, WatermarkSpec, blend_hdr_srgb, f16_bits_to_f32,
+    f32_to_f16_bits,
 };
 use snapit_store::{AnnotationConfig, AnnotationStyle, AnnotationTool};
 use tiny_skia::{
@@ -304,7 +305,7 @@ impl Shape {
 
     /// Painted extents without the selection padding; used to keep a dragged
     /// shape inside the captured region.
-    fn extents(&self) -> (f32, f32, f32, f32) {
+    pub(crate) fn extents(&self) -> (f32, f32, f32, f32) {
         match self {
             Self::Rect { from, to, .. }
             | Self::Arrow { from, to, .. }
@@ -366,6 +367,12 @@ impl Shape {
                 at[1] += dy;
             }
         }
+    }
+
+    pub(crate) fn intersects(&self, clip: [f32; 4]) -> bool {
+        let (x, y, w, h) = self.bounds();
+        let pad = self.style().size.max(4.0);
+        x - pad < clip[2] && x + w + pad > clip[0] && y - pad < clip[3] && y + h + pad > clip[1]
     }
 
     /// Grab points this shape exposes; empty for pen strokes and the tools
@@ -604,6 +611,14 @@ impl Layer {
     pub fn new(defaults: AnnotationConfig) -> Self {
         Self {
             defaults,
+            ..Self::default()
+        }
+    }
+
+    pub fn from_shapes(defaults: AnnotationConfig, shapes: Arc<Vec<Shape>>) -> Self {
+        Self {
+            defaults,
+            shapes,
             ..Self::default()
         }
     }
@@ -1204,6 +1219,11 @@ impl Layer {
         for shape in Arc::make_mut(&mut self.shapes).iter_mut() {
             shape.shift(dx, dy);
         }
+        for snapshot in &mut self.history {
+            for shape in Arc::make_mut(snapshot).iter_mut() {
+                shape.shift(dx, dy);
+            }
+        }
         if let Some(draft) = self.draft.as_mut() {
             draft.shift(dx, dy);
         }
@@ -1213,8 +1233,8 @@ impl Layer {
             shift.origin[0] += dx;
             shift.origin[1] += dy;
         }
-        // Every snapshot still holds the old coordinates, so a style run that
-        // started before the move must not reuse one.
+        // A style run's snapshot was taken before this translation and must not
+        // be reused as though it were a new edit step.
         self.style_run = None;
     }
 
@@ -1344,6 +1364,83 @@ pub fn bake(image: &mut RgbaImage, shapes: &[Shape], scale: f32) {
     if let Some(baked) = rgba_from_pixmap(pixmap) {
         *image = baked;
     }
+}
+
+/// Bake a bounded row range without materializing the full canvas.
+pub(crate) fn bake_strip(
+    source: &ImageSource,
+    start: u32,
+    rows: u32,
+    shapes: &[Shape],
+    watermark: &WatermarkSpec,
+    scale: f32,
+) -> anyhow::Result<RgbaImage> {
+    use anyhow::ensure;
+    ensure!(
+        rows > 0 && start < source.height(),
+        "annotation strip is out of bounds"
+    );
+    let rows = rows.min(source.height() - start);
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let padding = shapes
+        .iter()
+        .map(|shape| {
+            let size = match shape {
+                Shape::Text { style, .. } | Shape::Step { style, .. } => style.size * scale * 3.0,
+                Shape::Rect { style, .. }
+                | Shape::Arrow { style, .. }
+                | Shape::Line { style, .. }
+                | Shape::Pen { style, .. } => style.size * scale * 4.0 + 32.0,
+                Shape::Mosaic { .. } => 0.0,
+            };
+            size.ceil().max(64.0) as u32
+        })
+        .max()
+        .unwrap_or(0);
+    let output_end = start + rows;
+    let mut read_start = start.saturating_sub(padding);
+    let mut read_end = output_end.saturating_add(padding).min(source.height());
+    for shape in shapes {
+        let Shape::Mosaic { from, to, style } = shape else {
+            continue;
+        };
+        let (_, y, _, height) = scaled_aabb(*from, *to, scale);
+        let block = ((style.size * scale).round().max(2.0) as u32) as i64;
+        let region_start = i64::from(y).max(0);
+        let region_end = (i64::from(y) + i64::from(height)).clamp(0, i64::from(source.height()));
+        if region_start < i64::from(output_end) && region_end > i64::from(start) {
+            let first = if i64::from(start) <= region_start {
+                region_start
+            } else {
+                region_start + (i64::from(start) - region_start) / block * block
+            };
+            let last = region_start + (i64::from(output_end - 1) - region_start) / block * block;
+            read_start = read_start.min(first as u32);
+            read_end = read_end.max((last + block).min(region_end) as u32);
+        }
+    }
+    let mut strip = source.read_rows(read_start, read_end - read_start)?;
+    let mut local_shapes = shapes.to_vec();
+    for shape in &mut local_shapes {
+        shape.shift(0.0, -(read_start as f32 / scale));
+    }
+    bake(&mut strip, &local_shapes, scale);
+    if watermark.is_enabled() {
+        let layer = watermark.rasterize_rows(
+            source.width(),
+            source.height(),
+            read_start,
+            read_end - read_start,
+            scale,
+        )?;
+        layer.apply_sdr_mut(&mut strip);
+    }
+    let offset = start - read_start;
+    Ok(image::imageops::crop_imm(&strip, 0, offset, source.width(), rows).to_image())
 }
 
 /// Bake annotations into linear HDR samples without an 8-bit intermediate.
@@ -1484,11 +1581,95 @@ fn average_hdr(raw: &[u8], width: u32, x0: i32, y0: i32, x1: i32, y1: i32) -> [f
 /// never inherit the previous frame's colours.
 #[derive(Clone, Copy)]
 pub(crate) struct MosaicSource<'a> {
-    pub image: &'a RgbaImage,
+    pub image: MosaicImage<'a>,
     pub stamp: u64,
+    /// Shape/clip coordinates are logical; this converts them to source pixels.
+    /// Full-resolution captures use their layout scale, while a downscaled
+    /// preview uses `tile.width * layout_scale / snapshot.width`.
+    pub pixels_per_logical_unit: f32,
+    pub origin: [f32; 2],
+    /// Legacy full-resolution constructors inherit the paint scale. Explicit
+    /// preview constructors provide their own ratio and set this to false.
+    use_layout_scale: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MosaicImage<'a> {
+    Memory(&'a RgbaImage),
+    Source(&'a ImageSource),
+}
+
+impl<'a> MosaicSource<'a> {
+    pub fn memory(image: &'a RgbaImage, stamp: u64) -> Self {
+        Self {
+            image: MosaicImage::Memory(image),
+            stamp,
+            pixels_per_logical_unit: 1.0,
+            origin: [0.0, 0.0],
+            use_layout_scale: true,
+        }
+    }
+
+    pub fn source(image: &'a ImageSource, stamp: u64) -> Self {
+        Self {
+            image: MosaicImage::Source(image),
+            stamp,
+            pixels_per_logical_unit: 1.0,
+            origin: [0.0, 0.0],
+            use_layout_scale: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn source_at(image: &'a RgbaImage, stamp: u64, origin: [f32; 2]) -> Self {
+        Self {
+            image: MosaicImage::Memory(image),
+            stamp,
+            pixels_per_logical_unit: 1.0,
+            origin,
+            use_layout_scale: true,
+        }
+    }
+
+    /// A source whose logical-to-pixel ratio differs from the paint layout
+    /// scale. For a preview tile pass
+    /// `tile.width * layout_scale / snapshot.width`; geometry stays logical.
+    pub fn source_at_with_ratio(
+        image: &'a RgbaImage,
+        stamp: u64,
+        origin: [f32; 2],
+        pixels_per_logical_unit: f32,
+    ) -> Self {
+        Self {
+            image: MosaicImage::Memory(image),
+            stamp,
+            pixels_per_logical_unit: if pixels_per_logical_unit.is_finite()
+                && pixels_per_logical_unit > 0.0
+            {
+                pixels_per_logical_unit
+            } else {
+                1.0
+            },
+            origin,
+            use_layout_scale: false,
+        }
+    }
+
+    fn for_paint(mut self, layout_scale: f32) -> Self {
+        if self.use_layout_scale {
+            self.pixels_per_logical_unit = if layout_scale.is_finite() && layout_scale > 0.0 {
+                layout_scale
+            } else {
+                1.0
+            };
+            self.use_layout_scale = false;
+        }
+        self
+    }
 }
 
 /// One block of a mosaic and the colour sampled for it.
+#[derive(Clone, Copy)]
 struct MosaicBlock {
     /// Local to the selection, like the shape it belongs to.
     at: [f32; 2],
@@ -1496,26 +1677,47 @@ struct MosaicBlock {
     color: [u8; 4],
 }
 
-/// What a set of block colours was derived from.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What a set of block colours was derived from. The clip determines which
+/// blocks are retained, while the *original* mosaic AABB determines their grid
+/// phase. Two shapes can have the same clipped rectangle but different phases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MosaicKey {
     index: usize,
-    rect: [i64; 4],
+    geometry: [i64; 4],
+    clip: [i64; 4],
     block: i64,
     scale: i64,
+    pixels_per_logical_unit: i64,
+    source_origin: [i64; 2],
     stamp: u64,
 }
 
 impl MosaicKey {
-    fn new(index: usize, from: [f32; 2], to: [f32; 2], block: f32, scale: f32, stamp: u64) -> Self {
+    fn new(
+        index: usize,
+        from: [f32; 2],
+        to: [f32; 2],
+        block: f32,
+        scale: f32,
+        clip: [f32; 4],
+        source: MosaicSource<'_>,
+    ) -> Self {
         let (x, y, w, h) = aabb(from, to);
         let quantise = |value: f32| (f64::from(value) * 1000.0).round() as i64;
         Self {
             index,
-            rect: [quantise(x), quantise(y), quantise(w), quantise(h)],
+            geometry: [quantise(x), quantise(y), quantise(w), quantise(h)],
+            clip: [
+                quantise(clip[0]),
+                quantise(clip[1]),
+                quantise(clip[2]),
+                quantise(clip[3]),
+            ],
             block: quantise(block),
             scale: quantise(scale),
-            stamp,
+            pixels_per_logical_unit: quantise(source.pixels_per_logical_unit),
+            source_origin: [quantise(source.origin[0]), quantise(source.origin[1])],
+            stamp: source.stamp,
         }
     }
 }
@@ -1524,31 +1726,74 @@ impl MosaicKey {
 /// mosaic reads the whole region once per frame, and the canvas repaints on
 /// every pointer move while the mosaic is dragged; the colours only change
 /// when its rectangle, its block size or the source pixels do.
-#[derive(Default)]
 pub(crate) struct MosaicCache {
-    entries: Vec<(MosaicKey, Vec<MosaicBlock>)>,
+    entries: Vec<(MosaicKey, Arc<[MosaicBlock]>)>,
+    max_bytes: usize,
+    max_blocks: usize,
+}
+
+impl Default for MosaicCache {
+    fn default() -> Self {
+        Self::with_limits(Self::MAX_BYTES, Self::MAX_BLOCKS)
+    }
 }
 
 impl MosaicCache {
     /// Enough for the mosaic being dragged plus its neighbours.
     const KEEP: usize = 4;
+    /// A four-entry limit alone is not a memory bound: a single entry can hold
+    /// hundreds of thousands of blocks. Keep both a byte and a block budget.
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_BLOCKS: usize = 16_384;
+
+    fn with_limits(max_bytes: usize, max_blocks: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_bytes,
+            max_blocks,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(_, blocks)| blocks.len() * std::mem::size_of::<MosaicBlock>())
+            .sum()
+    }
+
+    fn retained_blocks(&self) -> usize {
+        self.entries.iter().map(|(_, blocks)| blocks.len()).sum()
+    }
 
     fn blocks(
         &mut self,
         key: MosaicKey,
         compute: impl FnOnce() -> Vec<MosaicBlock>,
-    ) -> &[MosaicBlock] {
+    ) -> Arc<[MosaicBlock]> {
         if let Some(ix) = self.entries.iter().position(|(hit, _)| *hit == key) {
             // Refresh the hit so the least recently painted one is evicted.
             let entry = self.entries.remove(ix);
+            let blocks = Arc::clone(&entry.1);
             self.entries.push(entry);
-        } else {
-            if self.entries.len() >= Self::KEEP {
-                self.entries.remove(0);
-            }
-            self.entries.push((key, compute()));
+            return blocks;
         }
-        &self.entries.last().expect("an entry was just pushed").1
+
+        let blocks: Arc<[MosaicBlock]> = Arc::from(compute());
+        let bytes = blocks.len() * std::mem::size_of::<MosaicBlock>();
+        if bytes > self.max_bytes || blocks.len() > self.max_blocks {
+            // Paint this frame, but never retain an entry that alone exceeds
+            // the cache budget. Arc lets an uncached result use the same API.
+            return blocks;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= Self::KEEP
+                || self.retained_bytes() + bytes > self.max_bytes
+                || self.retained_blocks() + blocks.len() > self.max_blocks)
+        {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, Arc::clone(&blocks)));
+        blocks
     }
 
     /// Nothing on screen needs the source pixels any more, so the sampled
@@ -1592,12 +1837,46 @@ pub(crate) fn paint_layer_zoomed(
     window: &mut Window,
     cx: &mut App,
 ) {
+    paint_layer_zoomed_clipped(
+        layer,
+        origin,
+        scale,
+        zoom,
+        [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
+        ],
+        source,
+        mosaics,
+        window,
+        cx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_layer_zoomed_clipped(
+    layer: &Layer,
+    origin: Point<Pixels>,
+    scale: f32,
+    zoom: f32,
+    clip: [f32; 4],
+    source: Option<MosaicSource<'_>>,
+    mosaics: &mut MosaicCache,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let zoom = if zoom.is_finite() && zoom > 0.0 {
         zoom
     } else {
         1.0
     };
     let z = |p: [f32; 2]| [p[0] * zoom, p[1] * zoom];
+    // Full-resolution sources predate the explicit preview ratio and inherit
+    // the capture's layout scale. Downscaled tile sources already carry the
+    // correct `tile.width * layout_scale / snapshot.width` ratio.
+    let source = source.map(|source| source.for_paint(scale));
     let typing = layer.is_typing();
     // Only the draft can be last, and only a draft ever gets a caret; skip
     // counting the shapes when nothing is being typed.
@@ -1607,6 +1886,9 @@ pub(crate) fn paint_layer_zoomed(
         usize::MAX
     };
     for (ix, shape) in layer.visible().enumerate() {
+        if !shape.intersects(clip) {
+            continue;
+        }
         match shape {
             Shape::Rect { from, to, style } => {
                 if let Some(bounds) = gpui_aabb(origin, z(*from), z(*to)) {
@@ -1637,11 +1919,18 @@ pub(crate) fn paint_layer_zoomed(
             }
             Shape::Mosaic { from, to, style } => {
                 if let Some(source) = source {
-                    let key = MosaicKey::new(ix, *from, *to, style.size, scale, source.stamp);
-                    let blocks = mosaics.blocks(key, || {
-                        mosaic_blocks(*from, *to, style.size, scale, source.image)
-                    });
-                    paint_gpui_mosaic_zoomed(window, origin, blocks, zoom);
+                    let (x, y, w, h) = aabb(*from, *to);
+                    let left = x.max(clip[0]);
+                    let top = y.max(clip[1]);
+                    let right = (x + w).min(clip[2]);
+                    let bottom = (y + h).min(clip[3]);
+                    if right <= left || bottom <= top {
+                        continue;
+                    }
+                    let key = MosaicKey::new(ix, *from, *to, style.size, scale, clip, source);
+                    let blocks =
+                        mosaics.blocks(key, || mosaic_blocks(*from, *to, style.size, source, clip));
+                    paint_gpui_mosaic_zoomed(window, origin, &blocks, zoom);
                 }
             }
             Shape::Text { at, text, style } => {
@@ -1672,7 +1961,7 @@ pub(crate) fn paint_layer_zoomed(
         && let Some(shape) = layer
             .selected
             .and_then(|ix| layer.shapes.get(ix))
-            .filter(|shape| shape.shows_bounds_outline())
+            .filter(|shape| shape.shows_bounds_outline() && shape.intersects(clip))
     {
         let (x, y, w, h) = shape.bounds();
         let outline = Bounds::new(
@@ -1686,6 +1975,9 @@ pub(crate) fn paint_layer_zoomed(
     let handles = layer.selected_handles();
     if !handles.is_empty() {
         for (_, at) in handles {
+            if at[0] < clip[0] || at[0] > clip[2] || at[1] < clip[1] || at[1] > clip[3] {
+                continue;
+            }
             let center = point(origin.x + px(at[0] * zoom), origin.y + px(at[1] * zoom));
             let box_ = Bounds::new(
                 point(
@@ -1806,9 +2098,22 @@ fn mosaic_blocks(
     from: [f32; 2],
     to: [f32; 2],
     block_size: f32,
-    scale: f32,
-    source: &RgbaImage,
+    source: MosaicSource<'_>,
+    clip: [f32; 4],
 ) -> Vec<MosaicBlock> {
+    let pixels_per_logical_unit = source.pixels_per_logical_unit;
+    let source_height = match source.image {
+        MosaicImage::Memory(image) => image.height(),
+        MosaicImage::Source(image) => image.height(),
+    };
+    let clip = [
+        clip[0] - source.origin[0],
+        clip[1] - source.origin[1],
+        clip[2] - source.origin[0],
+        clip[3] - source.origin[1],
+    ];
+    let from = [from[0] - source.origin[0], from[1] - source.origin[1]];
+    let to = [to[0] - source.origin[0], to[1] - source.origin[1]];
     let (x, y, w, h) = aabb(from, to);
     if w < MIN_SPAN || h < MIN_SPAN {
         return Vec::new();
@@ -1818,14 +2123,51 @@ fn mosaic_blocks(
     let mut row = y;
     while row < y + h {
         let bh = block.min(y + h - row);
+        if row + bh <= clip[1] || row >= clip[3] {
+            row += bh;
+            continue;
+        }
+        let py_start =
+            ((row * pixels_per_logical_unit).round() as i32).clamp(0, source_height as i32);
+        let py_end =
+            (((row + bh) * pixels_per_logical_unit).round() as i32).clamp(0, source_height as i32);
+        if py_end <= py_start {
+            row += bh;
+            continue;
+        }
+        let loaded;
+        let image = match source.image {
+            MosaicImage::Memory(image) => image,
+            MosaicImage::Source(image) => {
+                loaded = match image.read_rows(py_start as u32, (py_end - py_start) as u32) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        log::warn!("mosaic preview read failed: {error:#}");
+                        row += bh;
+                        continue;
+                    }
+                };
+                &loaded
+            }
+        };
         let mut col = x;
         while col < x + w {
             let bw = block.min(x + w - col);
-            let px0 = (col * scale).round() as i32;
-            let py0 = (row * scale).round() as i32;
-            let px1 = ((col + bw) * scale).round() as i32;
-            let py1 = ((row + bh) * scale).round() as i32;
-            let color = average_rgba(source, px0, py0, px1, py1);
+            if col + bw <= clip[0] || col >= clip[2] {
+                col += bw;
+                continue;
+            }
+            let px0 = (col * pixels_per_logical_unit).round() as i32;
+            let py0 = (row * pixels_per_logical_unit).round() as i32;
+            let px1 = ((col + bw) * pixels_per_logical_unit).round() as i32;
+            let py1 = ((row + bh) * pixels_per_logical_unit).round() as i32;
+            let color = {
+                let (local_y0, local_y1) = match source.image {
+                    MosaicImage::Memory(_) => (py0, py1),
+                    MosaicImage::Source(_) => (py0 - py_start, py1 - py_start),
+                };
+                average_rgba(image, px0, local_y0, px1, local_y1)
+            };
             let joined = match blocks.last_mut() {
                 Some(last)
                     if last.color == color
@@ -1848,6 +2190,10 @@ fn mosaic_blocks(
             col += bw;
         }
         row += bh;
+    }
+    for block in &mut blocks {
+        block.at[0] += source.origin[0];
+        block.at[1] += source.origin[1];
     }
     blocks
 }
@@ -2726,7 +3072,14 @@ mod tests {
                 [255, 0, 0, 255]
             });
         }
-        let blocks = mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, 1.0, &image);
+        let source = MosaicSource::memory(&image, 1);
+        let clip = [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
+        ];
+        let blocks = mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, source, clip);
         // Each row is two flat fields, so its four blocks per field merge into
         // one wide quad: 8 rows paint as 16 blocks instead of 64.
         assert_eq!(blocks.len(), 16, "flat neighbours are one block");
@@ -2751,18 +3104,18 @@ mod tests {
 
         let mut cache = MosaicCache::default();
         let mut sampled = 0;
-        let key = MosaicKey::new(0, [0.0, 0.0], [64.0, 64.0], 8.0, 1.0, 1);
+        let key = MosaicKey::new(0, [0.0, 0.0], [64.0, 64.0], 8.0, 1.0, clip, source);
         let first = cache
             .blocks(key, || {
                 sampled += 1;
-                mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, 1.0, &image)
+                mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, source, clip)
             })
             .len();
         // The next frame asks for the same geometry: no pixel reads at all.
         let second = cache
             .blocks(key, || {
                 sampled += 1;
-                mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, 1.0, &image)
+                mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, source, clip)
             })
             .len();
         assert_eq!(first, second);
@@ -2770,7 +3123,15 @@ mod tests {
 
         // New source pixels must resample even though the rectangle is the same.
         cache.blocks(
-            MosaicKey::new(0, [0.0, 0.0], [64.0, 64.0], 8.0, 1.0, 2),
+            MosaicKey::new(
+                0,
+                [0.0, 0.0],
+                [64.0, 64.0],
+                8.0,
+                1.0,
+                clip,
+                MosaicSource::memory(&image, 2),
+            ),
             || {
                 sampled += 1;
                 Vec::new()
@@ -2779,7 +3140,7 @@ mod tests {
         assert_eq!(sampled, 2);
 
         // A mosaic too small to draw paints nothing rather than one block.
-        assert!(mosaic_blocks([0.0, 0.0], [1.0, 1.0], 8.0, 1.0, &image).is_empty());
+        assert!(mosaic_blocks([0.0, 0.0], [1.0, 1.0], 8.0, source, clip).is_empty());
     }
 
     #[test]
@@ -2790,7 +3151,14 @@ mod tests {
         for (x, y, pixel) in image.enumerate_pixels_mut() {
             *pixel = Rgba([((x / 8) * 32) as u8, ((y / 8) * 32) as u8, 0, 255]);
         }
-        let blocks = mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, 1.0, &image);
+        let source = MosaicSource::memory(&image, 1);
+        let clip = [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
+        ];
+        let blocks = mosaic_blocks([0.0, 0.0], [64.0, 64.0], 8.0, source, clip);
         assert_eq!(blocks.len(), 64, "distinct colours never merge");
         assert!(blocks.iter().all(|block| block.size == [8.0, 8.0]));
     }
@@ -2800,11 +3168,222 @@ mod tests {
         let mut cache = MosaicCache::default();
         for index in 0..MosaicCache::KEEP + 3 {
             cache.blocks(
-                MosaicKey::new(index, [0.0, 0.0], [16.0, 16.0], 8.0, 1.0, 1),
+                MosaicKey::new(
+                    index,
+                    [0.0, 0.0],
+                    [16.0, 16.0],
+                    8.0,
+                    1.0,
+                    [
+                        f32::NEG_INFINITY,
+                        f32::NEG_INFINITY,
+                        f32::INFINITY,
+                        f32::INFINITY,
+                    ],
+                    MosaicSource::memory(&RgbaImage::new(1, 1), 1),
+                ),
                 Vec::new,
             );
         }
         assert_eq!(cache.entries.len(), MosaicCache::KEEP);
+    }
+
+    #[test]
+    fn mosaic_preview_uses_tile_ratio_not_retina_layout_scale() {
+        // A 1280×960 snapshot at scale 2 is previewed by a 320×240 tile, so
+        // one logical unit is 0.5 preview pixels (not 2). Logical x 200..600
+        // must therefore sample preview x 100..300.
+        let image = RgbaImage::from_fn(320, 240, |x, _| {
+            if (100..300).contains(&x) {
+                Rgba([40, 80, 120, 255])
+            } else {
+                Rgba([240, 240, 240, 255])
+            }
+        });
+        let ratio = 320.0_f32 * 2.0 / 1280.0_f32;
+        assert_eq!(ratio, 0.5);
+        assert_eq!(
+            MosaicSource::memory(&image, 1)
+                .for_paint(2.0)
+                .pixels_per_logical_unit,
+            2.0,
+            "full-resolution sources still inherit the Retina layout scale"
+        );
+        let source = MosaicSource::source_at_with_ratio(&image, 1, [0.0, 0.0], ratio);
+        assert_eq!(source.for_paint(2.0).pixels_per_logical_unit, ratio);
+        let clip = [200.0, 40.0, 600.0, 200.0];
+        let blocks = mosaic_blocks([200.0, 40.0], [600.0, 200.0], 20.0, source, clip);
+
+        assert_eq!(blocks.len(), 8, "one merged block per logical row");
+        for (row, block) in blocks.iter().enumerate() {
+            assert_eq!(block.at, [200.0, 40.0 + row as f32 * 20.0]);
+            assert_eq!(block.size, [400.0, 20.0]);
+            assert_eq!(block.color, [40, 80, 120, 255]);
+        }
+    }
+
+    #[test]
+    fn mosaic_preview_keeps_nonzero_logical_y_origin() {
+        // This tile starts at logical y 480 of the snapshot. Its first 40
+        // preview pixels represent logical y 480..560 at the 0.5 tile ratio.
+        let image = RgbaImage::from_fn(320, 240, |_, y| {
+            if y < 40 {
+                Rgba([10, 20, 30, 255])
+            } else {
+                Rgba([200, 200, 200, 255])
+            }
+        });
+        let source = MosaicSource::source_at_with_ratio(&image, 1, [0.0, 480.0], 0.5);
+        let blocks = mosaic_blocks(
+            [0.0, 480.0],
+            [320.0, 560.0],
+            20.0,
+            source,
+            [0.0, 480.0, 320.0, 560.0],
+        );
+
+        assert_eq!(blocks.len(), 4);
+        for (row, block) in blocks.iter().enumerate() {
+            assert_eq!(block.at, [0.0, 480.0 + row as f32 * 20.0]);
+            assert_eq!(block.size, [320.0, 20.0]);
+            assert_eq!(block.color, [10, 20, 30, 255]);
+        }
+    }
+
+    #[test]
+    fn mosaic_cache_key_includes_original_grid_phase_and_clip() {
+        let image = RgbaImage::from_fn(16, 16, |x, _| Rgba([(x / 4) as u8 * 20, 0, 0, 255]));
+        let source = MosaicSource::memory(&image, 1);
+        let clip = [4.0, 4.0, 12.0, 12.0];
+        let first_from = [0.0, 0.0];
+        let first_to = [12.0, 12.0];
+        let second_from = [2.0, 2.0];
+        let second_to = [14.0, 14.0];
+        let first_key = MosaicKey::new(0, first_from, first_to, 4.0, 1.0, clip, source);
+        let second_key = MosaicKey::new(0, second_from, second_to, 4.0, 1.0, clip, source);
+        assert_ne!(first_key, second_key, "the clipped rectangle is identical");
+
+        let mut cache = MosaicCache::default();
+        let mut sampled = 0;
+        let first = cache.blocks(first_key, || {
+            sampled += 1;
+            mosaic_blocks(first_from, first_to, 4.0, source, clip)
+        });
+        let second = cache.blocks(second_key, || {
+            sampled += 1;
+            mosaic_blocks(second_from, second_to, 4.0, source, clip)
+        });
+        assert_eq!(sampled, 2, "different grid phases must not reuse colours");
+        assert_ne!(first[1].color, second[1].color);
+    }
+
+    #[test]
+    fn mosaic_cache_evicts_lru_entries_to_fit_byte_budget() {
+        let block = MosaicBlock {
+            at: [0.0, 0.0],
+            size: [2.0, 2.0],
+            color: [0, 0, 0, 255],
+        };
+        let block_bytes = std::mem::size_of::<MosaicBlock>();
+        let image = solid(1, 1, [0, 0, 0, 255]);
+        let source = MosaicSource::memory(&image, 1);
+        let key = |index| {
+            MosaicKey::new(
+                index,
+                [0.0, 0.0],
+                [8.0, 8.0],
+                2.0,
+                1.0,
+                [0.0, 0.0, 8.0, 8.0],
+                source,
+            )
+        };
+        let mut cache = MosaicCache::with_limits(block_bytes * 2, usize::MAX);
+        let mut sampled = 0;
+        cache.blocks(key(0), || {
+            sampled += 1;
+            vec![block]
+        });
+        cache.blocks(key(1), || {
+            sampled += 1;
+            vec![block]
+        });
+        cache.blocks(key(0), || {
+            sampled += 1;
+            vec![block]
+        });
+        cache.blocks(key(2), || {
+            sampled += 1;
+            vec![block]
+        });
+
+        assert_eq!(sampled, 3, "the refreshed entry must still be cached");
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[0].0.index, 0);
+        assert_eq!(cache.entries[1].0.index, 2);
+        assert_eq!(cache.retained_bytes(), block_bytes * 2);
+    }
+
+    #[test]
+    fn mosaic_cache_retains_only_visible_clip_blocks() {
+        let image = RgbaImage::from_fn(64, 64, |x, y| {
+            Rgba([(x / 2) as u8 * 8, (y / 2) as u8 * 8, 0, 255])
+        });
+        let source = MosaicSource::memory(&image, 1);
+        let clip = [0.0, 0.0, 20.0, 20.0];
+        let key = MosaicKey::new(0, [0.0, 0.0], [64.0, 64.0], 2.0, 1.0, clip, source);
+        // The full mosaic has 1024 distinct blocks; only the visible 100 may
+        // consume the cache budget.
+        let mut cache = MosaicCache::with_limits(usize::MAX, 100);
+        let blocks = cache.blocks(key, || {
+            mosaic_blocks([0.0, 0.0], [64.0, 64.0], 2.0, source, clip)
+        });
+
+        assert_eq!(blocks.len(), 100);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(blocks.iter().all(|block| {
+            block.at[0] >= clip[0]
+                && block.at[1] >= clip[1]
+                && block.at[0] + block.size[0] <= clip[2]
+                && block.at[1] + block.size[1] <= clip[3]
+        }));
+    }
+
+    #[test]
+    fn mosaic_cache_does_not_retain_oversized_entries() {
+        let block = MosaicBlock {
+            at: [0.0, 0.0],
+            size: [2.0, 2.0],
+            color: [0, 0, 0, 255],
+        };
+        let block_bytes = std::mem::size_of::<MosaicBlock>();
+        let image = solid(1, 1, [0, 0, 0, 255]);
+        let source = MosaicSource::memory(&image, 1);
+        let key = MosaicKey::new(
+            0,
+            [0.0, 0.0],
+            [8.0, 8.0],
+            2.0,
+            1.0,
+            [0.0, 0.0, 8.0, 8.0],
+            source,
+        );
+
+        for mut cache in [
+            MosaicCache::with_limits(block_bytes * 2, usize::MAX),
+            MosaicCache::with_limits(usize::MAX, 2),
+        ] {
+            let mut sampled = 0;
+            for _ in 0..2 {
+                let blocks = cache.blocks(key, || {
+                    sampled += 1;
+                    vec![block; 3]
+                });
+                assert_eq!(blocks.len(), 3, "the oversized frame is still painted");
+                assert!(cache.entries.is_empty(), "oversized results are not cached");
+            }
+            assert_eq!(sampled, 2);
+        }
     }
 
     #[test]
@@ -3506,5 +4085,139 @@ mod tests {
             panic!("text tool must produce a Text shape");
         };
         assert_eq!(text, "mm");
+    }
+
+    #[test]
+    fn upward_translation_also_moves_undo_history_and_drafts() {
+        let mut layer = Layer::default();
+        layer.set_tool(Tool::Line);
+        layer.pointer_down(10.0, 10.0);
+        layer.pointer_move(30.0, 10.0);
+        layer.pointer_up();
+        layer.select_at(20.0, 10.0);
+        layer.begin_edit(20.0, 10.0);
+        layer.drag_edit(25.0, 20.0, [80.0, 80.0]);
+        layer.end_edit();
+
+        layer.translate(0.0, 100.0);
+        assert_eq!(layer.committed()[0].extents(), (15.0, 120.0, 20.0, 0.0));
+        layer.undo();
+        assert_eq!(layer.committed()[0].extents(), (10.0, 110.0, 20.0, 0.0));
+
+        layer.set_tool(Tool::Text);
+        layer.pointer_down(40.0, 40.0);
+        layer.translate(0.0, 25.0);
+        assert_eq!(layer.draft_origin(), Some([40.0, 65.0]));
+    }
+
+    #[test]
+    fn strip_bake_matches_full_bake_at_retina_scale() {
+        let source = RgbaImage::from_fn(64, 128, |x, y| {
+            image::Rgba([x as u8 * 4, y as u8 * 2, (x + y) as u8, 255])
+        });
+        let shapes = [
+            Shape::Rect {
+                from: [8.0, 20.0],
+                to: [40.0, 60.0],
+                style: Style::default(),
+            },
+            Shape::Mosaic {
+                from: [4.0, 70.0],
+                to: [30.0, 100.0],
+                style: Style {
+                    color: 0,
+                    size: 4.0,
+                },
+            },
+        ];
+        let mut full = source.clone();
+        bake(&mut full, &shapes, 2.0);
+        let disk = ImageSource::Memory(Arc::new(source));
+        let first = bake_strip(&disk, 16, 24, &shapes, &WatermarkSpec::default(), 2.0).unwrap();
+        let second = bake_strip(&disk, 80, 24, &shapes, &WatermarkSpec::default(), 2.0).unwrap();
+        assert_eq!(
+            first,
+            image::imageops::crop_imm(&full, 0, 16, 64, 24).to_image()
+        );
+        assert_eq!(
+            second,
+            image::imageops::crop_imm(&full, 0, 80, 64, 24).to_image()
+        );
+    }
+
+    #[test]
+    fn strip_bake_keeps_mosaic_blocks_whole_across_boundaries() {
+        let source = RgbaImage::from_fn(64, 128, |x, y| {
+            image::Rgba([x as u8 * 4, y as u8 * 2, (x + y) as u8, 255])
+        });
+        let shapes = [Shape::Mosaic {
+            from: [4.0, 20.0],
+            to: [30.0, 100.0],
+            style: Style::default(),
+        }];
+        let mut full = source.clone();
+        bake(&mut full, &shapes, 1.0);
+        let disk = ImageSource::Memory(Arc::new(source));
+
+        for start in [0, 17, 32, 63, 96] {
+            let strip =
+                bake_strip(&disk, start, 24, &shapes, &WatermarkSpec::default(), 1.0).unwrap();
+            assert_eq!(
+                strip,
+                image::imageops::crop_imm(&full, 0, start, 64, 24).to_image(),
+                "strip starting at {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn clipped_mosaic_blocks_match_the_same_full_frame_blocks() {
+        let source = RgbaImage::from_fn(16, 16, |x, y| {
+            image::Rgba([x as u8 * 16, y as u8 * 16, 0, 255])
+        });
+        let from = [2.0, 2.0];
+        let to = [12.0, 12.0];
+        let full = mosaic_blocks(
+            from,
+            to,
+            2.0,
+            MosaicSource::memory(&source, 1),
+            [
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+            ],
+        );
+        let clip = [4.0, 4.0, 10.0, 10.0];
+        let clipped = mosaic_blocks(from, to, 2.0, MosaicSource::memory(&source, 1), clip);
+        assert!(!clipped.is_empty());
+        for block in &clipped {
+            assert!(block.at[0] >= clip[0] && block.at[1] >= clip[1]);
+            assert!(block.at[0] + block.size[0] <= clip[2]);
+            assert!(block.at[1] + block.size[1] <= clip[3]);
+            assert!(full.iter().any(|candidate| {
+                candidate.at == block.at
+                    && candidate.size == block.size
+                    && candidate.color == block.color
+            }));
+        }
+    }
+
+    #[test]
+    fn mosaic_source_strip_uses_logical_origin_for_sampling_and_painting() {
+        let source = RgbaImage::from_fn(4, 4, |_, y| image::Rgba([0, y as u8 * 60, 0, 255]));
+        let blocks = mosaic_blocks(
+            [0.0, 10.0],
+            [4.0, 14.0],
+            2.0,
+            MosaicSource::source_at(&source, 1, [0.0, 10.0]),
+            [0.0, 10.0, 4.0, 14.0],
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].at, [0.0, 10.0]);
+        assert_eq!(blocks[0].color, [0, 30, 0, 255]);
+        assert_eq!(blocks[1].at, [0.0, 12.0]);
+        assert_eq!(blocks[1].color, [0, 150, 0, 255]);
     }
 }

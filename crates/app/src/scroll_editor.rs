@@ -4,12 +4,14 @@
 
 use std::{
     cell::Cell,
+    collections::{HashMap, hash_map::Entry},
     ops::Range,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _,
@@ -27,10 +29,10 @@ use gpui_kit::{
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, Rgba,
     ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
+    Subscription, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
 };
-use snapit_capture::{RgbaImage, WatermarkSpec};
+use snapit_capture::{ImageSource, WatermarkSpec};
 use snapit_store::{AnnotationTool, WatermarkTarget};
 
 use crate::annotate::{self, Layer, Shape, Tool};
@@ -40,7 +42,10 @@ use crate::session;
 use crate::settings::AppSettings;
 
 const CONTEXT: &str = "ScrollEditor";
-const TILE_MAX_HEIGHT: u32 = 2048;
+const TILE_OVERSCAN: usize = 1;
+const TILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TILE_ROWS: u32 = 2048;
+const MAX_TILE_ATTEMPTS: u8 = 3;
 const MIN_TRIM_HEIGHT_PX: u32 = 16;
 const TOAST_DURATION: Duration = Duration::from_millis(1600);
 
@@ -71,9 +76,10 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn open(
-    image: RgbaImage,
+    image: ImageSource,
     scale: f32,
     display_id: Option<DisplayId>,
+    shapes: Arc<Vec<Shape>>,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let window_size = size(px(920.), px(720.));
@@ -93,16 +99,71 @@ pub fn open(
         ..Default::default()
     };
     let handle = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| ScrollEditorView::new(image, scale, window, cx))
+        cx.new(|cx| ScrollEditorView::new(image, scale, shapes, window, cx))
     })?
     .0;
     Ok(handle)
 }
 
+#[derive(Clone, Copy)]
 struct EditorTile {
     id: usize,
+    y: u32,
     height: u32,
-    render: Arc<RenderImage>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TileFailure {
+    revision: u64,
+    error: String,
+    attempts: u8,
+}
+
+#[derive(Default)]
+struct TileLoadState {
+    failures: HashMap<usize, TileFailure>,
+}
+
+impl TileLoadState {
+    fn can_attempt(&self, tile_id: usize, revision: u64) -> bool {
+        self.failures.get(&tile_id).is_none_or(|failure| {
+            failure.revision != revision || failure.attempts < MAX_TILE_ATTEMPTS
+        })
+    }
+
+    fn fail(&mut self, tile_id: usize, revision: u64, error: String) {
+        let failure = self.failures.entry(tile_id).or_insert_with(|| TileFailure {
+            revision,
+            error: String::new(),
+            attempts: 0,
+        });
+        if failure.revision == revision {
+            failure.attempts = failure.attempts.saturating_add(1);
+        } else {
+            failure.revision = revision;
+            failure.attempts = 1;
+        }
+        failure.error = error;
+    }
+
+    fn loaded(&mut self, tile_id: usize) {
+        self.failures.remove(&tile_id);
+    }
+
+    fn retry(&mut self, tile_id: usize) -> bool {
+        self.failures.remove(&tile_id).is_some()
+    }
+
+    fn retain(&mut self, visible: &Range<usize>) {
+        self.failures.retain(|tile_id, _| visible.contains(tile_id));
+    }
+
+    fn error(&self, tile_id: usize, revision: u64) -> Option<&str> {
+        self.failures
+            .get(&tile_id)
+            .filter(|failure| failure.revision == revision && failure.attempts >= MAX_TILE_ATTEMPTS)
+            .map(|failure| failure.error.as_str())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,42 +172,102 @@ enum TrimEdge {
     Bottom,
 }
 
-fn build_tiles(image: &RgbaImage) -> Vec<EditorTile> {
-    let (width, height) = image.dimensions();
+fn tile_rows(width: u32) -> anyhow::Result<u32> {
+    anyhow::ensure!(width > 0, "editor tile width is zero");
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .context("editor tile row is too large")?;
+    anyhow::ensure!(
+        row_bytes <= TILE_BYTES,
+        "editor tile row is {:.2} MiB, exceeding the {:.0} MiB tile budget",
+        row_bytes as f64 / (1024.0 * 1024.0),
+        TILE_BYTES as f64 / (1024.0 * 1024.0)
+    );
+    Ok((TILE_BYTES / row_bytes).clamp(1, MAX_TILE_ROWS as usize) as u32)
+}
+
+fn describe_tiles(width: u32, height: u32) -> anyhow::Result<Vec<EditorTile>> {
     if width == 0 || height == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let count = height.div_ceil(TILE_MAX_HEIGHT) as usize;
-    let mut tiles = Vec::with_capacity(count);
-    for ix in 0..count {
-        let y0 = ix as u32 * TILE_MAX_HEIGHT;
-        let h = TILE_MAX_HEIGHT.min(height - y0);
-        let slice = image::imageops::crop_imm(image, 0, y0, width, h).to_image();
-        tiles.push(EditorTile {
-            id: ix,
-            height: h,
-            render: session::render_image(&slice),
-        });
+    let tile_rows = tile_rows(width)?;
+    let count = height.div_ceil(tile_rows) as usize;
+    Ok((0..count)
+        .map(|ix| {
+            let y = ix as u32 * tile_rows;
+            EditorTile {
+                id: ix,
+                y,
+                height: tile_rows.min(height - y),
+            }
+        })
+        .collect())
+}
+
+fn build_tile(image: &ImageSource, tile: EditorTile) -> anyhow::Result<Arc<RenderImage>> {
+    let slice = image.read_rows(tile.y, tile.height)?;
+    Ok(session::render_image(&slice))
+}
+
+fn visible_tile_range(
+    // `visible` is a half-open range in canvas display coordinates.
+    image_width: u32,
+    image_height: u32,
+    scale: f32,
+    zoom: f32,
+    visible: Range<f32>,
+    overscan: usize,
+) -> Range<usize> {
+    if image_width == 0
+        || image_height == 0
+        || !scale.is_finite()
+        || scale <= 0.0
+        || !zoom.is_finite()
+        || zoom <= 0.0
+    {
+        return 0..0;
     }
-    tiles
+    let display_height = image_height as f32 / scale * zoom;
+    let start = visible.start.clamp(0.0, display_height) * scale / zoom;
+    let end = visible.end.clamp(0.0, display_height) * scale / zoom;
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return 0..0;
+    }
+
+    let rows = match tile_rows(image_width) {
+        Ok(rows) => rows as usize,
+        Err(_) => return 0..0,
+    };
+    let count = image_height.div_ceil(rows as u32) as usize;
+    let first = (start.floor() as usize / rows).min(count);
+    let end = (end.ceil() as usize).div_ceil(rows).min(count);
+    first.saturating_sub(overscan)..(end.saturating_add(overscan)).min(count)
+}
+
+fn retain_visible_tiles<T>(cache: &mut HashMap<usize, T>, visible: &Range<usize>) {
+    cache.retain(|tile_id, _| visible.contains(tile_id));
 }
 
 /// Crop `image` vertically to `[trim_top .. trim_bottom]` and shift annotation
 /// shapes into the cropped coordinate space.
 fn crop_and_shift_shapes(
-    image: &RgbaImage,
+    image: &ImageSource,
     shapes: &[Shape],
     scale: f32,
     trim_top: u32,
     trim_bottom: u32,
-) -> (RgbaImage, Option<Arc<Vec<Shape>>>) {
+) -> anyhow::Result<(ImageSource, Option<Arc<Vec<Shape>>>)> {
     let (width, height) = image.dimensions();
     let top = trim_top.min(height.saturating_sub(1));
     let bottom = trim_bottom.clamp(top + 1, height);
-    let cropped = if top == 0 && bottom == height {
-        image.clone()
-    } else {
-        image::imageops::crop_imm(image, 0, top, width, bottom - top).to_image()
+    let cropped = match image {
+        ImageSource::Memory(_) if top == 0 && bottom == height => image.clone(),
+        ImageSource::Memory(image) => ImageSource::Memory(Arc::new(
+            image::imageops::crop_imm(image.as_ref(), 0, top, width, bottom - top).to_image(),
+        )),
+        ImageSource::Disk(image) => {
+            ImageSource::Disk(Arc::new(image.crop_vertical(top, bottom - top)?))
+        }
     };
     let shifted = if shapes.is_empty() {
         None
@@ -154,13 +275,22 @@ fn crop_and_shift_shapes(
         let dy = -(top as f32 / scale.max(0.1));
         Some(Arc::new(annotate::shift_shapes_vertical(shapes, dy)))
     };
-    (cropped, shifted)
+    Ok((cropped, shifted))
 }
 
 pub struct ScrollEditorView {
-    image: Arc<RgbaImage>,
+    image: Arc<ImageSource>,
     scale: f32,
     tiles: Vec<EditorTile>,
+    tile_range: Range<usize>,
+    tile_cache: HashMap<usize, Arc<RenderImage>>,
+    tile_loads: TileLoadState,
+    tile_layout_error: Option<String>,
+    tile_revision: u64,
+    tile_task: Option<Task<()>>,
+    tile_worker_active: bool,
+    requested_tile_range: Rc<Cell<Option<(usize, usize)>>>,
+    viewport_geometry: Rc<Cell<Option<(f32, Pixels)>>>,
     annotations: Layer,
     color_picker: Entity<ColorPickerState>,
     size_sliders: Vec<Entity<SliderState>>,
@@ -181,18 +311,31 @@ pub struct ScrollEditorView {
 }
 
 impl ScrollEditorView {
-    fn new(image: RgbaImage, scale: f32, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        image: ImageSource,
+        scale: f32,
+        shapes: Arc<Vec<Shape>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let scale = if scale.is_finite() && scale > 0.1 {
             scale
         } else {
             1.0
         };
         let (width, height) = image.dimensions();
-        let tiles = build_tiles(&image);
+        let (tiles, tile_layout_error) = match describe_tiles(width, height) {
+            Ok(tiles) => (tiles, None),
+            Err(err) => {
+                let error = format!("{err:#}");
+                log::error!("failed to describe scroll editor tiles: {error}");
+                (Vec::new(), Some(error))
+            }
+        };
         let logical_w = (width as f32 / scale).max(1.0);
         let fit_zoom = (700.0 / logical_w).clamp(0.2, 1.0);
         let defaults = AppSettings::get(cx).annotations.clone();
-        let annotations = Layer::new(defaults.clone());
+        let annotations = Layer::from_shapes(defaults.clone(), shapes);
         let style_color = annotations.style().color;
 
         let color_picker = cx.new(|cx| {
@@ -247,10 +390,19 @@ impl ScrollEditorView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        Self {
+        let mut view = Self {
             image: Arc::new(image),
             scale,
             tiles,
+            tile_range: 0..0,
+            tile_cache: HashMap::new(),
+            tile_loads: TileLoadState::default(),
+            tile_layout_error,
+            tile_revision: 0,
+            tile_task: None,
+            tile_worker_active: false,
+            requested_tile_range: Rc::new(Cell::new(None)),
+            viewport_geometry: Rc::new(Cell::new(None)),
             annotations,
             color_picker,
             size_sliders,
@@ -268,7 +420,149 @@ impl ScrollEditorView {
             focus_handle,
             toast: None,
             _subscriptions: subscriptions,
+        };
+        let initial_range = if view.tiles.is_empty() {
+            0..0
+        } else {
+            visible_tile_range(
+                width,
+                height,
+                scale,
+                fit_zoom,
+                0.0..window.viewport_size().height.as_f32(),
+                TILE_OVERSCAN,
+            )
+        };
+        view.set_tile_range(initial_range, cx);
+        view
+    }
+
+    fn set_tile_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let start = range.start.min(self.tiles.len());
+        let end = range.end.clamp(start, self.tiles.len());
+        let range = start..end;
+        if range == self.tile_range {
+            return;
         }
+        self.tile_range = range;
+        self.tile_revision = self.tile_revision.wrapping_add(1);
+        retain_visible_tiles(&mut self.tile_cache, &self.tile_range);
+        self.tile_loads.retain(&self.tile_range);
+        cx.notify();
+        self.start_tile_worker(cx);
+    }
+
+    fn retry_tile(&mut self, tile_id: usize, cx: &mut Context<Self>) {
+        if !self.tile_range.contains(&tile_id) || !self.tile_loads.retry(tile_id) {
+            return;
+        }
+        cx.notify();
+        self.start_tile_worker(cx);
+    }
+
+    fn render_tile_range(&self, image_height: u32) -> Range<usize> {
+        let Some((visible_top, last_offset)) = self.viewport_geometry.get() else {
+            return self.tile_range.clone();
+        };
+        let offset_delta = self.scroll_handle.offset().y - last_offset;
+        // Prepaint bounds already include the scroll offset. Predict its next
+        // position so a fast scroll gets placeholders before the deferred update.
+        let visible_top = visible_top - offset_delta.as_f32();
+        visible_tile_range(
+            self.image.width(),
+            image_height,
+            self.scale,
+            self.zoom,
+            visible_top..visible_top + self.scroll_handle.bounds().size.height.as_f32(),
+            TILE_OVERSCAN,
+        )
+    }
+
+    fn start_tile_worker(&mut self, cx: &mut Context<Self>) {
+        if self.tile_worker_active
+            || !self.tiles[self.tile_range.clone()].iter().any(|tile| {
+                self.tile_loads.can_attempt(tile.id, self.tile_revision)
+                    && !self.tile_cache.contains_key(&tile.id)
+            })
+        {
+            return;
+        }
+
+        self.tile_worker_active = true;
+        let image = self.image.clone();
+        self.tile_task = Some(
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    let next = this
+                        .update(cx, |this, _| {
+                            let tile = this.tiles[this.tile_range.clone()].iter().copied().find(
+                                |tile| {
+                                    this.tile_loads.can_attempt(tile.id, this.tile_revision)
+                                        && !this.tile_cache.contains_key(&tile.id)
+                                },
+                            )?;
+                            Some((this.tile_revision, tile))
+                        })
+                        .ok()
+                        .flatten();
+                    let Some((revision, tile)) = next else {
+                        this.update(cx, |this, _| {
+                            this.tile_worker_active = false;
+                        })
+                        .ok();
+                        break;
+                    };
+
+                    let image = image.clone();
+                    let render = cx
+                        .background_executor()
+                        .spawn(async move { build_tile(&image, tile) })
+                        .await;
+                    let render = match render {
+                        Ok(render) => render,
+                        Err(err) => {
+                            let error = format!("{err:#}");
+                            log::warn!("failed to load editor tile {}: {error}", tile.id);
+                            this.update(cx, |this, cx| {
+                                let visible = this.tile_range.contains(&tile.id);
+                                this.tile_loads.fail(tile.id, revision, error);
+                                if !visible {
+                                    this.tile_loads.retain(&this.tile_range);
+                                }
+                                if visible && this.tile_revision == revision {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                            continue;
+                        }
+                    };
+                    let keep_going = this
+                        .update(cx, |this, cx| {
+                            if this.tile_revision != revision || !this.tile_range.contains(&tile.id)
+                            {
+                                // Keep one sequential worker and let it pick up
+                                // the latest range instead of converting this stale tile.
+                                return true;
+                            }
+                            if let Entry::Vacant(entry) = this.tile_cache.entry(tile.id) {
+                                entry.insert(render);
+                                this.tile_loads.loaded(tile.id);
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        this.update(cx, |this, _| {
+                            this.tile_worker_active = false;
+                        })
+                        .ok();
+                        break;
+                    }
+                }
+            }),
+        );
     }
 
     fn persist_defaults(&self, cx: &mut App) {
@@ -349,7 +643,7 @@ impl ScrollEditorView {
             self.scale,
             self.trim_top,
             self.trim_bottom,
-        );
+        )?;
         Ok(Captured::from_parts(
             cropped, None, self.scale, shapes, watermark,
         ))
@@ -772,6 +1066,8 @@ impl Render for ScrollEditorView {
         let logical_h = img_h as f32 / self.scale;
         let disp_w = (logical_w * self.zoom).max(1.0);
         let disp_h = (logical_h * self.zoom).max(1.0);
+        let render_tile_range = self.render_tile_range(img_h);
+        self.start_tile_worker(cx);
 
         let trim_top_disp = (self.trim_top as f32 / self.scale) * self.zoom;
         let trim_bottom_disp = (self.trim_bottom as f32 / self.scale) * self.zoom;
@@ -785,8 +1081,13 @@ impl Render for ScrollEditorView {
         let zoom = self.zoom;
         let mosaics = self.mosaics.clone();
         let canvas_bounds_slot = self.canvas_bounds.clone();
+        let requested_tile_range = self.requested_tile_range.clone();
+        let viewport_geometry = self.viewport_geometry.clone();
+        let scroll_handle = self.scroll_handle.clone();
+        let annotation_scroll_handle = scroll_handle.clone();
         let ime_focus = self.focus_handle.clone();
         let view_entity = cx.entity();
+        let tile_view = view_entity.downgrade();
 
         let fit_w_zoom = {
             let vw = (window.viewport_size().width.as_f32() - 64.0).max(200.0);
@@ -1084,43 +1385,110 @@ impl Render for ScrollEditorView {
                                             MouseButton::Left,
                                             cx.listener(Self::on_canvas_mouse_down),
                                         )
-                                        .child(v_flex().size_full().children(
-                                            self.tiles.iter().map(|tile| {
-                                                let tile_h = (tile.height as f32 / scale) * zoom;
-                                                img(tile.render.clone())
-                                                    .id(SharedString::from(format!(
-                                                        "ed-tile-{}",
-                                                        tile.id
-                                                    )))
-                                                    .w(px(disp_w))
-                                                    .h(px(tile_h))
-                                                    .object_fit(ObjectFit::Fill)
+                                        .child(div().absolute().inset_0().children(
+                                            render_tile_range.clone().filter_map(|ix| {
+                                                self.tiles.get(ix).map(|tile| {
+                                                    let tile_h =
+                                                        (tile.height as f32 / scale) * zoom;
+                                                    div()
+                                                        .id(("ed-tile", tile.id))
+                                                        .absolute()
+                                                        .left_0()
+                                                        .top(px((tile.y as f32 / scale) * zoom))
+                                                        .w(px(disp_w))
+                                                        .h(px(tile_h))
+                                                        .bg(theme.background)
+                                                        .when_some(
+                                                            self.tile_cache.get(&tile.id),
+                                                            |tile, render| {
+                                                                tile.child(
+                                                                    img(render.clone())
+                                                                        .w_full()
+                                                                        .h_full()
+                                                                        .object_fit(
+                                                                            ObjectFit::Fill,
+                                                                        ),
+                                                                )
+                                                            },
+                                                        )
+                                                })
                                             }),
                                         ))
                                         .child(
                                             div().absolute().inset_0().overflow_hidden().child(
                                                 canvas(
-                                                    move |bounds, _, _| {
+                                                    move |bounds, _, cx| {
                                                         canvas_bounds_slot.set(Some(bounds));
+                                                        let viewport = scroll_handle.bounds();
+                                                        let visible_top = (viewport.top()
+                                                            - bounds.top())
+                                                        .as_f32();
+                                                        viewport_geometry.set(Some((
+                                                            visible_top,
+                                                            scroll_handle.offset().y,
+                                                        )));
+                                                        let range = visible_tile_range(
+                                                            img_w,
+                                                            img_h,
+                                                            scale,
+                                                            zoom,
+                                                            visible_top
+                                                                ..visible_top
+                                                                    + viewport.size.height.as_f32(),
+                                                            TILE_OVERSCAN,
+                                                        );
+                                                        let range_key = (range.start, range.end);
+                                                        if requested_tile_range.get()
+                                                            != Some(range_key)
+                                                        {
+                                                            requested_tile_range
+                                                                .set(Some(range_key));
+                                                            cx.defer(move |cx| {
+                                                                tile_view
+                                                                    .update(cx, |this, cx| {
+                                                                        this.set_tile_range(
+                                                                            range, cx,
+                                                                        );
+                                                                    })
+                                                                    .ok();
+                                                            });
+                                                        }
                                                     },
                                                     move |bounds, _, window, cx| {
+                                                        let viewport =
+                                                            annotation_scroll_handle.bounds();
+                                                        let visible_top = (viewport.top()
+                                                            - bounds.top())
+                                                        .as_f32();
+                                                        let clip = [
+                                                            0.0,
+                                                            visible_top / zoom,
+                                                            logical_w,
+                                                            (visible_top
+                                                                + viewport.size.height.as_f32())
+                                                                / zoom,
+                                                        ];
                                                         let mut guard = mosaics.lock().ok();
                                                         let mut fallback =
                                                             annotate::MosaicCache::default();
                                                         let cache = guard
                                                             .as_deref_mut()
                                                             .unwrap_or(&mut fallback);
-                                                        let source = layer
-                                                            .needs_source()
-                                                            .then_some(annotate::MosaicSource {
-                                                                image: &image,
-                                                                stamp: 1,
-                                                            });
-                                                        annotate::paint_layer_zoomed(
+                                                        let source =
+                                                            layer.needs_source().then_some(
+                                                                annotate::MosaicSource::source(
+                                                                    &image, 1,
+                                                                ),
+                                                            );
+                                                        if source.is_none() {
+                                                            cache.clear();
+                                                        }
+                                                        annotate::paint_layer_zoomed_clipped(
                                                             &layer,
                                                             bounds.origin,
                                                             scale,
                                                             zoom,
+                                                            clip,
                                                             source,
                                                             cache,
                                                             window,
@@ -1140,6 +1508,65 @@ impl Render for ScrollEditorView {
                                                 )
                                                 .size_full(),
                                             ),
+                                        )
+                                        .children(render_tile_range.filter_map(|ix| {
+                                            let tile = self.tiles.get(ix)?;
+                                            let error =
+                                                self.tile_loads.error(ix, self.tile_revision)?;
+                                            let message =
+                                                format!("{error}\n{}", t!("permission.recheck"));
+                                            Some(
+                                                div()
+                                                    .id(("ed-tile-error", tile.id))
+                                                    .absolute()
+                                                    .left_0()
+                                                    .top(px((tile.y as f32 / scale) * zoom))
+                                                    .w(px(disp_w))
+                                                    .h(px((tile.height as f32 / scale) * zoom))
+                                                    .bg(theme.background)
+                                                    .border_1()
+                                                    .border_color(theme.danger)
+                                                    .overflow_hidden()
+                                                    .cursor_pointer()
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.retry_tile(ix, cx);
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .size_full()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .gap_1()
+                                                            .p_2()
+                                                            .text_xs()
+                                                            .text_color(theme.danger)
+                                                            .child(message),
+                                                    ),
+                                            )
+                                        }))
+                                        .when_some(
+                                            self.tile_layout_error.as_ref(),
+                                            |this, error| {
+                                                this.child(
+                                                    div()
+                                                        .absolute()
+                                                        .inset_0()
+                                                        .bg(theme.background)
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .p_4()
+                                                        .text_sm()
+                                                        .text_color(theme.danger)
+                                                        .child(error.clone()),
+                                                )
+                                            },
                                         )
                                         .when(show_trim, |this| {
                                             this.when(trim_top_disp > 0.5, |this| {
@@ -1281,14 +1708,151 @@ mod tests {
     use crate::annotate::Style;
 
     #[test]
+    fn tile_descriptors_keep_source_offsets_without_pixels() {
+        let tiles = describe_tiles(1024, 4113).unwrap();
+        assert_eq!(tiles.len(), 3);
+        assert_eq!((tiles[0].id, tiles[0].y, tiles[0].height), (0, 0, 2048));
+        assert_eq!((tiles[1].id, tiles[1].y, tiles[1].height), (1, 2048, 2048));
+        assert_eq!((tiles[2].id, tiles[2].y, tiles[2].height), (2, 4096, 17));
+        assert!(describe_tiles(0, 4096).unwrap().is_empty());
+        assert!(describe_tiles(1024, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ultrawide_editor_tiles_stay_within_read_and_tile_budgets() {
+        for width in [65_536, 65_537, 100_000, 1_000_000, TILE_BYTES as u32 / 4] {
+            let rows = tile_rows(width).unwrap();
+            if width > 65_536 {
+                assert!(rows < 256);
+            }
+            let tiles = describe_tiles(width, 1025).unwrap();
+            let mut next_y = 0;
+            for tile in tiles {
+                assert_eq!(tile.y, next_y);
+                assert!(tile.height > 0);
+                let bytes = tile.height as usize * width as usize * 4;
+                assert!(bytes <= TILE_BYTES);
+                assert!(bytes <= 64 * 1024 * 1024);
+                next_y += tile.height;
+            }
+            assert_eq!(next_y, 1025);
+        }
+
+        let too_wide = TILE_BYTES as u32 / 4 + 1;
+        let error = tile_rows(too_wide).unwrap_err();
+        assert!(error.to_string().contains("tile budget"));
+        assert!(describe_tiles(too_wide, 1).is_err());
+        assert!(visible_tile_range(too_wide, 1, 1.0, 1.0, 0.0..1.0, 0).is_empty());
+    }
+
+    #[test]
+    fn editor_tile_failures_are_bounded_and_revision_scoped() {
+        let mut loads = TileLoadState::default();
+        for attempt in 1..=MAX_TILE_ATTEMPTS {
+            assert!(loads.can_attempt(2, 11));
+            loads.fail(2, 11, format!("failure {attempt}"));
+        }
+        assert!(!loads.can_attempt(2, 11));
+        assert_eq!(loads.error(2, 11), Some("failure 3"));
+        assert!(loads.error(2, 12).is_none());
+        assert!(loads.can_attempt(2, 12));
+
+        loads.fail(2, 12, "new revision".to_string());
+        let failure = loads.failures.get(&2).unwrap();
+        assert_eq!(failure.revision, 12);
+        assert_eq!(failure.attempts, 1);
+        assert!(loads.retry(2));
+        assert!(!loads.retry(2));
+        assert!(loads.can_attempt(2, 12));
+
+        loads.fail(2, 12, "transient".to_string());
+        loads.loaded(2);
+        assert!(loads.error(2, 12).is_none());
+        loads.fail(7, 12, "offscreen".to_string());
+        loads.retain(&(1..3));
+        assert!(!loads.failures.contains_key(&7));
+    }
+
+    #[test]
+    fn tile_range_uses_half_open_visible_boundaries() {
+        assert_eq!(
+            visible_tile_range(1024, 6144, 1.0, 1.0, 0.0..4096.0, 0),
+            0..2
+        );
+        assert_eq!(
+            visible_tile_range(1024, 6144, 1.0, 1.0, 2048.0..2049.0, 0),
+            1..2
+        );
+        assert_eq!(
+            visible_tile_range(1024, 6144, 1.0, 1.0, 4096.0..5000.0, 0),
+            2..3
+        );
+    }
+
+    #[test]
+    fn tile_range_adds_bounded_overscan_and_clamps_to_image_edges() {
+        assert_eq!(
+            visible_tile_range(1024, 10_000, 1.0, 1.0, 4200.0..4300.0, TILE_OVERSCAN),
+            1..4
+        );
+        assert_eq!(
+            visible_tile_range(1024, 5000, 1.0, 1.0, 4900.0..6000.0, TILE_OVERSCAN),
+            1..3
+        );
+        assert_eq!(
+            visible_tile_range(1024, 10_000, 1.0, 1.0, 0.0..100.0, TILE_OVERSCAN),
+            0..2
+        );
+    }
+
+    #[test]
+    fn tile_range_maps_zoom_and_ignores_invalid_geometry() {
+        assert_eq!(
+            visible_tile_range(1024, 6000, 2.0, 0.5, 0.0..1000.0, 0),
+            0..2
+        );
+        assert_eq!(
+            visible_tile_range(1024, 6000, 2.0, 0.5, 1400.0..1600.0, 0),
+            2..3
+        );
+        for range in [
+            visible_tile_range(1024, 0, 1.0, 1.0, 0.0..100.0, 1),
+            visible_tile_range(1024, 6000, 0.0, 1.0, 0.0..100.0, 1),
+            visible_tile_range(1024, 6000, 1.0, f32::NAN, 0.0..100.0, 1),
+            visible_tile_range(1024, 6000, 1.0, 1.0, f32::NAN..100.0, 1),
+            visible_tile_range(1024, 6000, 1.0, 1.0, 100.0..100.0, 1),
+            visible_tile_range(1024, 6000, 1.0, 1.0, -100.0..-10.0, 1),
+            visible_tile_range(1024, 6000, 1.0, 1.0, 7000.0..8000.0, 1),
+        ] {
+            assert!(range.is_empty());
+        }
+    }
+
+    #[test]
+    fn eviction_releases_tiles_outside_the_visible_range() {
+        let retained = Arc::new(());
+        let evicted = Arc::new(());
+        let retained_weak = Arc::downgrade(&retained);
+        let evicted_weak = Arc::downgrade(&evicted);
+        let mut cache = HashMap::from([(1, evicted), (3, retained), (5, Arc::new(()))]);
+
+        retain_visible_tiles(&mut cache, &(2..4));
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&3));
+        assert!(retained_weak.upgrade().is_some());
+        assert!(evicted_weak.upgrade().is_none());
+    }
+
+    #[test]
     fn cropping_trim_shifts_annotations_vertically() {
-        let image = RgbaImage::new(200, 1000);
+        let image = ImageSource::from(snapit_capture::RgbaImage::new(200, 1000));
         let shapes = vec![Shape::Rect {
             from: [10.0, 120.0],
             to: [50.0, 200.0],
             style: Style::default(),
         }];
-        let (cropped, shifted) = crop_and_shift_shapes(&image, &shapes, 2.0, 100, 800);
+        let (cropped, shifted) = crop_and_shift_shapes(&image, &shapes, 2.0, 100, 800).unwrap();
         assert_eq!(cropped.dimensions(), (200, 700));
         let shifted = shifted.unwrap();
         match &shifted[0] {
