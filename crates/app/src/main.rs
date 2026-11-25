@@ -20,6 +20,7 @@ mod autostart;
 mod clipboard;
 mod controller;
 mod events;
+mod export;
 mod history_store;
 mod history_view;
 mod hotkey;
@@ -32,12 +33,15 @@ mod permission_view;
 mod permissions;
 mod pin;
 mod recording_bar;
+mod scroll_bar;
+mod scroll_editor;
 mod session;
 mod settings;
 mod settings_view;
 mod tray;
 mod update_view;
 mod updater;
+mod watermark_editor;
 
 use gpui_kit::{KeyBinding, Menu, MenuItem, QuitMode, actions};
 use snapit_store::AppDirs;
@@ -139,6 +143,9 @@ fn main() {
         appearance::set_dock_visible(false, cx);
         overlay::init(cx);
         pin::init(cx);
+        watermark_editor::init(cx);
+        scroll_bar::init(cx);
+        scroll_editor::init(cx);
 
         cx.bind_keys([
             KeyBinding::new(shortcut!("q"), Quit, None),

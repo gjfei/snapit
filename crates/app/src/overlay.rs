@@ -35,7 +35,7 @@ use crate::settings::AppSettings;
 use gpui_kit::assets::IconName as LucideIcon;
 use snapit_capture::RgbaImage;
 use snapit_recorder::RecordFormat;
-use snapit_store::AnnotationTool;
+use snapit_store::{AnnotationTool, WatermarkPreset, WatermarkTarget};
 
 const CONTEXT: &str = "SnapItOverlay";
 
@@ -75,6 +75,7 @@ actions!(
         SaveSelection,
         PinSelection,
         RecognizeSelection,
+        ScrollCapture,
         RecordAnimation,
         RecordVideo,
         UndoAnnotations,
@@ -163,11 +164,16 @@ pub struct OverlayView {
     /// runs on every pointer move: cropping the region costs milliseconds per
     /// frame and averaging its blocks costs a few more.
     paint_cache: Arc<Mutex<PaintCache>>,
+    /// Selection-sized SDR watermark layer, rebuilt only when the region or
+    /// watermark configuration changes.
+    watermark_preview: RefCell<Option<SelectionWatermarkCache>>,
     /// Transient "color copied" confirmation and when it was shown.
     toast: Option<(SharedString, Instant)>,
     /// The overlay has become the recording indicator: only this outline is
     /// drawn, everything else (frozen frame, mask, toolbar) stays off screen.
     recording: Option<Bounds<Pixels>>,
+    /// Colors the live recording/scroll outline in warning color when active.
+    live_warning: bool,
     /// Toolbar top-left after the user dragged it; `None` keeps the automatic
     /// placement below/above/beside the selection.
     toolbar_position: Option<Point<Pixels>>,
@@ -179,10 +185,10 @@ pub struct OverlayView {
 }
 
 const TOOLBAR_HEIGHT: f32 = 34.;
-/// Estimate of the one-row toolbar (seven annotation tools, two record
-/// buttons and the capture actions), used to right-align it and to keep the
-/// style panel off it.
-const TOOLBAR_WIDTH: f32 = 520.;
+/// Estimate of the one-row toolbar (seven annotation tools, scroll capture, two
+/// record buttons and the capture actions), used to right-align it and to keep
+/// the style panel off it.
+const TOOLBAR_WIDTH: f32 = 556.;
 const STYLE_PANEL_WIDTH: f32 = 300.;
 const STYLE_PANEL_HEIGHT: f32 = 82.;
 const TOOLBAR_GAP: f32 = 8.;
@@ -193,6 +199,11 @@ const TOOLBAR_GAP: f32 = 8.;
 struct PaintCache {
     crop: Option<(CropKey, RgbaImage)>,
     mosaics: annotate::MosaicCache,
+}
+
+struct SelectionWatermarkCache {
+    key: (CropKey, WatermarkPreset),
+    result: std::result::Result<Option<Arc<RenderImage>>, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -387,8 +398,10 @@ impl OverlayView {
             hover_shape: false,
             pointer: None,
             paint_cache: Arc::new(Mutex::new(PaintCache::default())),
+            watermark_preview: RefCell::new(None),
             toast: None,
             recording: None,
+            live_warning: false,
             toolbar_position: None,
             toolbar_drag: None,
             _subscription: subscription,
@@ -484,6 +497,7 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) {
         self.recording = Some(selection);
+        self.live_warning = false;
         self.style_anchor = None;
         self.toast = None;
         self.hover_handle = None;
@@ -497,6 +511,13 @@ impl OverlayView {
         });
         crate::recording_bar::make_recording_window(window);
         cx.notify();
+    }
+
+    pub fn set_live_warning(&mut self, warning: bool, cx: &mut Context<Self>) {
+        if self.live_warning != warning {
+            self.live_warning = warning;
+            cx.notify();
+        }
     }
 
     fn request(&mut self, command: SessionCommand, cx: &mut Context<Self>) {
@@ -1428,6 +1449,17 @@ impl OverlayView {
                         )
                         .content(div().w(px(1.)).h(px(16.)).bg(border).mx_1())
                     })
+                    .child(
+                        Button::new("scroll-capture")
+                            .ghost()
+                            .icon(LucideIcon::ScrollText)
+                            .tooltip(t!("overlay.scroll").to_string())
+                            .accessibility_label(t!("overlay.scroll").to_string())
+                            .disabled(multi || composed)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request(SessionCommand::Scroll, cx)
+                            })),
+                    )
                     .child({
                         let format = crate::controller::last_animation_format(cx);
                         let label = t!(
@@ -1554,20 +1586,11 @@ fn shadowed_frame(
     shadows: Vec<BoxShadow>,
     image: &Arc<RenderImage>,
     viewport: Bounds<Pixels>,
+    scale: f32,
     border: Hsla,
 ) -> Vec<AnyElement> {
     if shadows.is_empty() {
-        return vec![
-            div()
-                .absolute()
-                .left(bounds.origin.x)
-                .top(bounds.origin.y)
-                .w(bounds.size.width)
-                .h(bounds.size.height)
-                .border_1()
-                .border_color(border)
-                .into_any_element(),
-        ];
+        return selection_outline(bounds, scale, border);
     }
     let mut layers = vec![
         div()
@@ -1596,18 +1619,44 @@ fn shadowed_frame(
             )
             .into_any_element(),
     ];
-    layers.push(
-        div()
-            .absolute()
-            .left(bounds.origin.x)
-            .top(bounds.origin.y)
-            .w(bounds.size.width)
-            .h(bounds.size.height)
-            .border_1()
-            .border_color(border)
-            .into_any_element(),
-    );
+    layers.extend(selection_outline(bounds, scale, border));
     layers
+}
+
+fn selection_outline_rects(bounds: Bounds<Pixels>, scale: f32) -> [Bounds<Pixels>; 4] {
+    let line = px(1.0 / scale);
+    let left = bounds.origin.x;
+    let top = bounds.origin.y;
+    let right = bounds.right();
+    let bottom = bounds.bottom();
+    [
+        Bounds::new(
+            point(left - line, top - line),
+            size(bounds.size.width + line + line, line),
+        ),
+        Bounds::new(
+            point(left - line, bottom),
+            size(bounds.size.width + line + line, line),
+        ),
+        Bounds::new(point(left - line, top), size(line, bounds.size.height)),
+        Bounds::new(point(right, top), size(line, bounds.size.height)),
+    ]
+}
+
+fn selection_outline(bounds: Bounds<Pixels>, scale: f32, color: Hsla) -> Vec<AnyElement> {
+    selection_outline_rects(bounds, scale)
+        .into_iter()
+        .map(|bounds| {
+            div()
+                .absolute()
+                .left(bounds.origin.x)
+                .top(bounds.origin.y)
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .bg(color)
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// A shaded band: top/bottom edges plus the free x-intervals inside it.
@@ -1716,31 +1765,19 @@ fn shade_rects(selections: &[Bounds<Pixels>], viewport: Bounds<Pixels>) -> Vec<B
 /// The live recording frame: the capture overlay's look without the frozen
 /// image — everything outside the region dimmed, and the one-pixel selection
 /// border kept just outside the captured pixels so it stays out of the file.
-fn recording_frame(selection: Bounds<Pixels>, viewport: Bounds<Pixels>, cx: &App) -> AnyElement {
+fn recording_frame(
+    selection: Bounds<Pixels>,
+    viewport: Bounds<Pixels>,
+    scale: f32,
+    warning: bool,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
-    let line = px(1.);
-    let outer = Bounds::new(
-        selection.origin - point(line, line),
-        size(
-            selection.size.width + line + line,
-            selection.size.height + line + line,
-        ),
-    );
-    let strips = [
-        Bounds::new(outer.origin, size(outer.size.width, line)),
-        Bounds::new(
-            outer.origin + point(px(0.), outer.size.height - line),
-            size(outer.size.width, line),
-        ),
-        Bounds::new(
-            outer.origin + point(px(0.), line),
-            size(line, outer.size.height - line - line),
-        ),
-        Bounds::new(
-            outer.origin + point(outer.size.width - line, line),
-            size(line, outer.size.height - line - line),
-        ),
-    ];
+    let outline = if warning {
+        theme.warning
+    } else {
+        theme.primary
+    };
     div()
         .size_full()
         .children(
@@ -1757,16 +1794,7 @@ fn recording_frame(selection: Bounds<Pixels>, viewport: Bounds<Pixels>, cx: &App
                         .into_any_element()
                 }),
         )
-        .children(strips.map(|bounds| {
-            div()
-                .absolute()
-                .left(bounds.origin.x)
-                .top(bounds.origin.y)
-                .w(bounds.size.width)
-                .h(bounds.size.height)
-                .bg(theme.primary)
-                .into_any_element()
-        }))
+        .children(selection_outline(selection, scale, outline))
         .into_any_element()
 }
 
@@ -1926,11 +1954,73 @@ impl EntityInputHandler for OverlayView {
     }
 }
 
+impl OverlayView {
+    fn selection_watermark_preview(
+        &self,
+        multi: bool,
+        composed: bool,
+        cx: &App,
+    ) -> Option<Arc<RenderImage>> {
+        let config = AppSettings::get(cx).watermark.clone();
+        if !config.enabled
+            || !config.target_enabled(WatermarkTarget::Screenshot)
+            || (multi && !composed)
+        {
+            self.watermark_preview.borrow_mut().take();
+            return None;
+        }
+        let Some(preset) = config.preset(WatermarkTarget::Screenshot).cloned() else {
+            self.watermark_preview.borrow_mut().take();
+            return None;
+        };
+        let session = self.session.read(cx);
+        let key = session.crop_key()?;
+        if let Some(cached) = self.watermark_preview.borrow().as_ref()
+            && cached.key == (key, preset.clone())
+        {
+            return cached.result.clone().ok().flatten();
+        }
+        let result = (|| -> std::result::Result<Option<Arc<RenderImage>>, String> {
+            let (crop, _, scale) = session
+                .crop_selections()
+                .ok_or_else(|| "selection pixels are unavailable".to_string())?;
+            let (width, height) = crop.dimensions();
+            drop(crop);
+            let spec = crate::export::watermark_spec(&preset, AppSettings::watermark_dir(cx))
+                .map_err(|err| err.to_string())?;
+            let layer = spec
+                .rasterize(width, height, scale)
+                .map_err(|err| err.to_string())?;
+            if layer.is_empty() {
+                return Ok(None);
+            }
+            let mut pixels = RgbaImage::new(width, height);
+            layer.apply_sdr_mut(&mut pixels);
+            Ok(Some(crate::session::render_image(&pixels)))
+        })();
+        if let Err(error) = &result {
+            log::warn!("selection watermark preview failed: {error}");
+        }
+        self.watermark_preview
+            .replace(Some(SelectionWatermarkCache {
+                key: (key, preset),
+                result: result.clone(),
+            }));
+        result.ok().flatten()
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(selection) = self.recording {
             let viewport = Bounds::new(Default::default(), window.viewport_size());
-            return recording_frame(selection, viewport, cx);
+            return recording_frame(
+                selection,
+                viewport,
+                window.scale_factor(),
+                self.live_warning,
+                cx,
+            );
         }
         self.sync_style_controls(window, cx);
         let style_anchor = self.live_style_anchor(cx);
@@ -1964,6 +2054,11 @@ impl Render for OverlayView {
         let collecting = session.collecting();
         let composed = session.is_composed();
         let multi = session.multi_selection();
+        let watermark_preview = committed_bounds.and_then(|_| {
+            (intent == CaptureIntent::Choose)
+                .then(|| self.selection_watermark_preview(multi, composed, cx))
+                .flatten()
+        });
         // Crosshair only while a region can still be drawn. Once the region is
         // locked the arrow comes back; over an annotation a hand says the
         // press will pick it instead of drawing.
@@ -2075,6 +2170,12 @@ impl Render for OverlayView {
             .on_action(cx.listener(|this, _: &RecognizeSelection, _, cx| {
                 this.request(SessionCommand::Recognize, cx)
             }))
+            .on_action(cx.listener(|this, _: &ScrollCapture, _, cx| {
+                if this.session.read(cx).is_composed() {
+                    return;
+                }
+                this.request(SessionCommand::Scroll, cx)
+            }))
             .on_action(cx.listener(|this, _: &RecordAnimation, _, cx| {
                 if this.session.read(cx).is_composed() {
                     return;
@@ -2172,6 +2273,7 @@ impl Render for OverlayView {
                         shadows.clone(),
                         &image,
                         viewport,
+                        scale,
                         if removing { danger } else { ring },
                     )
                 }
@@ -2182,6 +2284,7 @@ impl Render for OverlayView {
                     shadows.clone(),
                     &image,
                     viewport,
+                    scale,
                     ring,
                 ))
             })
@@ -2291,6 +2394,17 @@ impl Render for OverlayView {
                             .size_full(),
                         ),
                 )
+                .when_some(watermark_preview, |this, preview| {
+                    this.child(
+                        img(preview)
+                            .absolute()
+                            .left(bounds.origin.x)
+                            .top(bounds.origin.y)
+                            .w(bounds.size.width)
+                            .h(bounds.size.height)
+                            .object_fit(ObjectFit::Fill),
+                    )
+                })
                 .when(!collecting && !composed, |this| {
                     this.children(resize_handles(bounds, ring, cx.theme().background))
                 })
@@ -2536,8 +2650,8 @@ mod macos_window {
 #[cfg(test)]
 mod tests {
     use super::{
-        STYLE_PANEL_HEIGHT, STYLE_PANEL_WIDTH, TOOLBAR_HEIGHT, TOOLBAR_WIDTH, shade_rects,
-        style_panel_origin,
+        STYLE_PANEL_HEIGHT, STYLE_PANEL_WIDTH, TOOLBAR_HEIGHT, TOOLBAR_WIDTH,
+        selection_outline_rects, shade_rects, style_panel_origin,
     };
     use gpui_kit::{Bounds, Pixels, point, px, size};
 
@@ -2554,6 +2668,16 @@ mod tests {
                 && y >= top
                 && y < top + rect.size.height.as_f32()
         })
+    }
+
+    #[test]
+    fn selection_outline_stays_one_device_pixel_outside_the_selection() {
+        let selection = bounds(10.5, 20.5, 100.5, 50.5);
+        let [top, bottom, left, right] = selection_outline_rects(selection, 2.0);
+        assert_eq!(top, bounds(10., 20., 101.5, 0.5));
+        assert_eq!(bottom, bounds(10., 71., 101.5, 0.5));
+        assert_eq!(left, bounds(10., 20.5, 0.5, 50.5));
+        assert_eq!(right, bounds(111., 20.5, 0.5, 50.5));
     }
 
     #[test]

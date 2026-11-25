@@ -21,6 +21,7 @@ const ICON_SIZE: u32 = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayCommand {
     Screenshot,
+    Scroll,
     Animation,
     Video,
     Ocr,
@@ -32,8 +33,9 @@ enum TrayCommand {
 }
 
 impl TrayCommand {
-    const ITEMS: [(Self, &'static str); 9] = [
+    const ITEMS: [(Self, &'static str); 10] = [
         (Self::Screenshot, "screenshot"),
+        (Self::Scroll, "scroll"),
         (Self::Animation, "animation"),
         (Self::Video, "video"),
         (Self::Ocr, "ocr"),
@@ -44,8 +46,9 @@ impl TrayCommand {
         (Self::Quit, "quit"),
     ];
 
-    const TOP_LEVEL: [Self; 9] = [
+    const TOP_LEVEL: [Self; 10] = [
         Self::Screenshot,
+        Self::Scroll,
         Self::Animation,
         Self::Video,
         Self::Ocr,
@@ -66,6 +69,7 @@ impl TrayCommand {
     fn label(self) -> String {
         match self {
             Self::Screenshot => t!("action.screenshot").to_string(),
+            Self::Scroll => t!("action.scroll").to_string(),
             Self::Animation => t!("action.gif").to_string(),
             Self::Video => t!("action.video").to_string(),
             Self::Ocr => t!("action.ocr").to_string(),
@@ -80,6 +84,7 @@ impl TrayCommand {
     fn hotkey_action(self) -> Option<HotkeyAction> {
         match self {
             Self::Screenshot => Some(HotkeyAction::Screenshot),
+            Self::Scroll => Some(HotkeyAction::Scroll),
             Self::Animation => Some(HotkeyAction::Gif),
             Self::Video => Some(HotkeyAction::Video),
             Self::Ocr => Some(HotkeyAction::Ocr),
@@ -157,6 +162,9 @@ fn handle(command: TrayCommand, cx: &mut App) {
     match command {
         TrayCommand::Screenshot => Controller::global(cx).update(cx, |controller, cx| {
             controller.start_capture(CaptureIntent::Choose, cx)
+        }),
+        TrayCommand::Scroll => Controller::global(cx).update(cx, |controller, cx| {
+            controller.start_capture(CaptureIntent::Scroll, cx)
         }),
         TrayCommand::Animation => Controller::global(cx).update(cx, |controller, cx| {
             controller.start_capture(

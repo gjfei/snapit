@@ -624,6 +624,7 @@ pub enum SessionCommand {
     Save,
     Pin,
     Recognize,
+    Scroll,
     Record(RecordFormat),
     Cancel,
 }
@@ -635,6 +636,7 @@ pub enum CaptureIntent {
     #[default]
     Choose,
     Recognize,
+    Scroll,
     Record(RecordFormat),
 }
 
@@ -643,6 +645,7 @@ impl CaptureIntent {
         match self {
             Self::Choose => None,
             Self::Recognize => Some(SessionCommand::Recognize),
+            Self::Scroll => Some(SessionCommand::Scroll),
             Self::Record(format) => Some(SessionCommand::Record(format)),
         }
     }
@@ -651,6 +654,7 @@ impl CaptureIntent {
         match self {
             Self::Choose => t!("session.hint.choose").to_string(),
             Self::Recognize => t!("session.hint.recognize").to_string(),
+            Self::Scroll => t!("session.hint.scroll").to_string(),
             Self::Record(_) => t!("session.hint.record").to_string(),
         }
     }
@@ -702,6 +706,7 @@ struct Composed {
     image: RgbaImage,
     /// Union of the regions on screen, in overlay-local logical px.
     bounds: Bounds<Pixels>,
+    scale: f32,
 }
 
 /// Identifies the pixels [`CaptureSession::crop_selection`] cuts. A mosaic needs
@@ -1068,10 +1073,16 @@ impl CaptureSession {
         });
         self.extra_selections.clear();
         self.annotations.clear();
+        let scale = regions
+            .iter()
+            .filter_map(|selection| self.frames.get(selection.frame_ix).and_then(Option::as_ref))
+            .map(SessionFrame::physical_scale)
+            .fold(0.1_f32, f32::max);
         self.composed = Some(Composed {
             regions,
             image,
             bounds,
+            scale,
         });
     }
 
@@ -1936,11 +1947,11 @@ impl CaptureSession {
     /// Crop every committed region onto one image. Regions on the same display
     /// keep their on-screen positions over a transparent canvas; regions on
     /// different displays cannot share a coordinate space and are stitched
-    /// vertically instead. The second value is the resulting logical size for
-    /// scale and pin placement.
-    pub fn crop_selections(&self) -> Option<(RgbaImage, Bounds<Pixels>)> {
+    /// vertically instead. The logical bounds drive pin placement; the explicit
+    /// maximum source scale keeps annotation and watermark geometry uniform.
+    pub fn crop_selections(&self) -> Option<(RgbaImage, Bounds<Pixels>, f32)> {
         if let Some(composed) = &self.composed {
-            return Some((composed.image.clone(), composed.bounds));
+            return Some((composed.image.clone(), composed.bounds, composed.scale));
         }
         let regions = self.frames_of(&self.committed_selections());
         let (first_frame, first_bounds) = *regions.first()?;
@@ -1951,6 +1962,7 @@ impl CaptureSession {
                     .shot
                     .crop(first_frame.to_region(first_bounds))?,
                 first_bounds,
+                first_frame.physical_scale(),
             ));
         }
         if regions
@@ -1962,28 +1974,26 @@ impl CaptureSession {
             for (frame, bounds) in regions {
                 crops.push((bounds, frame.frame.shot.crop(frame.to_region(bounds))?));
             }
-            return Some(compose_at_positions(crops, scale));
+            let (image, bounds) = compose_at_positions(crops, scale);
+            return Some((image, bounds, scale));
         }
         let mut images = Vec::with_capacity(regions.len());
         let (mut width, mut height) = (0.0_f32, 0.0_f32);
+        let mut scale = 0.1_f32;
         for (frame, bounds) in regions {
             images.push(frame.frame.shot.crop(frame.to_region(bounds))?);
             width = width.max(bounds.size.width.as_f32());
             height += bounds.size.height.as_f32();
+            scale = scale.max(frame.physical_scale());
         }
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(height)));
-        Some((stitch_vertical(images), bounds))
+        Some((stitch_vertical(images), bounds, scale))
     }
 
-    /// HDR pixels for Save, when they can be written unchanged: one region,
-    /// not combined, and no annotations (the baked overlay is 8-bit).
+    /// HDR pixels for Save, when they represent one uncombined source region.
     pub fn export_hdr(&self) -> Option<HdrImage> {
         if self.composed.is_some() || !self.extra_selections.is_empty() {
             log::info!("HDR export declined: combined or multi-region selection");
-            return None;
-        }
-        if !self.annotations.committed().is_empty() {
-            log::info!("HDR export declined: annotations present (baked layer is 8-bit)");
             return None;
         }
         let Some((frame, bounds)) = self.selected_frame() else {

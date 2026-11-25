@@ -18,14 +18,20 @@ use gpui_kit::{
     Global, Image, ImageFormat, Pixels, SharedString, Subscription, TitlebarOptions, WeakEntity,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
-use snapit_capture::{HdrImage, HdrPngCache, RgbaImage};
+use snapit_capture::{HdrImage, RgbaImage, WatermarkSpec};
 use snapit_ocr::{OcrEngine, OcrOptions};
 use snapit_recorder::{ClickEffect, RecordFormat, RecordOptions, Recorder, RecorderStart};
-use snapit_store::{EntryKind, ImageFormat as SaveFormat};
+use snapit_scroll::{
+    AutoScrollError, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollSpeed, ScrollStart,
+};
+use snapit_store::{
+    EntryKind, ImageFormat as SaveFormat, ScrollSpeed as ConfigScrollSpeed, WatermarkTarget,
+};
 
-use crate::annotate::{BakedImage, Shape};
+use crate::annotate::Shape;
 use crate::appearance;
 use crate::clipboard;
+use crate::export::ExportComposition;
 use crate::history_store::HistoryStore;
 use crate::history_view::HistoryView;
 use crate::hotkey::HotkeyAction;
@@ -35,12 +41,23 @@ use crate::permission_view::PermissionView;
 use crate::permissions::{self, Permission};
 use crate::pin;
 use crate::recording_bar::{BAR_SIZE, RecordingBar};
+use crate::scroll_bar::{SCROLL_BAR_SIZE, ScrollBar, ScrollPreview, scroll_preview_bounds};
 use crate::session::{self, CaptureIntent, CaptureSession, SessionCommand, SessionSlot};
 use crate::settings::AppSettings;
 use crate::settings_view::{self, SettingsView};
 use crate::update_view::UpdateView;
 
 const RECORDING_TICK: Duration = Duration::from_millis(250);
+const SCROLL_TICK: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollFinishAction {
+    Copy,
+    Save,
+    Pin,
+    Recognize,
+    Edit,
+}
 
 #[derive(Clone, Debug, Default)]
 pub enum OcrState {
@@ -94,50 +111,74 @@ struct ActiveRecording {
     part: PathBuf,
 }
 
-/// A cropped selection and its physical-to-logical pixel ratio.
-///
-/// `image` is the 8-bit SDR tone map used for the overlay, pins, OCR and the
-/// history thumbnail. `hdr` is the untouched 16-bit source behind it; when
-/// present, every durable export (Save, Copy, history) writes that HDR data so
-/// the three stay consistent. Both are `Arc` so cloning a capture is cheap.
+struct ActiveScroll {
+    id: u64,
+    session: Option<ScrollSession>,
+    start: Option<ScrollStart>,
+    bar: Option<AnyWindowHandle>,
+    preview: Option<AnyWindowHandle>,
+    frame: Option<OverlayWindow>,
+    display_id: Option<gpui_kit::DisplayId>,
+    display_bounds: Bounds<Pixels>,
+    selection: Bounds<Pixels>,
+    scale: f32,
+    snapshot: Arc<ScrollSnapshot>,
+    preview_visible: bool,
+    finishing: bool,
+    last_warning: bool,
+}
+
+/// A cropped selection with one frozen composition shared by every export.
 #[derive(Clone)]
 pub struct Captured {
-    pub image: Arc<RgbaImage>,
-    pub hdr: Option<Arc<HdrImage>>,
-    pub hdr_png: Option<Arc<HdrPngCache>>,
-    pub baked: Option<Arc<BakedImage>>,
+    pub clean_sdr: Arc<RgbaImage>,
+    pub composition: Arc<ExportComposition>,
     pub scale: f32,
 }
 
 impl Captured {
+    pub(crate) fn from_parts(
+        image: RgbaImage,
+        hdr: Option<HdrImage>,
+        layout_scale: f32,
+        shapes: Option<Arc<Vec<Shape>>>,
+        watermark: WatermarkSpec,
+    ) -> Self {
+        Self::new(image, hdr, layout_scale, shapes, watermark)
+    }
+
     fn new(
         image: RgbaImage,
         hdr: Option<HdrImage>,
-        selection: Bounds<Pixels>,
+        layout_scale: f32,
         shapes: Option<Arc<Vec<Shape>>>,
+        watermark: WatermarkSpec,
     ) -> Self {
-        let logical_width = selection.size.width.as_f32().max(1.0);
-        let scale = (image.width() as f32 / logical_width).max(0.1);
-        let image = Arc::new(image);
-        let baked =
-            shapes.map(|shapes| Arc::new(BakedImage::new(image.as_ref().clone(), shapes, scale)));
-        let hdr_png = hdr.as_ref().map(|hdr| Arc::new(HdrPngCache::new(hdr)));
-        Self {
+        let scale = if layout_scale.is_finite() {
+            layout_scale.max(0.1)
+        } else {
+            1.0
+        };
+        let clean_sdr = Arc::new(image);
+        let composition = Arc::new(ExportComposition::new(
+            clean_sdr.clone(),
+            hdr.map(Arc::new),
+            shapes.unwrap_or_default(),
+            Arc::new(watermark),
             scale,
-            image,
-            hdr: hdr.map(Arc::new),
-            hdr_png,
-            baked,
+        ));
+        Self {
+            clean_sdr,
+            composition,
+            scale,
         }
     }
 
-    fn resolved(&self) -> Self {
+    pub fn frozen(png: Arc<Vec<u8>>, preview: Arc<RgbaImage>, scale: f32, hdr: bool) -> Self {
         Self {
-            image: self
-                .baked
-                .as_ref()
-                .map_or_else(|| self.image.clone(), |baked| baked.get()),
-            ..self.clone()
+            clean_sdr: preview.clone(),
+            composition: Arc::new(ExportComposition::frozen(png, preview, hdr)),
+            scale: scale.max(0.1),
         }
     }
 }
@@ -191,6 +232,10 @@ pub struct Controller {
     pending_close: Vec<AnyWindowHandle>,
     recording: Option<ActiveRecording>,
     recording_serial: u64,
+    scroll: Option<ActiveScroll>,
+    scroll_serial: u64,
+    scroll_editors: Vec<AnyWindowHandle>,
+    watermark_editor: Option<AnyWindowHandle>,
     workflow_serial: u64,
     ocr: OcrState,
     ocr_revision: usize,
@@ -223,6 +268,10 @@ impl Controller {
             pending_close: Vec::new(),
             recording: None,
             recording_serial: 0,
+            scroll: None,
+            scroll_serial: 0,
+            scroll_editors: Vec::new(),
+            watermark_editor: None,
             workflow_serial: 0,
             ocr: OcrState::Idle,
             ocr_revision: 0,
@@ -251,6 +300,15 @@ impl Controller {
                             slot.handle = None;
                         }
                     }
+                    controller
+                        .scroll_editors
+                        .retain(|handle| handle.window_id() != window_id);
+                    if controller
+                        .watermark_editor
+                        .is_some_and(|handle| handle.window_id() == window_id)
+                    {
+                        controller.watermark_editor = None;
+                    }
                     controller.sync_dock_visible(cx);
                 });
             });
@@ -274,7 +332,28 @@ impl Controller {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.busy.is_some() || self.selection.is_some() || self.recording.is_some()
+        self.busy.is_some()
+            || self.selection.is_some()
+            || self.recording.is_some()
+            || self.scroll.is_some()
+    }
+
+    pub fn has_scroll(&self) -> bool {
+        self.scroll.is_some()
+    }
+
+    pub fn is_finishing_scroll(&self) -> bool {
+        self.scroll.as_ref().is_some_and(|active| active.finishing)
+    }
+
+    pub fn is_scroll_preview_visible(&self) -> bool {
+        self.scroll
+            .as_ref()
+            .is_some_and(|active| active.preview_visible)
+    }
+
+    pub fn scroll_snapshot(&self) -> Option<Arc<ScrollSnapshot>> {
+        self.scroll.as_ref().map(|active| active.snapshot.clone())
     }
 
     /// True while an encoder is flushing after stop / duration cap.
@@ -333,6 +412,7 @@ impl Controller {
     pub fn on_hotkey(&mut self, action: HotkeyAction, cx: &mut Context<Self>) {
         let intent = match action {
             HotkeyAction::Screenshot => CaptureIntent::Choose,
+            HotkeyAction::Scroll => CaptureIntent::Scroll,
             HotkeyAction::Ocr => CaptureIntent::Recognize,
             HotkeyAction::Gif => CaptureIntent::Record(last_animation_format(cx)),
             HotkeyAction::Video => CaptureIntent::Record(RecordFormat::Mp4),
@@ -340,6 +420,13 @@ impl Controller {
         if self.recording.is_some() {
             self.queued_capture = Some(intent);
             self.stop_recording(cx);
+            return;
+        }
+        if self.scroll.is_some() {
+            if action != HotkeyAction::Scroll {
+                self.queued_capture = Some(intent);
+            }
+            self.finish_scroll(ScrollFinishAction::Copy, cx);
             return;
         }
         self.start_capture(intent, cx);
@@ -761,6 +848,43 @@ impl Controller {
         let Some(active) = self.selection.as_ref() else {
             return;
         };
+        let wants_still = matches!(
+            command,
+            SessionCommand::Copy
+                | SessionCommand::Save
+                | SessionCommand::Pin
+                | SessionCommand::Recognize
+        );
+        let watermark_config = AppSettings::get(cx).watermark.clone();
+        let screenshot_target_enabled =
+            watermark_config.target_enabled(WatermarkTarget::Screenshot);
+        let watermark = if wants_still && watermark_config.enabled && screenshot_target_enabled {
+            match watermark_config
+                .preset(WatermarkTarget::Screenshot)
+                .context("watermark template is unavailable")
+                .and_then(|preset| {
+                    crate::export::watermark_spec(preset, AppSettings::watermark_dir(cx))
+                }) {
+                Ok(spec) => {
+                    log::info!("watermark: enabled for screenshot export");
+                    spec
+                }
+                Err(err) => {
+                    self.fail(
+                        t!("controller.watermark_failed", error = format!("{err:#}")).to_string(),
+                        cx,
+                    );
+                    return;
+                }
+            }
+        } else {
+            log::info!(
+                "watermark: skipped for screenshot export (enabled={} target={})",
+                watermark_config.enabled,
+                screenshot_target_enabled
+            );
+            WatermarkSpec::default()
+        };
         let multi = active.session.read(cx).multi_selection();
         let composed = active.session.read(cx).is_composed();
         let bake = matches!(
@@ -782,10 +906,10 @@ impl Controller {
                 session.finish_annotations();
             }
             let hdr = if want_hdr { session.export_hdr() } else { None };
-            let image = session.crop_selections().map(|(image, bounds)| {
+            let image = session.crop_selections().map(|(image, _bounds, scale)| {
                 let shapes = (bake && !multi && !session.annotations().committed().is_empty())
                     .then(|| Arc::new(session.annotations().committed().to_vec()));
-                Captured::new(image, hdr, bounds, shapes)
+                Captured::new(image, hdr, scale, shapes, watermark.clone())
             });
             let record_target = session.selected_frame().map(|(frame, bounds)| {
                 (
@@ -802,13 +926,18 @@ impl Controller {
             self.last_display_id = *display_id;
         }
         let exported = started.elapsed();
-        // A record command keeps the active overlay: it becomes the live
-        // recording outline instead of closing and opening another window.
+        // A record or scroll command keeps the active overlay: it becomes the
+        // live indicator outline instead of closing and opening another window.
         let record_now = matches!(command, SessionCommand::Record(_))
             && !composed
             && image.is_some()
             && record_target.is_some();
-        if !record_now {
+        let scroll_now = matches!(command, SessionCommand::Scroll)
+            && !composed
+            && !multi
+            && image.is_some()
+            && record_target.is_some();
+        if !record_now && !scroll_now {
             self.close_selection(cx);
         }
         log::info!(
@@ -842,6 +971,11 @@ impl Controller {
                 self.open_pin_async(captured, placement, cx);
             }
             (SessionCommand::Recognize, Some(captured)) => self.recognize(captured, cx),
+            (SessionCommand::Scroll, Some(captured)) => {
+                if scroll_now && let Some(target) = record_target {
+                    self.start_scroll(target, captured.scale, cx);
+                }
+            }
             (SessionCommand::Record(format), Some(_)) => {
                 if record_now && let Some(target) = record_target {
                     self.start_recording(target, format, cx);
@@ -896,15 +1030,28 @@ impl Controller {
     /// Keep a capture for "pin last capture" and auto-save it to history.
     fn remember(&mut self, captured: &Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
-        let (image, baked, hdr_png, scale) = (
-            captured.image.clone(),
-            captured.baked.clone(),
-            captured.hdr_png.clone(),
-            captured.scale,
-        );
         HistoryStore::global(cx).update(cx, |history, cx| {
-            history.add_image(image, baked, hdr_png, scale, None, cx)
+            history.add_image(captured.composition.clone(), captured.scale, None, cx)
         });
+    }
+
+    pub(crate) fn remember_and_copy(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        self.remember(&captured, cx);
+        self.copy_image(captured, cx);
+    }
+
+    pub(crate) fn remember_and_save(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        self.remember(&captured, cx);
+        self.save_image(captured, cx);
+    }
+
+    pub(crate) fn remember_and_pin(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        self.remember(&captured, cx);
+        self.open_pin_async(captured, None, cx);
+    }
+
+    pub(crate) fn recognize_captured(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        self.recognize(captured, cx);
     }
 
     fn open_pin_async(
@@ -916,19 +1063,28 @@ impl Controller {
         let controller = cx.entity();
         let workflow = self.workflow_serial;
         cx.spawn(async move |this, cx| {
-            let captured = cx
-                .background_spawn(async move { captured.resolved() })
+            let composition = captured.composition.clone();
+            let preview = cx
+                .background_spawn(async move { composition.sdr_preview() })
                 .await;
-            this.update(cx, |_, cx| {
+            this.update(cx, |this, cx| {
                 if controller.read(cx).workflow_serial != workflow {
                     return;
                 }
-                let controller = controller.clone();
-                cx.defer(move |cx| {
-                    if controller.read(cx).workflow_serial == workflow {
-                        pin::open(captured, placement, cx);
+                match preview {
+                    Ok(preview) => {
+                        let controller = controller.clone();
+                        cx.defer(move |cx| {
+                            if controller.read(cx).workflow_serial == workflow {
+                                pin::open(captured, preview, placement, cx);
+                            }
+                        });
                     }
-                });
+                    Err(err) => {
+                        this.finish_pending_close(cx);
+                        this.fail(t!("controller.pin_failed", error = err).to_string(), cx);
+                    }
+                }
             })
             .ok();
         })
@@ -948,38 +1104,26 @@ impl Controller {
     }
 
     pub(crate) fn copy_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
-        let (width, height) = captured.image.dimensions();
+        let (width, height) = captured.clean_sdr.dimensions();
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
             let encoded = Instant::now();
             let png = cx
                 .background_spawn(async move {
                     let started = Instant::now();
-                    let captured = captured.resolved();
-                    // Put the same HDR data on the clipboard that Save and the
-                    // history original use. GPUI writes PNG bytes verbatim on
-                    // both platforms, so the 16-bit + cICP payload survives.
-                    let png = match captured.hdr_png.as_deref() {
-                        Some(cache) => match cache.get() {
-                            Ok(bytes) => {
-                                log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
-                                Ok(bytes)
-                            }
-                            Err(err) => {
-                                log::warn!("copy: HDR encode failed, falling back to SDR: {err}");
-                                snapit_capture::encode_png(&captured.image).map(Arc::new)
-                            }
-                        },
-                        None => snapit_capture::encode_png(&captured.image).map(Arc::new),
-                    };
+                    let hdr = captured.composition.has_hdr_original();
+                    let png = captured.composition.png();
+                    if hdr {
+                        log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
+                    } else {
+                        log::info!("copy: clipboard composed SDR PNG");
+                    }
                     log::info!(
                         target: "timing",
                         "copy: {width}x{height} PNG encode {:.1} ms",
                         ms(started.elapsed())
                     );
-                    png.map(|png| {
-                        Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone())
-                    })
+                    png.map(|png| Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone()))
                 })
                 .await;
             let encode = encoded.elapsed();
@@ -1020,13 +1164,7 @@ impl Controller {
     }
 
     pub(crate) fn save_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
-        let Captured {
-            image,
-            hdr,
-            hdr_png,
-            baked,
-            ..
-        } = captured;
+        let Captured { composition, .. } = captured;
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
         let name = format!("SnapIt {}.{}", timestamp(), format.extension());
@@ -1044,30 +1182,31 @@ impl Controller {
                 path.set_extension(format.extension());
                 format
             });
-            let hdr_available = hdr.is_some();
-            log::info!(
-                "save image: format={format:?} hdr_available={hdr_available} path={}",
-                path.display()
-            );
+            log::info!("save image: format={format:?} path={}", path.display());
             let saved = cx
                 .background_spawn(async move {
                     let writing = Instant::now();
-                    let image = baked.map_or(image, |baked| baked.get());
-                    let branch = match (format, &hdr) {
-                        (SaveFormat::Png, Some(_)) => "HDR PNG (16-bit + cICP)",
-                        (SaveFormat::Png, None) => "SDR PNG (8-bit)",
+                    let hdr_available = composition.has_hdr_original();
+                    let branch = match (format, hdr_available) {
+                        (SaveFormat::Png, true) => "HDR PNG (16-bit + cICP)",
+                        (SaveFormat::Png, false) => "SDR PNG (8-bit)",
                         (SaveFormat::Jpg, _) => "JPEG (8-bit)",
                     };
-                    log::info!("save branch: {branch}");
-                    let result = match (format, hdr_png) {
-                        (SaveFormat::Png, Some(cache)) => {
-                            cache.get().map_err(anyhow::Error::msg).and_then(|bytes| {
-                                std::fs::write(&path, bytes.as_slice())
-                                    .with_context(|| format!("failed to write {}", path.display()))
-                            })
+                    log::info!("save branch: {branch} hdr_available={hdr_available}");
+                    let result = match (format, hdr_available) {
+                        (SaveFormat::Png, true) => {
+                            let png = composition.png().map_err(anyhow::Error::msg)?;
+                            std::fs::write(&path, png.as_slice())
+                                .with_context(|| format!("failed to write {}", path.display()))
                         }
-                        (SaveFormat::Png, None) => snapit_capture::save_png(&image, &path),
-                        (SaveFormat::Jpg, _) => snapit_capture::save_jpeg(&image, &path, quality),
+                        (SaveFormat::Png, false) => {
+                            let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
+                            snapit_capture::save_png(&image, &path)
+                        }
+                        (SaveFormat::Jpg, _) => {
+                            let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
+                            snapit_capture::save_jpeg(&image, &path, quality)
+                        }
                     };
                     log::info!(
                         "save result: {} ({:.1} ms) {}",
@@ -1103,12 +1242,11 @@ impl Controller {
     fn recognize(&mut self, captured: Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
         let Captured {
-            image,
-            hdr_png,
+            clean_sdr,
+            composition,
             scale,
             ..
         } = captured;
-        let history_image = image.clone();
         self.ocr = OcrState::Running;
         self.ocr_revision += 1;
         self.open_panel(Panel::Ocr, cx);
@@ -1125,7 +1263,7 @@ impl Controller {
                         Some(engine) => engine,
                         None => Arc::from(snapit_ocr::engine_with(&options)?),
                     };
-                    let blocks = engine.recognize(&image)?;
+                    let blocks = snapit_ocr::recognize_tall(engine.as_ref(), &clean_sdr)?;
                     Ok::<_, anyhow::Error>((engine, blocks))
                 })
                 .await;
@@ -1135,7 +1273,7 @@ impl Controller {
                     .ok()
                     .map(|(_, blocks)| snapit_ocr::blocks_to_text(blocks));
                 HistoryStore::global(cx).update(cx, |history, cx| {
-                    history.add_image(history_image, None, hdr_png, scale, text.clone(), cx)
+                    history.add_image(composition, scale, text.clone(), cx)
                 });
                 if this.ocr_revision != revision {
                     return;
@@ -1178,7 +1316,41 @@ impl Controller {
         log::info!("recording start: format={format:?} display={monitor_id} region={region:?}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
-        let recording = &AppSettings::get(cx).recording;
+        let recording = AppSettings::get(cx).recording.clone();
+        let watermark_config = AppSettings::get(cx).watermark.clone();
+        let (watermark_target, watermark_target_name) = match format {
+            RecordFormat::Gif | RecordFormat::Apng => (WatermarkTarget::Animation, "animation"),
+            RecordFormat::Mp4 => (WatermarkTarget::Video, "video"),
+        };
+        let watermark_target_enabled = watermark_config.target_enabled(watermark_target);
+        let watermark = if watermark_config.enabled && watermark_target_enabled {
+            match watermark_config
+                .preset(watermark_target)
+                .context("watermark template is unavailable")
+                .and_then(|preset| {
+                    crate::export::watermark_spec(preset, AppSettings::watermark_dir(cx))
+                }) {
+                Ok(spec) => {
+                    log::info!("watermark: enabled for {watermark_target_name} recording");
+                    spec
+                }
+                Err(err) => {
+                    self.busy = None;
+                    self.fail(
+                        t!("controller.watermark_failed", error = err).to_string(),
+                        cx,
+                    );
+                    return;
+                }
+            }
+        } else {
+            log::info!(
+                "watermark: skipped for {watermark_target_name} recording (enabled={} target={})",
+                watermark_config.enabled,
+                watermark_target_enabled
+            );
+            WatermarkSpec::default()
+        };
         // GIF and APNG share the animation rate; MP4 can afford a smoother one.
         let fps = match format {
             RecordFormat::Gif | RecordFormat::Apng => recording.gif_fps,
@@ -1197,14 +1369,16 @@ impl Controller {
             .with_click_effect(ClickEffect::parse(&recording.click_effect).unwrap_or_default())
             // The recorder ignores this for GIF/APNG, which have no extended range.
             .with_hdr(hdr_requested)
-            .with_mp4_bitrate_kbps(recording.mp4_bitrate_kbps);
+            .with_mp4_bitrate_kbps(recording.mp4_bitrate_kbps)
+            .with_watermark(watermark);
         log::info!(
             "recording options: fps={fps} hdr_requested={hdr_requested} captures_cursor={} \
-             click_effects={} click_effect={:?} mp4_bitrate_kbps={:?}",
+             click_effects={} click_effect={:?} mp4_bitrate_kbps={:?} watermark={}",
             recording.captures_cursor,
             recording.click_effects,
             options.click_effect,
-            options.mp4_bitrate_kbps
+            options.mp4_bitrate_kbps,
+            options.watermark.is_enabled()
         );
         // Keep the overlay on screen as the region highlight: drop the frozen
         // frame and the toolbar, keep the dim mask and the selection border.
@@ -1787,7 +1961,601 @@ impl Controller {
         cx.notify();
     }
 
-    /// macOS: the Dock icon is visible only while a panel window is open.
+    fn start_scroll(
+        &mut self,
+        (monitor_id, region, display_id, display_bounds, selection): (
+            u32,
+            snapit_capture::Region,
+            Option<gpui_kit::DisplayId>,
+            Bounds<Pixels>,
+            Bounds<Pixels>,
+        ),
+        scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        crate::logging::begin_scroll();
+        log::info!("scroll start: display={monitor_id} region={region:?} scale={scale}");
+        self.busy = Some(Busy::Capturing);
+        self.last_display_id = display_id;
+        let scroll_cfg = AppSettings::get(cx).scroll.clone();
+        let speed = match scroll_cfg.auto_scroll_speed {
+            ConfigScrollSpeed::Slow => ScrollSpeed::Slow,
+            ConfigScrollSpeed::Medium => ScrollSpeed::Medium,
+            ConfigScrollSpeed::Fast => ScrollSpeed::Fast,
+        };
+        let options = ScrollOptions::default()
+            .with_max_height(scroll_cfg.max_height)
+            .with_auto_scroll_speed(speed)
+            .with_scale(scale);
+        let Some(overlay) = self.take_recording_overlay(display_id, cx) else {
+            self.busy = None;
+            self.fail(
+                t!(
+                    "controller.scroll_start_failed",
+                    error = "overlay window is gone"
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        self.workflow_serial = self.workflow_serial.wrapping_add(1);
+        self.scroll_serial = self.scroll_serial.wrapping_add(1);
+        let scroll_id = self.scroll_serial;
+        let show_preview = scroll_cfg.show_preview;
+        let overlay_handle = overlay.window;
+        let overlay_view = overlay.view.clone();
+        self.scroll = Some(ActiveScroll {
+            id: scroll_id,
+            session: None,
+            start: Some(ScrollStart::default()),
+            bar: None,
+            preview: None,
+            frame: Some(overlay),
+            display_id,
+            display_bounds,
+            selection,
+            scale,
+            snapshot: Arc::new(ScrollSnapshot::default()),
+            preview_visible: show_preview,
+            finishing: false,
+            last_warning: false,
+        });
+        self.open_scroll_bar(scroll_id, display_id, display_bounds, selection, cx);
+        if show_preview {
+            self.open_scroll_preview(scroll_id, display_id, display_bounds, selection, cx);
+        }
+        let controller = cx.entity();
+        let entered = overlay_handle.update(cx, |_, window, cx| {
+            overlay_view.update(cx, |view, cx| view.enter_recording(selection, window, cx));
+            after_presented_frame(window, move |_, cx| {
+                controller.update(cx, |this, cx| {
+                    if this
+                        .scroll
+                        .as_ref()
+                        .is_some_and(|active| active.id == scroll_id)
+                    {
+                        let start = this
+                            .scroll
+                            .as_ref()
+                            .and_then(|active| active.start.clone())
+                            .expect("current scroll capture has a start token");
+                        this.spawn_scroll(scroll_id, (monitor_id, region), options, start, cx);
+                    }
+                });
+            });
+        });
+        if entered.is_err() {
+            self.busy = None;
+            self.finish_scroll_ui(cx);
+            self.fail(
+                t!("controller.scroll_start_failed", error = "overlay").to_string(),
+                cx,
+            );
+        }
+    }
+
+    fn spawn_scroll(
+        &mut self,
+        scroll_id: u64,
+        (monitor_id, region): (u32, snapit_capture::Region),
+        options: ScrollOptions,
+        start: ScrollStart,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let session = cx
+                .background_spawn(async move {
+                    ScrollSession::start_with_cancel(monitor_id, region, options, start)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(active) = this.scroll.as_mut() else {
+                    if let Ok(session) = session {
+                        discard_stale_scroll(session);
+                    }
+                    return;
+                };
+                if active.id != scroll_id {
+                    if let Ok(session) = session {
+                        discard_stale_scroll(session);
+                    }
+                    return;
+                }
+                this.busy = None;
+                match session {
+                    Ok(session) => {
+                        let snap = session.snapshot();
+                        active.start = None;
+                        active.snapshot = snap;
+                        active.session = Some(session);
+                        cx.notify();
+                        Self::tick_scroll(scroll_id, cx);
+                    }
+                    Err(err) => {
+                        this.finish_scroll_ui(cx);
+                        this.fail(
+                            t!("controller.scroll_start_failed", error = format!("{err:#}"))
+                                .to_string(),
+                            cx,
+                        );
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn tick_scroll(scroll_id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(SCROLL_TICK).await;
+                let keep_ticking = this.update(cx, |this, cx| {
+                    let Some(active) = this.scroll.as_mut() else {
+                        return false;
+                    };
+                    if active.id != scroll_id || active.finishing {
+                        return false;
+                    }
+                    let Some(session) = active.session.as_ref() else {
+                        return false;
+                    };
+                    let snap = session.snapshot();
+                    let warn_now = snap.warning.is_some();
+                    let changed = snap.preview_revision != active.snapshot.preview_revision
+                        || snap.status != active.snapshot.status
+                        || snap.warning != active.snapshot.warning
+                        || snap.auto_scrolling != active.snapshot.auto_scrolling
+                        || snap.paused != active.snapshot.paused
+                        || snap.height != active.snapshot.height
+                        || snap.started != active.snapshot.started;
+                    active.snapshot = snap;
+                    if warn_now != active.last_warning {
+                        active.last_warning = warn_now;
+                        if let Some(frame) = active.frame.as_ref() {
+                            let view = frame.view.clone();
+                            frame
+                                .window
+                                .update(cx, |_, _, cx| {
+                                    view.update(cx, |view, cx| view.set_live_warning(warn_now, cx));
+                                })
+                                .ok();
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(keep_ticking, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn open_scroll_bar(
+        &mut self,
+        scroll_id: u64,
+        display_id: Option<gpui_kit::DisplayId>,
+        display_bounds: Bounds<Pixels>,
+        selection: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let bar = size(px(SCROLL_BAR_SIZE.0), px(SCROLL_BAR_SIZE.1));
+        let gap = px(8.);
+        let display_size = display_bounds.size;
+        let bottom = selection.origin.y + selection.size.height;
+        let right = selection.origin.x + selection.size.width;
+        let aligned_x = if right >= bar.width {
+            right - bar.width
+        } else {
+            selection.origin.x
+        }
+        .max(px(0.))
+        .min((display_size.width - bar.width).max(px(0.)));
+        let (x, y) = if bottom + gap + bar.height <= display_size.height {
+            (aligned_x, bottom + gap)
+        } else if selection.origin.y >= bar.height + gap {
+            (aligned_x, selection.origin.y - gap - bar.height)
+        } else {
+            (aligned_x, (bottom - gap - bar.height).max(px(0.)))
+        };
+        let origin = display_bounds.origin + point(x, y);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, bar))),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+        let controller = cx.entity();
+        cx.defer(move |cx| {
+            let view_controller = controller.clone();
+            let opened = cx
+                .open_window(options, |window, cx| {
+                    cx.new(|cx| ScrollBar::new(view_controller, window, cx))
+                })
+                .map(AnyWindowHandle::from)
+                .inspect_err(|err| log::error!("failed to open scroll bar: {err:#}"));
+            let Ok(handle) = opened else {
+                controller.update(cx, |this, cx| {
+                    if this.scroll.as_ref().is_some_and(|a| a.id == scroll_id) {
+                        this.cancel_scroll(cx);
+                        this.fail(
+                            t!("controller.scroll_start_failed", error = "scroll bar").to_string(),
+                            cx,
+                        );
+                    }
+                });
+                return;
+            };
+            let orphaned = controller.update(cx, |this, _| match this.scroll.as_mut() {
+                Some(active) if active.id == scroll_id => {
+                    active.bar = Some(handle);
+                    false
+                }
+                _ => true,
+            });
+            if orphaned {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        });
+    }
+
+    fn open_scroll_preview(
+        &mut self,
+        scroll_id: u64,
+        display_id: Option<gpui_kit::DisplayId>,
+        display_bounds: Bounds<Pixels>,
+        selection: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = scroll_preview_bounds(display_bounds, selection);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            focus: false,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+        let controller = cx.entity();
+        cx.defer(move |cx| {
+            let view_controller = controller.clone();
+            let opened = cx
+                .open_window(options, |window, cx| {
+                    cx.new(|cx| ScrollPreview::new(view_controller, window, cx))
+                })
+                .map(AnyWindowHandle::from)
+                .inspect_err(|err| log::error!("failed to open scroll preview: {err:#}"));
+            let Ok(handle) = opened else {
+                return;
+            };
+            let orphaned = controller.update(cx, |this, _| match this.scroll.as_mut() {
+                Some(active) if active.id == scroll_id && active.preview_visible => {
+                    active.preview = Some(handle);
+                    false
+                }
+                _ => true,
+            });
+            if orphaned {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        });
+    }
+
+    pub fn toggle_scroll_auto(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        let Some(session) = active.session.as_ref() else {
+            return;
+        };
+        let next = !active.snapshot.auto_scrolling;
+        match session.set_auto_scroll(next) {
+            Ok(()) => {
+                active.snapshot = session.snapshot();
+                cx.notify();
+            }
+            Err(AutoScrollError::NeedsAccessibility) => {
+                log::warn!("auto-scroll requested without accessibility permission");
+                permissions::request(Permission::Accessibility);
+                self.open_panel(Panel::Permissions, cx);
+                self.inform(t!("scroll.accessibility_needed").to_string(), cx);
+            }
+            Err(err) => {
+                self.fail(format!("{err}"), cx);
+            }
+        }
+    }
+
+    pub fn toggle_scroll_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.preview_visible = !active.preview_visible;
+        if active.preview_visible {
+            let id = active.id;
+            let display_id = active.display_id;
+            let display_bounds = active.display_bounds;
+            let selection = active.selection;
+            if active.preview.is_none() {
+                self.open_scroll_preview(id, display_id, display_bounds, selection, cx);
+            }
+        } else if let Some(handle) = active.preview.take() {
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn reset_scroll(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if let Some(session) = active.session.as_ref() {
+            session.reset();
+            active.snapshot = session.snapshot();
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_scroll(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.finishing {
+            return;
+        }
+        if let Some(start) = active.start.take() {
+            start.cancel();
+        }
+        if let Some(session) = active.session.take() {
+            discard_stale_scroll(session);
+        }
+        self.busy = None;
+        self.finish_scroll_ui(cx);
+        log::info!("scroll capture discarded");
+        self.resume_queued_capture(cx);
+    }
+
+    pub fn finish_scroll(&mut self, action: ScrollFinishAction, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.finishing {
+            return;
+        }
+        if active.session.is_none() {
+            self.cancel_scroll(cx);
+            return;
+        }
+        let needs_watermark = matches!(
+            action,
+            ScrollFinishAction::Copy | ScrollFinishAction::Save | ScrollFinishAction::Pin
+        );
+        let watermark = if needs_watermark {
+            let watermark_config = AppSettings::get(cx).watermark.clone();
+            if watermark_config.enabled
+                && watermark_config.target_enabled(WatermarkTarget::Screenshot)
+            {
+                let resolved = watermark_config
+                    .preset(WatermarkTarget::Screenshot)
+                    .ok_or_else(|| anyhow::anyhow!("watermark template is unavailable"))
+                    .and_then(|preset| {
+                        crate::export::watermark_spec(preset, AppSettings::watermark_dir(cx))
+                    });
+                match resolved {
+                    Ok(spec) => spec,
+                    Err(err) => {
+                        if let Some(session) = active.session.take() {
+                            discard_stale_scroll(session);
+                        }
+                        self.finish_scroll_ui(cx);
+                        self.fail(
+                            t!("controller.watermark_failed", error = format!("{err:#}"))
+                                .to_string(),
+                            cx,
+                        );
+                        self.resume_queued_capture(cx);
+                        return;
+                    }
+                }
+            } else {
+                WatermarkSpec::default()
+            }
+        } else {
+            WatermarkSpec::default()
+        };
+        let session = active.session.take().expect("checked above");
+        let scale = active.scale;
+        let display_id = active.display_id;
+        active.finishing = true;
+        self.busy = Some(Busy::Encoding);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let handle = std::thread::Builder::new()
+                .name("snapit-scroll-finish".into())
+                .spawn(move || session.finish());
+            let image = match handle {
+                Ok(handle) => {
+                    while !handle.is_finished() {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(4))
+                            .await;
+                    }
+                    match handle.join() {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!("scroll finish thread crashed")),
+                    }
+                }
+                Err(err) => Err(err.into()),
+            };
+            this.update(cx, |this, cx| {
+                this.finish_scroll_ui(cx);
+                match image {
+                    Ok(Some(image)) => {
+                        if action == ScrollFinishAction::Edit {
+                            this.open_scroll_editor(image, scale, display_id, cx);
+                        } else {
+                            let captured = Captured::new(image, None, scale, None, watermark);
+                            match action {
+                                ScrollFinishAction::Copy => {
+                                    this.remember(&captured, cx);
+                                    this.copy_image(captured, cx);
+                                }
+                                ScrollFinishAction::Save => {
+                                    this.remember(&captured, cx);
+                                    this.save_image(captured, cx);
+                                }
+                                ScrollFinishAction::Pin => {
+                                    this.remember(&captured, cx);
+                                    this.open_pin_async(captured, None, cx);
+                                }
+                                ScrollFinishAction::Recognize => this.recognize(captured, cx),
+                                ScrollFinishAction::Edit => unreachable!(),
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        this.fail(t!("controller.scroll_empty").to_string(), cx);
+                    }
+                    Err(err) => {
+                        this.fail(
+                            t!("controller.scroll_failed", error = format!("{err:#}")).to_string(),
+                            cx,
+                        );
+                    }
+                }
+                this.resume_queued_capture(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_scroll_ui(&mut self, cx: &mut Context<Self>) {
+        let windows = self
+            .scroll
+            .take()
+            .map(|active| (active.bar, active.preview, active.frame.map(|f| f.window)));
+        if let Some((bar, preview, frame)) = windows {
+            cx.defer(move |cx| {
+                for handle in [bar, preview, frame].into_iter().flatten() {
+                    handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            });
+        }
+        if matches!(self.busy, Some(Busy::Encoding)) {
+            self.busy = None;
+        }
+        cx.notify();
+    }
+
+    fn open_scroll_editor(
+        &mut self,
+        image: RgbaImage,
+        scale: f32,
+        display_id: Option<gpui_kit::DisplayId>,
+        cx: &mut Context<Self>,
+    ) {
+        let controller = cx.entity();
+        cx.defer(
+            move |cx| match crate::scroll_editor::open(image, scale, display_id, cx) {
+                Ok(handle) => {
+                    controller.update(cx, |this, cx| {
+                        this.scroll_editors.push(handle);
+                        this.sync_dock_visible(cx);
+                    });
+                    cx.activate(true);
+                }
+                Err(err) => {
+                    log::error!("failed to open scroll editor: {err:#}");
+                }
+            },
+        );
+    }
+
+    pub fn open_watermark_editor(
+        &mut self,
+        target: snapit_store::WatermarkTarget,
+        template_id: Option<String>,
+        initial_preset: snapit_store::WatermarkPreset,
+        display_id: Option<gpui_kit::DisplayId>,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.watermark_editor.take();
+        let controller = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(prev) = previous {
+                prev.update(cx, |_, window, _| window.remove_window()).ok();
+            }
+            match crate::watermark_editor::open_window(
+                target,
+                template_id,
+                initial_preset,
+                display_id,
+                cx,
+            ) {
+                Ok(handle) => {
+                    controller.update(cx, |this, cx| {
+                        this.watermark_editor = Some(handle);
+                        this.sync_dock_visible(cx);
+                    });
+                    cx.activate(true);
+                }
+                Err(err) => {
+                    log::error!("failed to open watermark editor: {err:#}");
+                }
+            }
+        });
+    }
+
+    /// macOS: the Dock icon is visible only while a panel or editor window is open.
     fn sync_dock_visible(&self, cx: &mut App) {
         let open = cx.windows();
         let any_panel = self.panels.iter().any(|slot| {
@@ -1796,7 +2564,15 @@ impl Controller {
                     .any(|window| window.window_id() == handle.window_id())
             })
         });
-        appearance::set_dock_visible(any_panel, cx);
+        let any_editor = self.scroll_editors.iter().any(|handle| {
+            open.iter()
+                .any(|window| window.window_id() == handle.window_id())
+        });
+        let has_watermark_editor = self.watermark_editor.is_some_and(|handle| {
+            open.iter()
+                .any(|window| window.window_id() == handle.window_id())
+        });
+        appearance::set_dock_visible(any_panel || any_editor || has_watermark_editor, cx);
     }
 
     /// Retitle open panels after the UI language changes.
@@ -1808,6 +2584,18 @@ impl Controller {
             let title = panel_title(panel);
             handle
                 .update(cx, |_, window, _| window.set_window_title(&title))
+                .ok();
+        }
+        let editor_title = t!("scroll_editor.title").to_string();
+        for handle in &self.scroll_editors {
+            handle
+                .update(cx, |_, window, _| window.set_window_title(&editor_title))
+                .ok();
+        }
+        if let Some(handle) = self.watermark_editor {
+            let watermark_title = t!("settings.watermark.editor.title").to_string();
+            handle
+                .update(cx, |_, window, _| window.set_window_title(&watermark_title))
                 .ok();
         }
     }
@@ -1907,7 +2695,7 @@ fn open_panel_window(
 ) -> Result<AnyWindowHandle> {
     let (window_size, min_size) = match panel {
         Panel::Ocr => (size(px(480.), px(420.)), size(px(360.), px(280.))),
-        Panel::Settings => (size(px(780.), px(580.)), size(px(560.), px(400.))),
+        Panel::Settings => (size(px(860.), px(640.)), size(px(620.), px(440.))),
         Panel::History => (size(px(640.), px(640.)), size(px(480.), px(360.))),
         Panel::Permissions => (size(px(520.), px(360.)), size(px(420.), px(280.))),
         Panel::Update => (size(px(520.), px(460.)), size(px(420.), px(360.))),
@@ -1982,6 +2770,15 @@ fn discard_stale_recorder(recorder: Result<Recorder>, path: PathBuf) {
         Err(_) => {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+fn discard_stale_scroll(session: ScrollSession) {
+    if let Err(err) = std::thread::Builder::new()
+        .name("snapit-scroll-discard".into())
+        .spawn(move || session.discard())
+    {
+        log::warn!("failed to start scroll-discard thread: {err:#}");
     }
 }
 

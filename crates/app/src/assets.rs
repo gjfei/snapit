@@ -24,7 +24,32 @@ gpui_kit::assets::icon_assets!(
         ListOrdered,
         Undo2,
         Eraser,
-        Trash
+        Trash,
+        Stamp,
+        ArrowUp,
+        ArrowDown,
+        ScrollText,
+        ChevronsDown,
+        PanelRight,
+        RotateCcw,
+        Scissors,
+        ZoomIn,
+        ZoomOut,
+        Maximize2,
+        Play,
+        Pause,
+        CircleX,
+        Redo2,
+        ImagePlus,
+        Bold,
+        Sun,
+        Moon,
+        Grid2x2,
+        AlignStartVertical,
+        AlignCenterVertical,
+        AlignCenterHorizontal,
+        AlignHorizontalSpaceBetween,
+        AlignVerticalSpaceBetween
     ]
 );
 

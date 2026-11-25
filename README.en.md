@@ -25,12 +25,14 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 - **Multiple regions and quick keys**: `F` selects the whole current display, `C` copies the color under the cursor (`#RRGGBB`). Hold `Shift` to collect: click or drag to add regions, click a selected region to remove it. Releasing `Shift` combines same-display regions into one selection that can be annotated; copy / save / pin use the combined image with each region at its original on-screen position and the rest transparent in PNG.
 - **Window and element snapping**: highlight the window under the cursor; with element snapping on, the smallest control is highlighted and the wheel moves up through its containers.
 - **Annotations**: rectangle, arrow, pen, mosaic, text and numbered steps, with 6 colors and 3 line widths; `⌘Z` / `Ctrl+Z` to undo, plus one-click clear.
+- **Watermarks**: design multi-element stamps in a dedicated three-pane designer window combining multi-line text (with `{date}` / `{time}` / `{datetime}` / `{year}` variables, bold, drop shadow, outline stroke and pill background) and multiple PNG / JPEG images (with rounded corners). Drag, corner-resize, top-handle rotate (`Shift` snaps 15°), align with snap guides, undo/redo, drop files or paste clipboard images directly over checkerboard, light or dark backdrops, or start from 5 built-in starters. Template names, a visual 3×3 placement grid, draggable preview margins, tiling and spacing live in Settings, with a segmented Screenshot / Animation / Video tab bar, one-click Duplicate and optional shared template mode. Watermarks are off by default with an independent switch for each output type; OCR always recognizes the clean image without annotations or watermarks.
 - **Copy and save**: copy as PNG; save as PNG or JPEG (with adjustable JPG quality), or change the extension in the save dialog.
-- **HDR capture**: when the display is in HDR and the frame actually exceeds SDR white, Save, Copy and the history original keep the same 16-bit PNG tagged with cICP (BT.2020 / PQ); the selection preview, pins, OCR, GIF and history thumbnails use an SDR image, and annotated or multi-region captures stay 8-bit. With HDR recording enabled and supported by the system, MP4 is encoded as HDR10 (HEVC Main 10, PQ / BT.2020); otherwise it falls back to SDR / H.264. macOS needs 15+ on Apple Silicon; Windows needs an HDR-enabled display.
-- **Pins**: keep a capture on screen, movable, zoomable and translucent; multiple pins are supported.
+- **HDR capture**: when the display is in HDR and the frame actually exceeds SDR white, Save, Copy and the history original keep the same 16-bit PNG tagged with cICP (BT.2020 / PQ). Annotations and watermarks on a single-region capture are composited in linear HDR and preserve HDR; selection previews, pins, OCR, GIF and history thumbnails use SDR. Cross-display multi-region stitching remains 8-bit, and JPEG does not carry HDR. With HDR recording enabled and supported, MP4 is encoded as HDR10 (HEVC Main 10, PQ / BT.2020), and watermarks never silently downgrade it; only an unavailable encoder falls back to SDR / H.264 with the watermark retained. macOS needs 15+ on Apple Silicon; Windows needs an HDR-enabled display.
+- **Pins**: keep a capture on screen, movable, zoomable and translucent; multiple pins are supported, and tall captures automatically open as scrollable tiled pins.
+- **Scrolling screenshot**: after selecting a region, scroll manually right away (bidirectional downward & upward stitching) or enable adaptive auto-scroll from the floating control bar. The stitcher detects and keeps textured sticky headers/footers only once (ignoring plain whitespace), excludes scrollbar margins, aligns with coarse-to-fine matching, cuts seams cleanly across overlaps, and renders incremental preview tiles alongside the region. Finish directly with Copy, Save, Pin or OCR, or press `E` to open a dedicated long-image editor with top/bottom trim handles, all 7 annotation tools and zoom. Images taller than 4096 px are OCR'd in overlapping strips with seam deduplication, and >2:1 history entries crop a top/left thumbnail while preserving full dimensions.
 - **Text recognition**: recognizes the selection and copies the text when it can; the results panel lets you copy again, and the text is stored in history.
 - **Video / animation recording (GIF and APNG)**: the overlay toolbar and tray expose separate Animation and Video actions. Animation uses the format chosen in Settings (GIF by default), with no repeated format picker at the recording entry points. GIF drops straight into a chat, APNG keeps full lossless RGBA quality in a `.png` animation, and MP4 goes through the system hardware encoder and stays small and smooth. The cursor and click effects are on by default. Settings offers 22 effects in Basic, Motion, Particles and Glow groups, including a diamond outline, corner brackets, orbiting dots, radar sweep, stardust, a micro rocket, nebula glow and a rainbow ring. Compact category tabs save vertical space, and clicking a style card plays a one-shot preview at the clicked position, hides the static thumbnail while it plays, and restores the thumbnail after 1.2 seconds without another click. Click effects require cursor capture and are drawn before duplicate-frame detection, so they still animate over a static screen. Recording captures, encodes and writes on a dedicated thread; GIF / APNG use a bounded queue sized for the physical resolution, and changed frames get a sampled prefilter before exact deduplication without reducing output pixels. Every format shows a control bar with pause / resume, cancel and stop; the shortcut, Stop or the duration limit saves the recording, while `Esc` or Cancel discards it.
-- **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧O` recognize text, `⌥⇧G` record an animation, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
+- **Tray and global shortcuts**: `⌥⇧A` capture, `⌥⇧S` scrolling screenshot, `⌥⇧O` recognize text, `⌥⇧G` record an animation, `⌥⇧V` record a video by default. Rebind them in settings; conflicts are reported.
 - **History**: copy, save, pin, OCR and recorded GIFs / APNGs / videos are all saved automatically, pruned by item count (0 keeps everything).
 - **Permission guidance**: when macOS screen recording or accessibility access is missing, SnapIt opens a permissions panel that explains what each one is for and links to System Settings.
 - **Small and native**: a single executable, light / dark themes that follow the system, Simplified Chinese and English UI.
@@ -81,18 +83,19 @@ Each release also includes `SHA256SUMS.txt` with the checksums of all files and 
 
 ### Tray and global shortcuts
 
-On launch SnapIt only shows a tray icon (the menu bar on macOS). The tray menu contains Screenshot, Animation, Video, Recognize Text, Pin Last Capture, History, Settings and Quit. The animation format is configured in Settings and defaults to GIF. Closing settings, history, OCR results, a pin or the overlay never quits the app. On macOS there is normally no Dock icon; it appears only while the settings, history or OCR panel is open.
+On launch SnapIt only shows a tray icon (the menu bar on macOS). The tray menu contains Screenshot, Scrolling Screenshot, Animation, Video, Recognize Text, Pin Last Capture, History, Settings and Quit. The animation format is configured in Settings and defaults to GIF. Closing settings, history, OCR results, a pin or the overlay never quits the app. On macOS there is normally no Dock icon; it appears only while the settings, history, OCR panel or long-image editor is open.
 
 Default global shortcuts:
 
 | Action | Default shortcut |
 | --- | --- |
 | Capture region | `⌥⇧A` (`Alt+Shift+A` on Windows) |
+| Scrolling screenshot | `⌥⇧S` (`Alt+Shift+S`) |
 | Recognize text | `⌥⇧O` (`Alt+Shift+O`) |
 | Record animation | `⌥⇧G` (`Alt+Shift+G`) |
 | Record video | `⌥⇧V` (`Alt+Shift+V`) |
 
-Rebind them in **Settings → Shortcuts** by clicking and pressing a new combination; `Esc` aborts the rebinding and `Backspace` / `⌫` clears (disables) a binding. Unsupported combinations, conflicts with another action and shortcuts the system refuses to register are reported. While recording, any global shortcut stops the current recording and then runs that shortcut's own action once encoding finishes (press the GIF shortcut again to start the next recording).
+Rebind them in **Settings → Shortcuts** by clicking and pressing a new combination; `Esc` aborts the rebinding and `Backspace` / `⌫` clears (disables) a binding. Unsupported combinations, conflicts with another action and shortcuts the system refuses to register are reported. While recording or capturing a scrolling screenshot, any global shortcut finishes the current task (scrolling capture completes and copies), and pressing a different shortcut queues and runs its action once done.
 
 Only one SnapIt process runs per data directory, so the tray icon and global hotkeys are never duplicated. A second launch without flags simply exits; `--capture` / `--settings` / `--history` are forwarded to the running instance through `snapit.request` in the data directory and executed there (within about 50 ms) instead of being silently dropped. The login item's `--background` launch has no request and does not open another window.
 
@@ -114,6 +117,14 @@ The save dialog suggests `SnapIt <date> <time>.<extension>`, and the directory i
 
 With no selection, hovering highlights the window under the cursor; with element snapping, the smallest control is highlighted, the wheel moves outward to containers and reverses back. Clicking the highlight selects it.
 
+### Scrolling screenshot
+
+1. Press the scrolling screenshot shortcut (`⌥⇧S` / `Alt+Shift+S` by default), choose **Scrolling Screenshot** in the tray, or click the scroll capture button on the selection overlay toolbar (single-display, single-region selections only).
+2. The overlay immediately switches to a click-through live border while opening a compact floating control bar and an incremental tile-rendered preview strip (togglable from the bar or in Settings). Scroll manually with the mouse wheel or trackpad right away (both downward and upward stitching work), or press `Space` / click Auto-Scroll to scroll adaptively until the end, user intervention (moving the pointer or clicking), or the height cap is reached.
+3. The stitcher ignores scrollbar margins, automatically keeps textured sticky headers and footers only once (never misclassifying blank whitespace), and cuts seams near the middle of overlap bands. If you scroll too fast or hit a blank low-texture stretch, the live outline switches to a warning color and pauses stitching until you scroll back into overlap.
+4. From the control bar you can **Reset**, toggle **Auto-Scroll** (`Space`) or **Live Preview**, or finish directly with **Copy** (`Enter`), **Save** (`⌘S` / `Ctrl+S`), **Pin**, **OCR**, or press `E` for the **Long-Image Editor**; `Esc` or Cancel discards the capture.
+5. **Long-image editor**: renders arbitrarily tall captures in <= 2048 px GPU tiles with draggable top/bottom trim handles, all 7 annotation tools (rectangle, arrow, line, pen, mosaic, IME-aware text, numbered steps) plus style strip, zoom controls (`Fit width` / `100%`), and direct Copy / Save / Pin / OCR actions.
+
 ### Annotations
 
 Once a region is selected, annotation tools appear on the left of the toolbar:
@@ -132,7 +143,19 @@ Once a region is selected, annotation tools appear on the left of the toolbar:
 </p>
 <p align="center"><sub>Rectangle, arrow, pen, mosaic, text and step annotations, with color and line width</sub></p>
 
-Everything except mosaic takes a color; rectangle, arrow and pen also take a line width. Undo and clear buttons sit on the same toolbar, which can be dragged and stays where you drop it. Annotations live on the frozen screenshot: copy, save and pin bake them into the image, while OCR and recording use the unannotated selection.
+Everything except mosaic takes a color; rectangle, arrow and pen also take a line width. Undo and clear buttons sit on the same toolbar, which can be dragged and stays where you drop it. Annotations live on the frozen screenshot: copy, save and pin bake them into the image, while OCR and recording use the unannotated selection. Watermarks sit above annotations, and Copy, Save, Pin and the history original share one frozen composed result.
+
+### Watermarks
+
+Enable watermarks in **Settings → Watermark**, then choose a saved template, click **New…** to pick from 5 built-in starters (Blank, Clean signature, Brand + timestamp, Pill badge, Diagonal tile), or click **Edit…** / **Duplicate** to work in the dedicated three-pane designer window. Its toolbar adds multiple multi-line text elements (with `{date}`, `{time}`, `{datetime}` and `{year}` variables, bold, drop shadow, outline stroke and pill background) and multiple PNG / JPEG images (with corner radius cropping), plus undo / redo, duplicate, delete and alignment / distribution actions. The left pane lists layers alongside the **Whole** toggle, the center canvas supports checkerboard, light or dark backdrops, direct dragging with 5 px sibling snap guides, corner resize handles, top rotation handle (`Shift` snaps 15°), trackpad pinch or scroll zoom, drag-and-drop image import and `⌘V` / `Ctrl+V` clipboard image paste, and the right inspector edits styling and exact coordinates. Editing is draft-only: **Save Template** writes the stamp design, while Cancel leaves the original untouched. Template names, a visual clickable 3×3 placement grid, tiling and spacing are configured directly in Settings, and non-tiled non-centered margins can also be dragged directly on the Settings live preview canvas; template names are unique and searchable, and deleting a template makes its outputs fall back cleanly.
+
+The **Apply To** group has independent switches for screenshots, animations (GIF / APNG) and videos (MP4): screenshots default on, while animations and videos default off. Turning off the master switch disables the scope controls and shows an inactive preview; selecting no output type prompts you to choose one.
+
+**Shared watermark** is on by default, so all three output types use one template. Turn it off to switch between Screenshot, Animation and Video in a segmented tab bar (**Use shared watermark** inherits the shared template, and Settings shows a note when multiple outputs share a template). Switching modes preserves each selection, and the three Apply To switches remain independent. Template names, designer fields and output types are included in Settings search. Template edits update both the Settings preview and the active screenshot selection preview immediately. The preview frame is always 16:9, while representative screenshot, square animation and 16:9 video canvases fit inside it without cropping; square canvases are centered with side padding. Watermarks use a new template-based configuration and do not migrate the old inline fields.
+
+Enabled animation and video recordings bake in the watermark for their output type before encoding. The watermark is composited after the cursor / click effects and after exact duplicate-frame detection, and is rasterized only once, so a static watermark never changes deduplication or stacks on itself. HDR MP4 composites directly into linear HDR before BT.2020 / PQ Main10 conversion.
+
+Imported images are checked for format, dimensions and file size, then copied into the app data directory's `watermarks/` folder; the config stores only the managed file name. Watermark processing stays local. History originals and pins opened from history retain the pixels captured at creation time: later settings changes do not recompose them, and copying or saving again never adds a second watermark. OCR always receives the clean SDR source.
 
 ### Text recognition
 
@@ -140,7 +163,7 @@ Press the OCR shortcut, choose Recognize Text in the tray, or click the recogniz
 
 - A result is **copied to the clipboard automatically**.
 - The panel can copy the text again; no text, a failed recognition or an unavailable backend is reported in the panel.
-- Recognition uses the original selection, without annotations.
+- Recognition uses the original selection, without annotations or watermarks; the image stored in history still matches Copy and Save.
 
 Choose the language in **Settings → Text Recognition**: automatic (Simplified Chinese, Traditional Chinese, English) or an explicit Simplified Chinese, Traditional Chinese, English, Japanese, Korean, French or German. The setting applies to macOS Vision and Windows.Media.Ocr; the ocrs backend only supports Latin script, so the setting does not change its results.
 
@@ -172,7 +195,7 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 </p>
 <p align="center"><sub>Recorded GIF (fictional demo content): changes inside the selection captured frame by frame</sub></p>
 
-The animation format is configured only in **Settings → Recording → Animation format** and defaults to GIF; shortcuts, the tray and the overlay share that choice. The same page holds GIF / APNG frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), MP4 target bitrate in Kbps, 0–600 seconds (default 0, unlimited), cursor capture (on by default), click effects (on by default), click style (14 options in Basic, Motion, Particles and Glow groups, including multicolour fireworks, sparkles, comets and aurora effects) and HDR recording (on by default, MP4 only). Enter 0 for the MP4 target bitrate to use the automatic value; a positive integer overrides it. You can also set `animation_format`, `click_effect`, `mp4_bitrate_kbps`, `captures_cursor` and `click_effects` under `[recording]` in `config.toml`. The bitrate affects MP4 only, for both SDR / H.264 and HDR / HEVC. APNG shares GIF's frame rate but keeps lossless 8-bit RGBA pixels instead of a 256-colour palette; it loops forever and is copied as PNG image data. Click effects are drawn before duplicate-frame detection, so they still animate over a static screen. Output uses the display's physical pixels by default, matching screenshot resolution instead of automatically shrinking to logical size on Retina displays.
+The animation format is configured only in **Settings → Recording → Animation format** and defaults to GIF; shortcuts, the tray and the overlay share that choice. The same page holds GIF / APNG frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), MP4 target bitrate in Kbps, 0–600 seconds (default 0, unlimited), cursor capture (on by default), click effects (on by default), click style (22 options in Basic, Motion, Particles and Glow groups, including multicolour fireworks, sparkles, comets and aurora effects) and HDR recording (on by default, MP4 only). Enter 0 for the MP4 target bitrate to use the automatic value; a positive integer overrides it. You can also set `animation_format`, `click_effect`, `mp4_bitrate_kbps`, `captures_cursor` and `click_effects` under `[recording]` in `config.toml`. The bitrate affects MP4 only, for both SDR / H.264 and HDR / HEVC. APNG shares GIF's frame rate but keeps lossless 8-bit RGBA pixels instead of a 256-colour palette; it loops forever and is copied as PNG image data. Click effects are drawn before duplicate-frame detection, so they still animate over a static screen. Output uses the display's physical pixels by default, matching screenshot resolution instead of automatically shrinking to logical size on Retina displays.
 
 Each recording writes exactly one file, and all three formats coexist in history with a first-frame PNG thumbnail. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows): HDR sessions use HEVC Main10, and an unavailable encoder or a rejected first frame automatically reopens the file as SDR / H.264, so no codec has to be installed. SDR video is explicitly tagged BT.709 and, unless a manual bitrate is set, targets 0.1 bit/pixel/frame at the physical resolution to leave room for small text and fine edges. GIF is encoded in pure Rust and plays anywhere: it shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. APNG stores lossless RGBA8 frames through the existing PNG encoder, reuses GIF's dirty rectangles with no disposal or blend operation, loops forever, and patches the final frame count into `acTL` when recording finishes. GIF and APNG stream to disk through a bounded eight-frame queue, so long recordings do not require keeping every frame in memory. Physical pixels cost more CPU, memory and disk space, and GIF still has a 256-colour limit; callers that need smaller output can set `max_width` explicitly. GIF and APNG keep actual pixel dimensions, including odd sizes. H.264 and HEVC need even dimensions for 4:2:0 chroma, so an MP4 can be up to one pixel narrower or shorter than the selection.
 
@@ -185,10 +208,10 @@ Click Pin in the overlay toolbar, choose Pin Last Capture in the tray, or pick P
 </p>
 <p align="center"><sub>Pins stay on top, can be moved, zoomed and made translucent, several at once</sub></p>
 
-- Drag a pin to move it; scroll to zoom; hold `⌥` / `Alt` while scrolling to change opacity (minimum 20%).
+- Drag a pin to move it; scroll to zoom normal pins, or scroll through tall scrollable pins (`⌘` / `Ctrl` + scroll to zoom); hold `⌥` / `Alt` while scrolling to change opacity (minimum 20%).
 - Double-click or `Esc` closes it. The right-click menu copies, saves, sets opacity (100% / 80% / 60% / 40%), zooms, resets zoom or closes.
 - `⌘C` / `Ctrl+C` copies, `⌘S` / `Ctrl+S` saves, `⌘=` / `⌘-` / `⌘0` (`Ctrl+=` etc. on Windows) zoom, `⌘W` / `Ctrl+W` closes.
-- Pins stay on top and show no Dock icon. A pin from a selection covers that selection's position; one opened from history is scaled to at most 60% of the display and centered.
+- Pins stay on top and show no Dock icon. Images taller than the GPU texture tile height render cleanly in stacked tiles, and tall scrollable pins cap initial window height at 75% of the screen with a scrollbar. A pin from a selection covers that selection's position; one opened from history is scaled to at most 60% of the display (fit to width for tall images) and centered.
 
 ### History
 
@@ -206,8 +229,9 @@ The history panel has **All / Screenshots / Recordings** filters at the top; the
 | Page | Options |
 | --- | --- |
 | General | Language (follow system / Simplified Chinese / English), theme (follow system / light / dark), launch at login |
-| Shortcuts | Global shortcuts for capture, text recognition, GIF and video recording |
-| Capture | Default save directory, image format (PNG / JPEG), JPG quality, window snapping, element snapping, dim mask strength, selection drop shadow |
+| Shortcuts | Global shortcuts for capture, scrolling screenshot, text recognition, GIF and video recording |
+| Capture | Default save directory, image format (PNG / JPEG), JPG quality, window snapping, element snapping, dim mask strength, selection drop shadow, and scrolling capture options (max height, auto-scroll speed, live preview) |
+| Watermark | Master and shared / separate template modes, three target switches, named template selection / creation / editing / deletion, designer dialog, rotation / scale / opacity, placement / margins / tiling / spacing, image import, instant preview |
 | Recording | Animation format (GIF / APNG), GIF / APNG and MP4 frame rates, MP4 target bitrate, maximum duration, cursor, click effects and style, HDR recording |
 | Text Recognition | Recognition language |
 | History | Enable saving, maximum entries (0 = unlimited), and a button to open the history panel |
@@ -216,7 +240,7 @@ The history panel has **All / Screenshots / Recordings** filters at the top; the
 <p align="center">
   <img src="assets/screenshots/en/settings.png" width="820" alt="Settings panel">
 </p>
-<p align="center"><sub>Settings: General, Shortcuts, Capture, Recording, Text Recognition, History and About</sub></p>
+<p align="center"><sub>Settings: General, Shortcuts, Capture, Watermark, Recording, Text Recognition, History and About</sub></p>
 
 Launch at login is registered through a LaunchAgent (macOS) or the current user's registry Run key (Windows). It passes `--background`, so the app starts in the tray.
 
@@ -237,6 +261,11 @@ Global shortcuts are listed above and can be changed in settings. The following 
 | Pause / resume while recording | <kbd>Space</kbd> | <kbd>Space</kbd> |
 | Stop and save while recording | <kbd>Enter</kbd> | <kbd>Enter</kbd> |
 | Discard while recording | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
+| Toggle auto-scroll while scrolling capture | <kbd>Space</kbd> | <kbd>Space</kbd> |
+| Finish scrolling capture (copy / save / edit) | <kbd>Enter</kbd> / <kbd>⌘S</kbd> / <kbd>E</kbd> | <kbd>Enter</kbd> / <kbd>Ctrl+S</kbd> / <kbd>E</kbd> |
+| Cancel scrolling capture | <kbd>Esc</kbd> | <kbd>Esc</kbd> |
+| Long-image editor copy / save / undo | <kbd>⌘C</kbd> / <kbd>⌘S</kbd> / <kbd>⌘Z</kbd> | <kbd>Ctrl+C</kbd> / <kbd>Ctrl+S</kbd> / <kbd>Ctrl+Z</kbd> |
+| Long-image editor zoom in / out / 100% / close | <kbd>⌘=</kbd> / <kbd>⌘-</kbd> / <kbd>⌘0</kbd> / <kbd>Esc</kbd> | <kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd> / <kbd>Esc</kbd> |
 | Close pin | <kbd>⌘W</kbd> | <kbd>Ctrl+W</kbd> |
 | Pin zoom in / out / reset | <kbd>⌘=</kbd> / <kbd>⌘-</kbd> / <kbd>⌘0</kbd> | <kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd> |
 | Open settings | <kbd>⌘,</kbd> | <kbd>Ctrl+,</kbd> |
@@ -258,6 +287,7 @@ Paths come from `directories::ProjectDirs::from("dev", "SnapIt", "SnapIt")`. Set
 | --- | --- | --- |
 | Settings `config.toml` | `~/Library/Application Support/dev.SnapIt.SnapIt/config.toml` | `%APPDATA%\SnapIt\SnapIt\config\config.toml` |
 | History `history/index.json`, captures and recordings | `~/Library/Application Support/dev.SnapIt.SnapIt/history/` | `%APPDATA%\SnapIt\SnapIt\data\history\` |
+| Image watermarks | `~/Library/Application Support/dev.SnapIt.SnapIt/watermarks/` | `%APPDATA%\SnapIt\SnapIt\data\watermarks\` |
 
 The default TOML is written on first run. A corrupt config is moved to `config.toml.bak` and replaced with defaults. Settings are written back to `config.toml` as soon as they change. For example, to set the MP4 target bitrate to 12 Mbps:
 
@@ -306,12 +336,13 @@ cargo run -p snapit-recorder --example record_video -- /tmp/out.mp4 3 1280
 crates/
 ├── capture   # snapit-capture: xcap multi-monitor capture, scale conversion, crop, encoding, windows/elements
 ├── recorder  # snapit-recorder: xcap capture + gif / system H.264 / HEVC Main10 encoding, duplicate-frame dedupe, duration cap
-├── ocr       # snapit-ocr: OcrEngine trait + Vision / ocrs / Windows.Media.Ocr backends
+├── scroll    # snapit-scroll: bidirectional live stitcher, sticky-bar & scrollbar detection, auto-scroll injection, tiled preview
+├── ocr       # snapit-ocr: OcrEngine trait + Vision / ocrs / Windows.Media.Ocr backends + segmented tall OCR
 ├── store     # snapit-store: TOML settings, history index and pruning, app directories
-└── app       # snapit: gpui-kit UI, tray, global shortcuts, selection overlays, annotations, pins, recording bar
+└── app       # snapit: gpui-kit UI, tray, global shortcuts, selection overlays, annotations, long-image editor, pins, control bars
 ```
 
-Main modules in `crates/app`: `controller.rs` (the global workflow), `session.rs` (frozen frames and selection), `overlay.rs` (selection UI and toolbar), `annotate.rs` (annotation model and baking), `pin.rs`, `recording_bar.rs`, `tray.rs`, `settings*`, `history*`, `hotkey.rs`, `permissions*`, `appearance.rs` and `autostart.rs`.
+Main modules in `crates/app`: `controller.rs` (the global workflow), `session.rs` (frozen frames and selection), `overlay.rs` (selection UI and toolbar), `annotate.rs` (annotation model and baking), `scroll_bar.rs` (scrolling control bar and live preview), `scroll_editor.rs` (long-image trim and annotation editor), `pin.rs`, `recording_bar.rs`, `tray.rs`, `settings*`, `history*`, `hotkey.rs`, `permissions*`, `appearance.rs` and `autostart.rs`.
 
 ## macOS app bundle
 
@@ -412,7 +443,9 @@ Model lookup order: the `SNAPIT_OCR_MODELS` environment variable → `models/` n
 - **Copying a video file**: macOS writes a file reference (pasteable); Windows falls back to copying the path as text.
 - **OCR**: the ocrs backend is Latin-only; the language setting only affects Vision and Windows.Media.Ocr.
 - **Auto-updates**: macOS only downloads the DMG to Downloads and reveals it in Finder; installing it (drag into `/Applications`) is left to you, because an app cannot reliably replace itself while running. A development build run from `target/debug` cannot update itself. Windows updates run `setup.exe` elevated and restart afterwards.
-- **Multiple regions and cross-display stitching**: all displays freeze together. Hold `Shift` to add or remove regions, release it to finish the collection, then use the toolbar to export. Regions on one display are composed at their relative on-screen positions over a transparent canvas and support annotation, but not resizing or region recording. Regions on different displays remain separate and are exported in selection order, stitched top to bottom; annotation, resizing and region recording are unavailable for this collection.
+- **Watermarks and HDR boundaries**: image watermarks accept PNG / JPEG only and are always treated as sRGB sources composited into linear HDR; ordinary images are not promoted to true HDR assets. Single-region HDR captures support annotations and watermarks. Cross-display multi-region stitching and JPEG remain 8-bit. Watermark, annotation or HDR encoding failures are reported instead of silently omitting the watermark or dropping HDR.
+- **Multiple regions and cross-display stitching**: all displays freeze together. Hold `Shift` to add or remove regions, release it to finish the collection, then use the toolbar to export. Regions on one display are composed at their relative on-screen positions over a transparent canvas and support annotation, but not resizing, region recording or scrolling screenshot. Regions on different displays remain separate and are exported in selection order, stitched top to bottom; annotation, resizing, region recording and scrolling screenshot are unavailable for this collection.
+- **Scrolling screenshot**: synthetic auto-scroll on macOS requires Accessibility permission; without it, manual scrolling still works right away without blocking (enabling Auto-Scroll opens Accessibility guidance). Extreme large blank areas or very fast jumps pause stitching with a warning outline and recover once you scroll back into overlap. Maximum stitched height defaults to 30,000 px (configurable up to 60,000 px under `[scroll]`) and always exports in SDR.
 
 ## Credits and license
 

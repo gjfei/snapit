@@ -10,6 +10,7 @@ use crate::{
 
 pub struct AppSettings {
     store: ConfigStore,
+    watermark_dir: std::path::PathBuf,
 }
 
 impl Global for AppSettings {}
@@ -22,7 +23,10 @@ impl AppSettings {
             ConfigStore::detached(&path)
         });
         log::info!("settings: {}", store.path().display());
-        cx.set_global(Self { store });
+        cx.set_global(Self {
+            store,
+            watermark_dir: dirs.watermark_dir(),
+        });
 
         let mut applied = Self::get(cx).clone();
         cx.observe_global::<Self>(move |cx| {
@@ -39,6 +43,10 @@ impl AppSettings {
 
     pub fn config_path(cx: &App) -> &std::path::Path {
         cx.global::<Self>().store.path()
+    }
+
+    pub fn watermark_dir(cx: &App) -> &std::path::Path {
+        &cx.global::<Self>().watermark_dir
     }
 
     /// Change and persist settings. Observers only fire when something changed.
@@ -80,6 +88,9 @@ fn apply_changes(prev: &Config, next: &Config, cx: &mut App) {
     }
     if prev.ocr != next.ocr {
         Controller::global(cx).update(cx, |controller, _| controller.reset_ocr_engine());
+    }
+    if prev.watermark != next.watermark {
+        cx.refresh_windows();
     }
     if prev.history != next.history {
         // The limit is not applied here on purpose. Every edit — including each

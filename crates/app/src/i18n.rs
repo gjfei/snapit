@@ -45,4 +45,23 @@ mod tests {
         assert_eq!(t!("overlay.tool.line", locale = "zh-CN").as_ref(), "直线");
         assert_eq!(t!("overlay.tool.line", locale = "en").as_ref(), "Line");
     }
+
+    #[test]
+    fn both_locales_have_identical_keys() {
+        let keys = |source: &str| {
+            source
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') || line.starts_with("_version:") {
+                        return None;
+                    }
+                    line.split_once(':').map(|(key, _)| key.to_string())
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let en = keys(include_str!("../locales/en.yml"));
+        let zh = keys(include_str!("../locales/zh-CN.yml"));
+        assert_eq!(en, zh, "locale key sets must stay identical");
+    }
 }

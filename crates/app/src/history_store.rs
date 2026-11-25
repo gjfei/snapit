@@ -8,10 +8,10 @@ use std::{
 
 use anyhow::Result;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
-use snapit_capture::{HdrPngCache, RgbaImage};
+use snapit_capture::RgbaImage;
 use snapit_store::{EntryKind, History, HistoryEntry, Limits, NewEntry};
 
-use crate::annotate::BakedImage;
+use crate::export::ExportComposition;
 use crate::settings::AppSettings;
 
 pub struct HistoryStore {
@@ -158,14 +158,10 @@ impl HistoryStore {
         Self::limits(cx)
     }
 
-    /// `hdr_png` caches the 16-bit source encoding shared with Save and Copy;
-    /// when present it becomes the stored original so history matches them.
-    /// Encoding happens on the background task, never on the UI thread.
+    /// Store the same composed pixels as Copy and Save, including HDR originals.
     pub fn add_image(
         &mut self,
-        image: Arc<RgbaImage>,
-        baked: Option<Arc<BakedImage>>,
-        hdr_png: Option<Arc<HdrPngCache>>,
+        composition: Arc<ExportComposition>,
         scale_factor: f32,
         ocr_text: Option<String>,
         cx: &mut Context<Self>,
@@ -176,24 +172,14 @@ impl HistoryStore {
         let generation = self.generation;
         let dir = self.dir.clone();
         let task = cx.background_spawn(async move {
-            let image = baked.map_or(image, |baked| baked.get());
-            match hdr_png {
-                Some(cache) => {
-                    log::info!("history: storing shared HDR original (16-bit BT.2020/PQ)");
-                    match cache.get() {
-                        Ok(bytes) => {
-                            NewEntry::image_hdr(&dir, &bytes, &image, scale_factor, ocr_text)
-                        }
-                        Err(err) => {
-                            log::warn!("failed to encode HDR PNG for history, storing SDR: {err}");
-                            NewEntry::image(&dir, &image, scale_factor, ocr_text)
-                        }
-                    }
-                }
-                None => {
-                    log::info!("history: storing SDR original (no HDR frame)");
-                    NewEntry::image(&dir, &image, scale_factor, ocr_text)
-                }
+            let image = composition.sdr_preview().map_err(anyhow::Error::msg)?;
+            if composition.has_hdr_original() {
+                log::info!("history: storing shared HDR original (16-bit BT.2020/PQ)");
+                let png = composition.png().map_err(anyhow::Error::msg)?;
+                NewEntry::image_hdr(&dir, &png, &image, scale_factor, ocr_text)
+            } else {
+                log::info!("history: storing composed SDR original");
+                NewEntry::image(&dir, &image, scale_factor, ocr_text)
             }
         });
         self.insert_when_ready(task, generation, cx).detach();

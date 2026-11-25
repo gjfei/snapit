@@ -15,11 +15,18 @@ pub enum HotkeyAction {
     Ocr,
     Gif,
     Video,
+    Scroll,
 }
 
 impl HotkeyAction {
-    pub const COUNT: usize = 4;
-    pub const ALL: [Self; 4] = [Self::Screenshot, Self::Ocr, Self::Gif, Self::Video];
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; 5] = [
+        Self::Screenshot,
+        Self::Ocr,
+        Self::Gif,
+        Self::Video,
+        Self::Scroll,
+    ];
 
     pub fn label(self) -> String {
         match self {
@@ -27,6 +34,7 @@ impl HotkeyAction {
             Self::Ocr => t!("action.ocr").to_string(),
             Self::Gif => t!("action.gif").to_string(),
             Self::Video => t!("action.video").to_string(),
+            Self::Scroll => t!("action.scroll").to_string(),
         }
     }
 
@@ -40,6 +48,7 @@ impl HotkeyAction {
             Self::Ocr => &hotkeys.ocr,
             Self::Gif => &hotkeys.gif,
             Self::Video => &hotkeys.video,
+            Self::Scroll => &hotkeys.scroll,
         }
     }
 
@@ -49,6 +58,7 @@ impl HotkeyAction {
             Self::Ocr => hotkeys.ocr = binding,
             Self::Gif => hotkeys.gif = binding,
             Self::Video => hotkeys.video = binding,
+            Self::Scroll => hotkeys.scroll = binding,
         }
     }
 }

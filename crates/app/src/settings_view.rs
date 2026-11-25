@@ -1,32 +1,53 @@
 //! The settings window, built on gpui-kit's `Settings` component.
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
+use anyhow::Context as _;
+use gpui_kit::AppContext as _;
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Selectable as _, Sizable as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputEvent, InputState},
     kbd::Kbd,
     label::Label,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    searchable_list::SearchableVec,
+    select::{Select, SelectEvent, SelectState},
     setting::{
         NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings,
     },
     switch::Switch,
+    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
-    Animation, AnimationExt as _, AnyElement, App, AsyncApp, Axis, Bounds, Context, Div, ElementId,
-    Entity, FocusHandle, Hsla, IntoElement, Keystroke, Modifiers, ParentElement as _,
-    PathPromptOptions, Pixels, Point, Render, SharedString, Styled as _, Subscription, Window,
-    canvas, div, fill, point,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, AsyncApp, Axis, Bounds, Context,
+    CursorStyle, Div, ElementId, Entity, FocusHandle, Hsla, IntoElement, Keystroke, Modifiers,
+    MouseButton, ObjectFit, ParentElement as _, PathPromptOptions, Pixels, Point, Render,
+    RenderImage, SharedString, Styled as _, StyledImage as _, Subscription, Window, canvas,
+    container_query, div, fill, img, point,
     prelude::FluentBuilder as _,
     prelude::{InteractiveElement as _, StatefulInteractiveElement as _},
     px, rgb, size,
 };
+use snapit_capture::{RgbaImage, load_watermark_image};
 use snapit_recorder::{CLICK_DURATION, ClickEffect, ClickEffectGroup};
-use snapit_store::{Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ThemePreference};
+use snapit_store::{
+    Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ScrollConfig, ScrollSpeed,
+    ThemePreference, WatermarkConfig, WatermarkPlacement, WatermarkPreset, WatermarkTarget,
+};
 
 use crate::{
     appearance,
@@ -54,6 +75,8 @@ const CLICK_EFFECT_GROUPS: &[(ClickEffectGroup, &str)] = &[
 ];
 const CLICK_PREVIEW_SIZE: f32 = 56.0;
 const CLICK_PREVIEW_RESTORE_DELAY: Duration = Duration::from_millis(1200);
+const WATERMARK_PREVIEW_FRAME_WIDTH: f32 = 512.0;
+const WATERMARK_PREVIEW_FRAME_HEIGHT: f32 = 288.0;
 
 const CLICK_EFFECT_LABELS: &[(ClickEffect, &str)] = &[
     (ClickEffect::Ring, "settings.click_effect.ring"),
@@ -116,6 +139,17 @@ pub fn ocr_languages(value: &str) -> Vec<String> {
     }
 }
 
+struct WatermarkPreview {
+    target: WatermarkTarget,
+    preset: WatermarkPreset,
+    result: std::result::Result<Arc<RenderImage>, String>,
+}
+
+struct WatermarkTemplateSelect {
+    state: Entity<SelectState<SearchableVec<crate::watermark_editor::WatermarkChoice>>>,
+    _subscription: Subscription,
+}
+
 pub struct SettingsView {
     hotkey_focus: [FocusHandle; HotkeyAction::COUNT],
     /// The action whose field is waiting for keys.
@@ -125,6 +159,8 @@ pub struct SettingsView {
     hotkey_errors: [Option<SharedString>; HotkeyAction::COUNT],
     click_effect_group: ClickEffectGroup,
     click_preview_trigger: Option<(ClickEffect, u64, Point<Pixels>)>,
+    watermark_target_tab: WatermarkTarget,
+    watermark_preview: [Option<WatermarkPreview>; 3],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -187,6 +223,8 @@ impl SettingsView {
             hotkey_errors: Default::default(),
             click_effect_group: click_effect.group(),
             click_preview_trigger: None,
+            watermark_target_tab: WatermarkTarget::Screenshot,
+            watermark_preview: std::array::from_fn(|_| None),
             _subscriptions: subscriptions,
         }
     }
@@ -573,6 +611,286 @@ impl SettingsView {
                         .description(t!("settings.selection_shadow.desc").to_string()),
                     ]),
             )
+            .group(
+                SettingGroup::new()
+                    .title(t!("settings.group.scroll").to_string())
+                    .items([
+                        SettingItem::new(
+                            t!("settings.scroll.max_height").to_string(),
+                            SettingField::number_input(
+                                NumberFieldOptions {
+                                    min: ScrollConfig::HEIGHT_RANGE.0 as f64,
+                                    max: ScrollConfig::HEIGHT_RANGE.1 as f64,
+                                    step: 2000.,
+                                },
+                                |cx: &App| AppSettings::get(cx).scroll.max_height as f64,
+                                |value: f64, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.scroll.max_height = value.round() as u32
+                                    })
+                                },
+                            )
+                            .w_48()
+                            .default_value(defaults.scroll.max_height as f64),
+                        )
+                        .description(t!("settings.scroll.max_height.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.scroll.auto_speed").to_string(),
+                            SettingField::dropdown(
+                                vec![
+                                    (
+                                        "slow".into(),
+                                        t!("settings.scroll.speed.slow").to_string().into(),
+                                    ),
+                                    (
+                                        "medium".into(),
+                                        t!("settings.scroll.speed.medium").to_string().into(),
+                                    ),
+                                    (
+                                        "fast".into(),
+                                        t!("settings.scroll.speed.fast").to_string().into(),
+                                    ),
+                                ],
+                                |cx: &App| {
+                                    AppSettings::get(cx)
+                                        .scroll
+                                        .auto_scroll_speed
+                                        .as_str()
+                                        .into()
+                                },
+                                |value: SharedString, cx: &mut App| {
+                                    if let Some(speed) = ScrollSpeed::parse(&value) {
+                                        AppSettings::update(cx, |config| {
+                                            config.scroll.auto_scroll_speed = speed
+                                        });
+                                    }
+                                },
+                            )
+                            .default_value(defaults.scroll.auto_scroll_speed.as_str()),
+                        )
+                        .description(t!("settings.scroll.auto_speed.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.scroll.show_preview").to_string(),
+                            SettingField::switch(
+                                |cx: &App| AppSettings::get(cx).scroll.show_preview,
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.scroll.show_preview = value
+                                    })
+                                },
+                            )
+                            .default_value(defaults.scroll.show_preview),
+                        )
+                        .description(t!("settings.scroll.show_preview.desc").to_string()),
+                    ]),
+            )
+    }
+
+    fn watermark_page(&mut self, view: &Entity<Self>, cx: &mut Context<Self>) -> SettingPage {
+        let watermark_defaults = WatermarkConfig::default();
+        let config = AppSettings::get(cx).watermark.clone();
+        let page = SettingPage::new(t!("settings.page.watermark").to_string())
+            .icon(Icon::new(LucideIcon::Stamp))
+            .group(
+                SettingGroup::new()
+                    .title(t!("settings.watermark.group.general").to_string())
+                    .items([
+                        SettingItem::new(
+                            t!("settings.watermark.enabled").to_string(),
+                            SettingField::switch(
+                                |cx: &App| AppSettings::get(cx).watermark.enabled,
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.watermark.enabled = value
+                                    })
+                                },
+                            )
+                            .default_value(watermark_defaults.enabled),
+                        )
+                        .description(t!("settings.watermark.enabled.desc").to_string()),
+                        SettingItem::new(
+                            t!("settings.watermark.shared").to_string(),
+                            SettingField::switch(
+                                |cx: &App| AppSettings::get(cx).watermark.shared,
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config.watermark.set_shared(value)
+                                    })
+                                },
+                            )
+                            .default_value(watermark_defaults.shared),
+                        )
+                        .description(t!("settings.watermark.shared.desc").to_string()),
+                    ]),
+            )
+            .group(
+                SettingGroup::new()
+                    .title(t!("settings.watermark.group.scope").to_string())
+                    .description(t!("settings.watermark.group.scope.desc").to_string())
+                    .items([
+                        SettingItem::new(
+                            t!("settings.watermark.screenshots").to_string(),
+                            SettingField::switch(
+                                |cx: &App| {
+                                    AppSettings::get(cx)
+                                        .watermark
+                                        .target_enabled(WatermarkTarget::Screenshot)
+                                },
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config
+                                            .watermark
+                                            .set_target_enabled(WatermarkTarget::Screenshot, value)
+                                    })
+                                },
+                            )
+                            .default_value(watermark_defaults.apply_to_screenshots),
+                        )
+                        .description(t!("settings.watermark.screenshots.desc").to_string())
+                        .disabled(!config.enabled),
+                        SettingItem::new(
+                            t!("settings.watermark.animations").to_string(),
+                            SettingField::switch(
+                                |cx: &App| {
+                                    AppSettings::get(cx)
+                                        .watermark
+                                        .target_enabled(WatermarkTarget::Animation)
+                                },
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config
+                                            .watermark
+                                            .set_target_enabled(WatermarkTarget::Animation, value)
+                                    })
+                                },
+                            )
+                            .default_value(watermark_defaults.apply_to_animations),
+                        )
+                        .description(t!("settings.watermark.animations.desc").to_string())
+                        .disabled(!config.enabled),
+                        SettingItem::new(
+                            t!("settings.watermark.videos").to_string(),
+                            SettingField::switch(
+                                |cx: &App| {
+                                    AppSettings::get(cx)
+                                        .watermark
+                                        .target_enabled(WatermarkTarget::Video)
+                                },
+                                |value: bool, cx: &mut App| {
+                                    AppSettings::update(cx, |config| {
+                                        config
+                                            .watermark
+                                            .set_target_enabled(WatermarkTarget::Video, value)
+                                    })
+                                },
+                            )
+                            .default_value(watermark_defaults.apply_to_videos),
+                        )
+                        .description(t!("settings.watermark.videos.desc").to_string())
+                        .disabled(!config.enabled),
+                    ]),
+            );
+        if !config.enabled || !config.has_active_target() {
+            return page.group(
+                SettingGroup::new()
+                    .title(t!("settings.watermark.group.preview").to_string())
+                    .item(SettingItem::render(watermark_preview_inactive_setting)),
+            );
+        }
+        let previews: [std::result::Result<Arc<RenderImage>, String>; 3] =
+            std::array::from_fn(|index| {
+                self.watermark_preview_image(WatermarkTarget::ALL[index], cx)
+            });
+        let template_names: Vec<SharedString> = config
+            .templates
+            .values()
+            .map(|template| template.name.clone().into())
+            .collect();
+        let mut keywords = watermark_editor_keywords();
+        keywords.extend(template_names);
+        if config.shared {
+            let group = SettingGroup::new()
+                .title(t!("settings.watermark.group.presets").to_string())
+                .description(t!("settings.watermark.group.presets.desc").to_string());
+            let group = add_watermark_target_items(
+                group,
+                WatermarkTarget::Screenshot,
+                &config,
+                previews[watermark_target_index(WatermarkTarget::Screenshot)].clone(),
+                keywords,
+            );
+            page.group(group)
+        } else {
+            let active_target = self.watermark_target_tab;
+            let tab_view = view.clone();
+            let group = SettingGroup::new()
+                .title(t!("settings.watermark.group.presets").to_string())
+                .description(t!("settings.watermark.group.presets.desc").to_string())
+                .item(SettingItem::render(move |_, _, cx| {
+                    let watermark = &AppSettings::get(cx).watermark;
+                    let selected_ix = watermark_target_index(active_target);
+                    let tab_view = tab_view.clone();
+                    TabBar::new("watermark-target-tabs")
+                        .segmented()
+                        .w_full()
+                        .selected_index(selected_ix)
+                        .children(WatermarkTarget::ALL.into_iter().map(|target| {
+                            let enabled = watermark.target_enabled(target);
+                            Tab::new().label(watermark_target_label(target)).suffix(
+                                div().size(px(6.)).rounded_full().bg(if enabled {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().muted_foreground.opacity(0.35)
+                                }),
+                            )
+                        }))
+                        .on_click(move |ix, _, cx| {
+                            if let Some(&target) = WatermarkTarget::ALL.get(*ix) {
+                                tab_view.update(cx, |this, cx| {
+                                    this.watermark_target_tab = target;
+                                    cx.notify();
+                                });
+                            }
+                        })
+                }));
+            let group = add_watermark_target_items(
+                group,
+                active_target,
+                &config,
+                previews[watermark_target_index(active_target)].clone(),
+                keywords,
+            );
+            page.group(group)
+        }
+    }
+}
+
+impl SettingsView {
+    fn watermark_preview_image(
+        &mut self,
+        target: WatermarkTarget,
+        cx: &App,
+    ) -> std::result::Result<Arc<RenderImage>, String> {
+        let target_index = watermark_target_index(target);
+        let mut preset = AppSettings::get(cx)
+            .watermark
+            .preset(target)
+            .cloned()
+            .ok_or_else(|| "watermark template is unavailable".to_string())?;
+        preset.sanitize();
+        if let Some(cached) = &self.watermark_preview[target_index]
+            && cached.target == target
+            && cached.preset == preset
+        {
+            return cached.result.clone();
+        }
+        let result = build_watermark_preview(target, &preset, AppSettings::watermark_dir(cx));
+        self.watermark_preview[target_index] = Some(WatermarkPreview {
+            target,
+            preset,
+            result: result.clone(),
+        });
+        result
     }
 
     fn recording_page(&self, view: &Entity<SettingsView>) -> SettingPage {
@@ -926,6 +1244,1134 @@ impl SettingsView {
                     ),
             )
     }
+}
+
+struct WatermarkTemplateNameState {
+    input: Entity<InputState>,
+    synced_id: Option<String>,
+    synced_name: String,
+    syncing: bool,
+    error: Option<String>,
+    _subscription: Subscription,
+}
+
+fn active_editable_template_id(
+    watermark: &WatermarkConfig,
+    target: WatermarkTarget,
+) -> Option<String> {
+    if watermark.shared {
+        watermark.effective_template_id(target).map(str::to_string)
+    } else {
+        watermark.selected_template_id(target).map(str::to_string)
+    }
+}
+
+fn add_watermark_target_items(
+    mut group: SettingGroup,
+    target: WatermarkTarget,
+    config: &WatermarkConfig,
+    preview: std::result::Result<Arc<RenderImage>, String>,
+    keywords: Vec<SharedString>,
+) -> SettingGroup {
+    let target_label = watermark_target_label(target);
+    let editable_id = active_editable_template_id(config, target);
+    let inherited = editable_id.is_none();
+    let effective_preset = config.preset(target).cloned().unwrap_or_default();
+    let defaults = WatermarkPreset::default();
+
+    group = group
+        .item(
+            SettingItem::render(move |_, window, cx| {
+                watermark_preset_row(target, target_label.clone(), window, cx)
+            })
+            .keywords(keywords),
+        )
+        .item(
+            SettingItem::new(
+                t!("settings.watermark.template.name").to_string(),
+                SettingField::render(move |options, window, cx| {
+                    watermark_template_name_field(target, options, window, cx)
+                }),
+            )
+            .disabled(inherited),
+        )
+        .item(
+            SettingItem::new(
+                t!("settings.watermark.placement").to_string(),
+                SettingField::render(move |options, _, cx| {
+                    watermark_placement_grid(target, inherited, options, cx)
+                })
+                .on_reset(
+                    move |cx: &App| {
+                        AppSettings::get(cx)
+                            .watermark
+                            .preset(target)
+                            .is_some_and(|preset| preset.placement != defaults.placement)
+                    },
+                    move |_, cx: &mut App| {
+                        AppSettings::update(cx, |config| {
+                            if let Some(id) = active_editable_template_id(&config.watermark, target)
+                                && let Some(template) = config.watermark.template_mut(&id)
+                            {
+                                template.preset.placement = defaults.placement;
+                            }
+                        });
+                    },
+                ),
+            )
+            .disabled(inherited),
+        )
+        .item(
+            SettingItem::new(
+                t!("settings.watermark.margin_x").to_string(),
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: 0.,
+                        max: 2048.,
+                        step: 4.,
+                    },
+                    move |cx: &App| {
+                        AppSettings::get(cx)
+                            .watermark
+                            .preset(target)
+                            .map_or(defaults.margin_x as f64, |preset| preset.margin_x as f64)
+                    },
+                    move |value: f64, cx: &mut App| {
+                        AppSettings::update(cx, |config| {
+                            if let Some(id) = active_editable_template_id(&config.watermark, target)
+                                && let Some(template) = config.watermark.template_mut(&id)
+                            {
+                                template.preset.margin_x = value as f32;
+                            }
+                        });
+                    },
+                )
+                .w_48()
+                .default_value(defaults.margin_x as f64),
+            )
+            .disabled(inherited),
+        )
+        .item(
+            SettingItem::new(
+                t!("settings.watermark.margin_y").to_string(),
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: 0.,
+                        max: 2048.,
+                        step: 4.,
+                    },
+                    move |cx: &App| {
+                        AppSettings::get(cx)
+                            .watermark
+                            .preset(target)
+                            .map_or(defaults.margin_y as f64, |preset| preset.margin_y as f64)
+                    },
+                    move |value: f64, cx: &mut App| {
+                        AppSettings::update(cx, |config| {
+                            if let Some(id) = active_editable_template_id(&config.watermark, target)
+                                && let Some(template) = config.watermark.template_mut(&id)
+                            {
+                                template.preset.margin_y = value as f32;
+                            }
+                        });
+                    },
+                )
+                .w_48()
+                .default_value(defaults.margin_y as f64),
+            )
+            .disabled(inherited),
+        )
+        .item(
+            SettingItem::new(
+                t!("settings.watermark.tiled").to_string(),
+                SettingField::switch(
+                    move |cx: &App| {
+                        AppSettings::get(cx)
+                            .watermark
+                            .preset(target)
+                            .is_some_and(|preset| preset.tiled)
+                    },
+                    move |value: bool, cx: &mut App| {
+                        AppSettings::update(cx, |config| {
+                            if let Some(id) = active_editable_template_id(&config.watermark, target)
+                                && let Some(template) = config.watermark.template_mut(&id)
+                            {
+                                template.preset.tiled = value;
+                            }
+                        });
+                    },
+                )
+                .default_value(defaults.tiled),
+            )
+            .disabled(inherited),
+        );
+
+    if effective_preset.tiled {
+        group = group
+            .item(
+                SettingItem::new(
+                    t!("settings.watermark.spacing_x").to_string(),
+                    SettingField::number_input(
+                        NumberFieldOptions {
+                            min: 8.,
+                            max: 4096.,
+                            step: 8.,
+                        },
+                        move |cx: &App| {
+                            AppSettings::get(cx)
+                                .watermark
+                                .preset(target)
+                                .map_or(defaults.tile_spacing_x as f64, |preset| {
+                                    preset.tile_spacing_x as f64
+                                })
+                        },
+                        move |value: f64, cx: &mut App| {
+                            AppSettings::update(cx, |config| {
+                                if let Some(id) =
+                                    active_editable_template_id(&config.watermark, target)
+                                    && let Some(template) = config.watermark.template_mut(&id)
+                                {
+                                    template.preset.tile_spacing_x = value as f32;
+                                }
+                            });
+                        },
+                    )
+                    .w_48()
+                    .default_value(defaults.tile_spacing_x as f64),
+                )
+                .disabled(inherited),
+            )
+            .item(
+                SettingItem::new(
+                    t!("settings.watermark.spacing_y").to_string(),
+                    SettingField::number_input(
+                        NumberFieldOptions {
+                            min: 8.,
+                            max: 4096.,
+                            step: 8.,
+                        },
+                        move |cx: &App| {
+                            AppSettings::get(cx)
+                                .watermark
+                                .preset(target)
+                                .map_or(defaults.tile_spacing_y as f64, |preset| {
+                                    preset.tile_spacing_y as f64
+                                })
+                        },
+                        move |value: f64, cx: &mut App| {
+                            AppSettings::update(cx, |config| {
+                                if let Some(id) =
+                                    active_editable_template_id(&config.watermark, target)
+                                    && let Some(template) = config.watermark.template_mut(&id)
+                                {
+                                    template.preset.tile_spacing_y = value as f32;
+                                }
+                            });
+                        },
+                    )
+                    .w_48()
+                    .default_value(defaults.tile_spacing_y as f64),
+                )
+                .disabled(inherited),
+            );
+    }
+
+    group.item(SettingItem::render(move |options, window, cx| {
+        watermark_preview_setting(target, preview.clone(), options, window, cx)
+    }))
+}
+
+fn watermark_template_name_field(
+    target: WatermarkTarget,
+    options: &RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let watermark = &AppSettings::get(cx).watermark;
+    let effective_id = watermark.effective_template_id(target).map(str::to_string);
+    let current_name = effective_id
+        .as_deref()
+        .and_then(|id| watermark.templates.get(id))
+        .map(|template| template.name.clone())
+        .unwrap_or_default();
+
+    let state = window.use_keyed_state(
+        ElementId::from(SharedString::from(format!(
+            "watermark-template-name-{}",
+            target.as_str()
+        ))),
+        cx,
+        {
+            let current_name = current_name.clone();
+            let effective_id = effective_id.clone();
+            move |window, cx| {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(current_name.clone())
+                        .placeholder(t!("settings.watermark.template.name").to_string())
+                });
+                let subscription = cx.subscribe_in(&input, window, {
+                    move |state: &mut WatermarkTemplateNameState,
+                          input,
+                          event: &InputEvent,
+                          _,
+                          cx| {
+                        if state.syncing || !matches!(event, InputEvent::Change) {
+                            return;
+                        }
+                        let raw = input.read(cx).value().to_string();
+                        let trimmed = raw.trim();
+                        let watermark = &AppSettings::get(cx).watermark;
+                        let Some(editable_id) = active_editable_template_id(watermark, target)
+                        else {
+                            return;
+                        };
+                        if trimmed.is_empty() {
+                            state.error =
+                                Some(t!("settings.watermark.template.name_required").to_string());
+                            cx.notify();
+                            return;
+                        }
+                        if watermark.template_name_exists(trimmed, Some(&editable_id)) {
+                            state.error = Some(
+                                t!("settings.watermark.template.name_exists", name = trimmed)
+                                    .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        state.error = None;
+                        state.synced_name = trimmed.chars().take(64).collect();
+                        let next_name = trimmed.to_string();
+                        AppSettings::update(cx, |config| {
+                            config.watermark.rename_template(&editable_id, next_name);
+                        });
+                    }
+                });
+                WatermarkTemplateNameState {
+                    input,
+                    synced_id: effective_id,
+                    synced_name: current_name,
+                    syncing: false,
+                    error: None,
+                    _subscription: subscription,
+                }
+            }
+        },
+    );
+
+    state.update(cx, |state, cx| {
+        if state.synced_id != effective_id
+            || (state.error.is_none() && state.synced_name != current_name)
+        {
+            state.syncing = true;
+            state.synced_id = effective_id.clone();
+            state.synced_name = current_name.clone();
+            state.error = None;
+            state.input.update(cx, |input, cx| {
+                input.set_value(current_name, window, cx);
+            });
+            state.syncing = false;
+        }
+    });
+
+    let read_state = state.read(cx);
+    let input = read_state.input.clone();
+    let error = read_state.error.clone();
+    v_flex()
+        .w_56()
+        .gap_1()
+        .child(
+            Input::new(&input)
+                .w_full()
+                .with_size(options.size())
+                .disabled(options.is_disabled())
+                .aria_label(t!("settings.watermark.template.name").to_string()),
+        )
+        .when_some(error, |this, err| {
+            this.child(div().text_xs().text_color(cx.theme().danger).child(err))
+        })
+        .into_any_element()
+}
+
+fn watermark_preset_row(
+    target: WatermarkTarget,
+    target_label: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let watermark = AppSettings::get(cx).watermark.clone();
+    let choices = crate::watermark_editor::template_choices(&watermark, target);
+    let selected = crate::watermark_editor::selection_value(&watermark, target);
+    let selected_index = choices
+        .iter()
+        .position(|choice| choice.value == selected)
+        .map(|index| IndexPath::default().row(index));
+    let select = window.use_keyed_state(
+        ElementId::from(SharedString::from(format!(
+            "watermark-template-{}",
+            target.as_str()
+        ))),
+        cx,
+        {
+            let choices = choices.clone();
+            move |window, cx| {
+                let state = cx.new(|cx| {
+                    SelectState::new(SearchableVec::from(choices), selected_index, window, cx)
+                        .searchable(true)
+                });
+                let subscription = cx.subscribe_in(
+                    &state,
+                    window,
+                    move |_: &mut WatermarkTemplateSelect,
+                          _,
+                          event: &SelectEvent<
+                        SearchableVec<crate::watermark_editor::WatermarkChoice>,
+                    >,
+                          _,
+                          cx| {
+                        let SelectEvent::Confirm(Some(value)) = event else {
+                            return;
+                        };
+                        let id = (value != crate::watermark_editor::INHERIT_VALUE)
+                            .then(|| value.clone());
+                        AppSettings::update(cx, |config| {
+                            config.watermark.select_template(target, id);
+                        });
+                    },
+                );
+                WatermarkTemplateSelect {
+                    state,
+                    _subscription: subscription,
+                }
+            }
+        },
+    );
+    select.update(cx, |select, cx| {
+        select.state.update(cx, |state, cx| {
+            state.set_items(choices.into(), window, cx);
+            if state.selected_value().map(String::as_str) != Some(selected.as_str()) {
+                state.set_selected_value(&selected, window, cx);
+            }
+        });
+    });
+    let explicit_id = active_editable_template_id(&watermark, target);
+    let editable_id = explicit_id.clone();
+    let effective_id = watermark.effective_template_id(target).map(str::to_string);
+    let effective_preset = watermark.preset(target).cloned().unwrap_or_default();
+    let inherited_from_name = (!watermark.shared && explicit_id.is_none()).then(|| {
+        effective_id
+            .as_deref()
+            .and_then(|id| watermark.templates.get(id))
+            .map(|template| template.name.clone())
+            .unwrap_or_else(|| "SnapIt".to_string())
+    });
+    let delete_id = explicit_id
+        .as_ref()
+        .filter(|id| id.as_str() != WatermarkConfig::DEFAULT_TEMPLATE_ID)
+        .cloned();
+    let delete_name = delete_id
+        .as_ref()
+        .and_then(|id| watermark.templates.get(id))
+        .map(|template| template.name.clone())
+        .unwrap_or_default();
+    let duplicate_id = effective_id.clone();
+    let shared_targets = (!watermark.shared)
+        .then(|| {
+            effective_id
+                .as_deref()
+                .map(|id| watermark.template_usages(id))
+                .filter(|usages| usages.len() > 1)
+                .map(|usages| {
+                    usages
+                        .into_iter()
+                        .map(|used| watermark_target_label(used).to_string())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+        })
+        .flatten();
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(Label::new(target_label).text_sm())
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(format!("watermark-new-{}", target.as_str()))
+                                .small()
+                                .label(t!("settings.watermark.template.new").to_string())
+                                .dropdown_menu_with_anchor(
+                                    Anchor::TopRight,
+                                    move |mut menu, _, _| {
+                                        for starter in
+                                            crate::watermark_editor::WatermarkStarter::ALL
+                                        {
+                                            menu = menu.item(
+                                                PopupMenuItem::new(starter.label()).on_click(
+                                                    move |_, window, cx| {
+                                                        crate::watermark_editor::open(
+                                                            window,
+                                                            cx,
+                                                            target,
+                                                            None,
+                                                            starter.preset(),
+                                                        )
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        menu
+                                    },
+                                ),
+                        )
+                        .child(
+                            Button::new(format!("watermark-edit-{}", target.as_str()))
+                                .small()
+                                .outline()
+                                .label(t!("settings.watermark.template.edit").to_string())
+                                .disabled(effective_id.is_none())
+                                .on_click(move |_, window, cx| {
+                                    crate::watermark_editor::open(
+                                        window,
+                                        cx,
+                                        target,
+                                        editable_id.clone(),
+                                        effective_preset.clone(),
+                                    )
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("watermark-duplicate-{}", target.as_str()))
+                                .small()
+                                .outline()
+                                .label(t!("settings.watermark.template.duplicate").to_string())
+                                .disabled(effective_id.is_none())
+                                .on_click(move |_, _, cx| {
+                                    if let Some(id) = duplicate_id.as_deref() {
+                                        AppSettings::update(cx, |config| {
+                                            config.watermark.duplicate_template(id, target);
+                                        });
+                                    }
+                                }),
+                        )
+                        .when_some(delete_id, |this, id| {
+                            this.child(
+                                Button::new(format!("watermark-delete-{}", target.as_str()))
+                                    .small()
+                                    .ghost()
+                                    .label(t!("settings.watermark.template.delete").to_string())
+                                    .on_click(move |_, window, cx| {
+                                        let name = delete_name.clone();
+                                        let id_to_delete = id.clone();
+                                        window.open_alert_dialog(cx, move |alert, _, _| {
+                                            let id_to_delete = id_to_delete.clone();
+                                            alert
+                                                .title(
+                                                    t!(
+                                                        "settings.watermark.template.delete_title",
+                                                        name = name.clone()
+                                                    )
+                                                    .to_string(),
+                                                )
+                                                .description(
+                                                    t!("settings.watermark.template.delete_desc")
+                                                        .to_string(),
+                                                )
+                                                .confirm()
+                                                .ok_text(
+                                                    t!("settings.watermark.template.delete")
+                                                        .to_string(),
+                                                )
+                                                .on_ok(move |_, _, cx| {
+                                                    AppSettings::update(cx, |config| {
+                                                        config
+                                                            .watermark
+                                                            .delete_template(&id_to_delete);
+                                                    });
+                                                    true
+                                                })
+                                        })
+                                    }),
+                            )
+                        }),
+                ),
+        )
+        .child(Select::new(&select.read(cx).state).w_full())
+        .when_some(inherited_from_name, |this, name| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("settings.watermark.template.inherit_hint", name = name).to_string()),
+            )
+        })
+        .when_some(shared_targets, |this, targets| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        t!(
+                            "settings.watermark.template.shared_usage",
+                            targets = targets
+                        )
+                        .to_string(),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+fn watermark_target_index(target: WatermarkTarget) -> usize {
+    match target {
+        WatermarkTarget::Screenshot => 0,
+        WatermarkTarget::Animation => 1,
+        WatermarkTarget::Video => 2,
+    }
+}
+
+fn watermark_editor_keywords() -> Vec<SharedString> {
+    let mut keywords = vec![
+        SharedString::from("watermark"),
+        SharedString::from("水印"),
+        t!("settings.watermark.group.editor").to_string().into(),
+        t!("settings.watermark.kind").to_string().into(),
+        t!("settings.watermark.kind.text").to_string().into(),
+        t!("settings.watermark.kind.image").to_string().into(),
+        t!("settings.watermark.placement").to_string().into(),
+        t!("settings.watermark.placement.top_left")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.top_center")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.top_right")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.middle_left")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.center").to_string().into(),
+        t!("settings.watermark.placement.middle_right")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.bottom_left")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.bottom_center")
+            .to_string()
+            .into(),
+        t!("settings.watermark.placement.bottom_right")
+            .to_string()
+            .into(),
+        t!("settings.watermark.margin_x").to_string().into(),
+        t!("settings.watermark.margin_y").to_string().into(),
+        t!("settings.watermark.rotation").to_string().into(),
+        t!("settings.watermark.tiled").to_string().into(),
+        t!("settings.watermark.spacing_x").to_string().into(),
+        t!("settings.watermark.spacing_y").to_string().into(),
+        t!("settings.watermark.text.content").to_string().into(),
+        t!("settings.watermark.text.font_size").to_string().into(),
+        t!("settings.watermark.text.color").to_string().into(),
+        t!("settings.watermark.text.bold").to_string().into(),
+        t!("settings.watermark.text.shadow").to_string().into(),
+        t!("settings.watermark.text.stroke").to_string().into(),
+        t!("settings.watermark.text.background").to_string().into(),
+        t!("settings.watermark.text.opacity").to_string().into(),
+        t!("settings.watermark.image.source").to_string().into(),
+        t!("settings.watermark.image.choose").to_string().into(),
+        t!("settings.watermark.image.width").to_string().into(),
+        t!("settings.watermark.image.corner_radius")
+            .to_string()
+            .into(),
+        t!("settings.watermark.image.opacity").to_string().into(),
+        t!("settings.watermark.preview").to_string().into(),
+    ];
+    keywords.extend(WatermarkTarget::ALL.into_iter().map(watermark_target_label));
+    keywords
+}
+
+fn watermark_target_label(target: WatermarkTarget) -> SharedString {
+    match target {
+        WatermarkTarget::Screenshot => t!("settings.watermark.screenshots"),
+        WatermarkTarget::Animation => t!("settings.watermark.animations"),
+        WatermarkTarget::Video => t!("settings.watermark.videos"),
+    }
+    .to_string()
+    .into()
+}
+
+pub(crate) fn build_watermark_preview(
+    target: WatermarkTarget,
+    preset: &WatermarkPreset,
+    image_dir: &std::path::Path,
+) -> std::result::Result<Arc<RenderImage>, String> {
+    let (width, height) = match target {
+        WatermarkTarget::Screenshot => (480, 240),
+        WatermarkTarget::Animation => (240, 240),
+        WatermarkTarget::Video => (480, 270),
+    };
+    let sample = RgbaImage::from_fn(width, height, |x, y| {
+        let shade = ((y * 255) / height) as u8;
+        match target {
+            WatermarkTarget::Screenshot if x < 104 => image::Rgba([20, 23, 32, 255]),
+            WatermarkTarget::Screenshot if (120..420).contains(&x) && (28..72).contains(&y) => {
+                image::Rgba([53, 61, 79, 255])
+            }
+            WatermarkTarget::Screenshot
+                if (120..270).contains(&x) && (86..136).contains(&y)
+                    || (284..420).contains(&x) && (86..136).contains(&y) =>
+            {
+                image::Rgba([39, 46, 62, 255])
+            }
+            WatermarkTarget::Animation => {
+                let distance = ((x as f32 - 120.).powi(2) + (y as f32 - 120.).powi(2)).sqrt();
+                if distance < 70. {
+                    image::Rgba([57, 67, 88, 255])
+                } else if distance < 94. {
+                    image::Rgba([40, 48, 65, 255])
+                } else {
+                    image::Rgba([22, 26, 36, 255])
+                }
+            }
+            WatermarkTarget::Video => {
+                if (64..416).contains(&x) && (42..230).contains(&y) {
+                    let band = (y / 24) % 2;
+                    image::Rgba(if band == 0 {
+                        [52, 60, 78, 255]
+                    } else {
+                        [42, 49, 66, 255]
+                    })
+                } else {
+                    image::Rgba([20, 23, 32, 255])
+                }
+            }
+            WatermarkTarget::Screenshot => {
+                image::Rgba([28 + shade / 5, 32 + shade / 4, 43 + shade / 3, 255])
+            }
+        }
+    });
+    let spec = crate::export::watermark_spec(preset, image_dir).map_err(|err| err.to_string())?;
+    let layer = spec
+        .rasterize(width, height, 1.0)
+        .map_err(|err| err.to_string())?;
+    let composed = Arc::new(layer).apply_sdr(Arc::new(sample));
+    Ok(crate::session::render_image(&composed))
+}
+
+fn watermark_preview_size(
+    target: WatermarkTarget,
+    frame_width: f32,
+    frame_height: f32,
+) -> (f32, f32) {
+    let (width, height) = match target {
+        WatermarkTarget::Screenshot => (480., 240.),
+        WatermarkTarget::Animation => (240., 240.),
+        WatermarkTarget::Video => (480., 270.),
+    };
+    let scale = (frame_width / width).min(frame_height / height);
+    (width * scale, height * scale)
+}
+
+fn watermark_preview_inactive_setting(
+    _options: &RenderOptions,
+    _window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement + use<> {
+    let config = AppSettings::get(cx).watermark.clone();
+    let (title, description) = if !config.enabled {
+        (
+            t!("settings.watermark.inactive").to_string(),
+            t!("settings.watermark.inactive.desc").to_string(),
+        )
+    } else {
+        (
+            t!("settings.watermark.no_target").to_string(),
+            t!("settings.watermark.no_target.desc").to_string(),
+        )
+    };
+    v_flex()
+        .w_full()
+        .min_h(px(96.))
+        .justify_center()
+        .items_center()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().muted)
+        .child(Label::new(title).text_sm())
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(description),
+        )
+}
+
+fn watermark_placement_grid(
+    target: WatermarkTarget,
+    inherited: bool,
+    _options: &RenderOptions,
+    cx: &App,
+) -> AnyElement {
+    const ROWS: [[WatermarkPlacement; 3]; 3] = [
+        [
+            WatermarkPlacement::TopLeft,
+            WatermarkPlacement::TopCenter,
+            WatermarkPlacement::TopRight,
+        ],
+        [
+            WatermarkPlacement::MiddleLeft,
+            WatermarkPlacement::Center,
+            WatermarkPlacement::MiddleRight,
+        ],
+        [
+            WatermarkPlacement::BottomLeft,
+            WatermarkPlacement::BottomCenter,
+            WatermarkPlacement::BottomRight,
+        ],
+    ];
+    let current = AppSettings::get(cx)
+        .watermark
+        .preset(target)
+        .map_or(WatermarkPlacement::default(), |preset| preset.placement);
+    let theme = cx.theme();
+
+    h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            v_flex()
+                .gap(px(3.))
+                .p(px(4.))
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .when(inherited, |this| this.opacity(0.6))
+                .children(ROWS.into_iter().map(|row| {
+                    h_flex().gap(px(3.)).children(row.into_iter().map(|cell| {
+                        let active = cell == current;
+                        let label = crate::watermark_editor::placement_label(cell);
+                        Button::new(SharedString::from(format!(
+                            "wm-place-{}-{}",
+                            target.as_str(),
+                            cell.as_str()
+                        )))
+                        .ghost()
+                        .p_0()
+                        .w(px(34.))
+                        .h(px(26.))
+                        .selected(active)
+                        .disabled(inherited)
+                        .tooltip(label.clone())
+                        .accessibility_label(label)
+                        .on_click(move |_, _, cx| {
+                            AppSettings::update(cx, |config| {
+                                if let Some(id) =
+                                    active_editable_template_id(&config.watermark, target)
+                                    && let Some(template) = config.watermark.template_mut(&id)
+                                {
+                                    template.preset.placement = cell;
+                                }
+                            });
+                        })
+                        .child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(div().size(px(7.)).rounded_full().bg(if active {
+                                    theme.primary
+                                } else {
+                                    theme.muted_foreground.opacity(0.45)
+                                })),
+                        )
+                    }))
+                })),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(crate::watermark_editor::placement_label(current)),
+        )
+        .into_any_element()
+}
+
+#[derive(Default)]
+struct SettingsPreviewDrag {
+    active: bool,
+    press: Point<Pixels>,
+    start_margin_x: f32,
+    start_margin_y: f32,
+    ratio: f32,
+    placement: WatermarkPlacement,
+}
+
+fn preview_margin_axes(placement: WatermarkPlacement) -> (f32, f32) {
+    let x = match placement {
+        WatermarkPlacement::TopLeft
+        | WatermarkPlacement::MiddleLeft
+        | WatermarkPlacement::BottomLeft => 1.0,
+        WatermarkPlacement::TopRight
+        | WatermarkPlacement::MiddleRight
+        | WatermarkPlacement::BottomRight => -1.0,
+        WatermarkPlacement::TopCenter
+        | WatermarkPlacement::Center
+        | WatermarkPlacement::BottomCenter => 0.0,
+    };
+    let y = match placement {
+        WatermarkPlacement::TopLeft
+        | WatermarkPlacement::TopCenter
+        | WatermarkPlacement::TopRight => 1.0,
+        WatermarkPlacement::BottomLeft
+        | WatermarkPlacement::BottomCenter
+        | WatermarkPlacement::BottomRight => -1.0,
+        WatermarkPlacement::MiddleLeft
+        | WatermarkPlacement::Center
+        | WatermarkPlacement::MiddleRight => 0.0,
+    };
+    (x, y)
+}
+
+fn watermark_preview_setting(
+    target: WatermarkTarget,
+    preview: std::result::Result<Arc<RenderImage>, String>,
+    _options: &RenderOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement + use<> {
+    let image = preview.as_ref().ok().cloned();
+    let error = match &preview {
+        Err(error) => Some(error.clone()),
+        Ok(_) => None,
+    };
+    let watermark = AppSettings::get(cx).watermark.clone();
+    let editable_id = active_editable_template_id(&watermark, target);
+    let preset = watermark.preset(target).cloned().unwrap_or_default();
+    let drag_enabled =
+        editable_id.is_some() && !preset.tiled && preset.placement != WatermarkPlacement::Center;
+    let drag = window.use_keyed_state(
+        SharedString::from(format!("watermark-preview-drag-{}", target.as_str())),
+        cx,
+        |_, _| SettingsPreviewDrag::default(),
+    );
+    let start_margin_x = preset.margin_x;
+    let start_margin_y = preset.margin_y;
+    let placement = preset.placement;
+
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(Label::new(t!("settings.watermark.preview").to_string()).text_sm())
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(if drag_enabled {
+                    format!(
+                        "{} {}",
+                        t!("settings.watermark.preview.desc"),
+                        t!("settings.watermark.preview.drag_hint")
+                    )
+                } else {
+                    t!("settings.watermark.preview.desc").to_string()
+                }),
+        )
+        .child(
+            div()
+                .w_full()
+                .justify_center()
+                .child(container_query(move |size, _, cx| {
+                    let frame_width = size.width.min(px(WATERMARK_PREVIEW_FRAME_WIDTH));
+                    let frame_height = frame_width
+                        * (WATERMARK_PREVIEW_FRAME_HEIGHT / WATERMARK_PREVIEW_FRAME_WIDTH);
+                    let (width, height) = watermark_preview_size(
+                        target,
+                        f32::from(frame_width),
+                        f32::from(frame_height),
+                    );
+                    let logical_width = match target {
+                        WatermarkTarget::Animation => 240.0,
+                        WatermarkTarget::Screenshot | WatermarkTarget::Video => 480.0,
+                    };
+                    let ratio = if width > 0.0 {
+                        logical_width / width
+                    } else {
+                        1.0
+                    };
+                    let down_drag = drag.clone();
+                    let move_drag = drag.clone();
+                    let up_drag = drag.clone();
+                    let out_drag = drag.clone();
+
+                    div()
+                        .w(frame_width)
+                        .h(frame_height)
+                        .flex_none()
+                        .justify_center()
+                        .items_center()
+                        .rounded_md()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().muted)
+                        .children(image.clone().map(|image| {
+                            div()
+                                .id(SharedString::from(format!(
+                                    "watermark-preview-canvas-{}",
+                                    target.as_str()
+                                )))
+                                .w(px(width))
+                                .h(px(height))
+                                .flex_none()
+                                .overflow_hidden()
+                                .when(drag_enabled, |this| this.cursor(CursorStyle::OpenHand))
+                                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                                    if !drag_enabled {
+                                        return;
+                                    }
+                                    down_drag.update(cx, |state, _| {
+                                        *state = SettingsPreviewDrag {
+                                            active: true,
+                                            press: event.position,
+                                            start_margin_x,
+                                            start_margin_y,
+                                            ratio,
+                                            placement,
+                                        };
+                                    });
+                                })
+                                .on_mouse_move(move |event, _, cx| {
+                                    let snapshot = {
+                                        let state = move_drag.read(cx);
+                                        state.active.then_some((
+                                            state.press,
+                                            state.start_margin_x,
+                                            state.start_margin_y,
+                                            state.ratio,
+                                            state.placement,
+                                        ))
+                                    };
+                                    let Some((press, sx, sy, ratio, placement)) = snapshot else {
+                                        return;
+                                    };
+                                    let (x_dir, y_dir) = preview_margin_axes(placement);
+                                    let dx = f32::from(event.position.x - press.x) * ratio;
+                                    let dy = f32::from(event.position.y - press.y) * ratio;
+                                    AppSettings::update(cx, |config| {
+                                        if let Some(id) =
+                                            active_editable_template_id(&config.watermark, target)
+                                            && let Some(template) =
+                                                config.watermark.template_mut(&id)
+                                        {
+                                            if x_dir != 0.0 {
+                                                template.preset.margin_x =
+                                                    (sx + dx * x_dir).round().clamp(0.0, 2048.0);
+                                            }
+                                            if y_dir != 0.0 {
+                                                template.preset.margin_y =
+                                                    (sy + dy * y_dir).round().clamp(0.0, 2048.0);
+                                            }
+                                        }
+                                    });
+                                })
+                                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                                    up_drag.update(cx, |state, _| state.active = false);
+                                })
+                                .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                                    out_drag.update(cx, |state, _| state.active = false);
+                                })
+                                .child(img(image).size_full().object_fit(ObjectFit::Fill))
+                        }))
+                        .children(error.clone().map(|error| {
+                            div()
+                                .size_full()
+                                .p_4()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(error)
+                        }))
+                })),
+        )
+}
+
+static WATERMARK_PASTE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn import_watermark_image_bytes(
+    bytes: &[u8],
+    directory: &std::path::Path,
+) -> anyhow::Result<(String, u32, u32)> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    anyhow::ensure!(
+        bytes.len() <= MAX_BYTES,
+        "watermark image exceeds the 16 MiB limit"
+    );
+    let rgba = image::load_from_memory(bytes)
+        .context("invalid watermark image")?
+        .to_rgba8();
+    let (width, height) = rgba.dimensions();
+    anyhow::ensure!(
+        (1..=8192).contains(&width)
+            && (1..=8192).contains(&height)
+            && u64::from(width) * u64::from(height) <= 64_000_000,
+        "watermark image dimensions are invalid or too large"
+    );
+    std::fs::create_dir_all(directory).context("failed to create the watermark folder")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = WATERMARK_PASTE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!("watermark-{}-{nonce}-{seq}.png", std::process::id());
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(&name))
+        .context("failed to create the managed watermark image")?;
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut output, image::ImageFormat::Png)
+        .context("failed to write pasted watermark image")?;
+    Ok((name, width, height))
+}
+
+pub(crate) fn import_watermark_image(
+    source: &std::path::Path,
+    directory: &std::path::Path,
+) -> anyhow::Result<(String, u32, u32)> {
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| matches!(value.as_str(), "png" | "jpg" | "jpeg"))
+        .ok_or_else(|| anyhow::anyhow!("watermark images must be PNG or JPEG"))?;
+    let image = load_watermark_image(source).context("invalid watermark image")?;
+    let (width, height) = image.dimensions();
+    std::fs::create_dir_all(directory).context("failed to create the watermark folder")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = format!("watermark-{}-{nonce}.{extension}", std::process::id());
+    let mut input = std::fs::File::open(source).context("failed to open the watermark image")?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(&name))
+        .context("failed to create the managed watermark image")?;
+    std::io::copy(&mut input, &mut output).context("failed to copy the watermark image")?;
+    Ok((name, width, height))
 }
 
 fn click_effect_setting(
@@ -1360,7 +2806,7 @@ fn choose_save_dir(cx: &mut App) {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         div()
             .size_full()
@@ -1373,6 +2819,7 @@ impl Render for SettingsView {
                         self.general_page(),
                         self.hotkey_page(&view, cx),
                         self.capture_page(),
+                        self.watermark_page(&view, cx),
                         self.recording_page(&view),
                         self.ocr_page(),
                         self.history_page(),
@@ -1439,6 +2886,90 @@ mod tests {
             ClickEffect::Ring,
             1,
         ));
+    }
+
+    #[test]
+    fn watermark_preview_keeps_a_wide_frame_and_undistorted_canvases() {
+        assert!(
+            (WATERMARK_PREVIEW_FRAME_WIDTH / WATERMARK_PREVIEW_FRAME_HEIGHT - 16. / 9.).abs()
+                < 0.0001
+        );
+        for (target, ratio, expected) in [
+            (WatermarkTarget::Screenshot, 2.0, (512., 256.)),
+            (WatermarkTarget::Animation, 1.0, (288., 288.)),
+            (WatermarkTarget::Video, 16. / 9., (512., 288.)),
+        ] {
+            let (width, height) = watermark_preview_size(
+                target,
+                WATERMARK_PREVIEW_FRAME_WIDTH,
+                WATERMARK_PREVIEW_FRAME_HEIGHT,
+            );
+            assert!(width <= WATERMARK_PREVIEW_FRAME_WIDTH);
+            assert!(height <= WATERMARK_PREVIEW_FRAME_HEIGHT);
+            assert!((width / height - ratio).abs() < 0.0001);
+            assert!((width - expected.0).abs() < 0.0001);
+            assert!((height - expected.1).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn watermark_search_keywords_keep_editor_fields_discoverable() {
+        let keywords = watermark_editor_keywords();
+        assert!(keywords.iter().any(|keyword| keyword == "watermark"));
+        assert!(keywords.iter().any(|keyword| keyword == "水印"));
+
+        for label in [
+            t!("settings.watermark.kind"),
+            t!("settings.watermark.placement"),
+            t!("settings.watermark.margin_x"),
+            t!("settings.watermark.rotation"),
+            t!("settings.watermark.tiled"),
+            t!("settings.watermark.text.content"),
+            t!("settings.watermark.image.source"),
+            t!("settings.watermark.preview"),
+        ] {
+            let label: SharedString = label.to_string().into();
+            assert!(keywords.contains(&label));
+        }
+        for target in WatermarkTarget::ALL {
+            assert!(keywords.contains(&watermark_target_label(target)));
+        }
+    }
+
+    #[test]
+    fn watermark_preview_uses_the_shared_text_rasterizer() {
+        let mut preset = WatermarkPreset::default();
+        preset.elements[0].text.color = 0xFA_CC_15;
+        preset.elements[0].opacity = 1.0;
+        let preview = build_watermark_preview(
+            WatermarkTarget::Screenshot,
+            &preset,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let bytes = preview.as_bytes(0).unwrap();
+        assert!(
+            bytes.as_chunks::<4>().0.iter().any(|pixel| {
+                pixel[0] < 80 && pixel[1] > 180 && pixel[2] > 220 && pixel[3] == 255
+            })
+        );
+    }
+
+    #[test]
+    fn watermark_preview_reports_an_unmanaged_image_source() {
+        let mut preset = WatermarkPreset::default();
+        preset.elements = vec![snapit_store::WatermarkElement::new_image(
+            "el-1",
+            "../outside.png",
+            120.0,
+        )];
+        let error = build_watermark_preview(
+            WatermarkTarget::Screenshot,
+            &preset,
+            std::path::Path::new("."),
+        )
+        .unwrap_err();
+        assert!(error.contains("managed file name"));
     }
 
     #[test]

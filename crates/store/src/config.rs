@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -89,6 +92,7 @@ impl Default for GeneralConfig {
 #[non_exhaustive]
 pub struct Hotkeys {
     pub screenshot: String,
+    pub scroll: String,
     pub ocr: String,
     /// Record an animated GIF.
     pub gif: String,
@@ -100,6 +104,7 @@ impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             screenshot: "Alt+Shift+A".into(),
+            scroll: "Alt+Shift+S".into(),
             ocr: "Alt+Shift+O".into(),
             gif: "Alt+Shift+G".into(),
             video: "Alt+Shift+V".into(),
@@ -146,6 +151,56 @@ impl Default for CaptureConfig {
             element_snap: true,
             mask_opacity: 45,
             selection_shadow: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollSpeed {
+    Slow,
+    #[default]
+    Medium,
+    Fast,
+}
+
+impl ScrollSpeed {
+    pub const ALL: [Self; 3] = [Self::Slow, Self::Medium, Self::Fast];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Medium => "medium",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|speed| speed.as_str() == value.trim().to_ascii_lowercase())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct ScrollConfig {
+    pub max_height: u32,
+    pub auto_scroll_speed: ScrollSpeed,
+    pub show_preview: bool,
+}
+
+impl ScrollConfig {
+    pub const HEIGHT_RANGE: (u32, u32) = (4_000, 60_000);
+}
+
+impl Default for ScrollConfig {
+    fn default() -> Self {
+        Self {
+            max_height: 30_000,
+            auto_scroll_speed: ScrollSpeed::Medium,
+            show_preview: true,
         }
     }
 }
@@ -482,23 +537,700 @@ impl Default for UpdateConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatermarkKind {
+    #[default]
+    Text,
+    Image,
+}
+
+impl WatermarkKind {
+    pub const ALL: [Self; 2] = [Self::Text, Self::Image];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value.trim().to_ascii_lowercase())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WatermarkPlacement {
+    #[default]
+    TopLeft,
+    TopCenter,
+    TopRight,
+    MiddleLeft,
+    Center,
+    MiddleRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl WatermarkPlacement {
+    pub const ALL: [Self; 9] = [
+        Self::TopLeft,
+        Self::TopCenter,
+        Self::TopRight,
+        Self::MiddleLeft,
+        Self::Center,
+        Self::MiddleRight,
+        Self::BottomLeft,
+        Self::BottomCenter,
+        Self::BottomRight,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLeft => "top-left",
+            Self::TopCenter => "top-center",
+            Self::TopRight => "top-right",
+            Self::MiddleLeft => "middle-left",
+            Self::Center => "center",
+            Self::MiddleRight => "middle-right",
+            Self::BottomLeft => "bottom-left",
+            Self::BottomCenter => "bottom-center",
+            Self::BottomRight => "bottom-right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|placement| placement.as_str() == value.trim().to_ascii_lowercase())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct TextWatermarkConfig {
+    pub content: String,
+    pub font_size: f32,
+    #[serde(with = "hex_color")]
+    pub color: u32,
+    pub bold: bool,
+    pub shadow: bool,
+    pub stroke_width: f32,
+    #[serde(with = "hex_color")]
+    pub stroke_color: u32,
+    pub background: bool,
+    #[serde(with = "hex_color")]
+    pub background_color: u32,
+    pub background_opacity: f32,
+}
+
+impl Default for TextWatermarkConfig {
+    fn default() -> Self {
+        Self {
+            content: "SnapIt".into(),
+            font_size: 24.0,
+            color: 0xFF_FF_FF,
+            bold: false,
+            shadow: false,
+            stroke_width: 0.0,
+            stroke_color: 0x00_00_00,
+            background: false,
+            background_color: 0x0F_17_2A,
+            background_opacity: 0.55,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct ImageWatermarkConfig {
+    /// Controlled file name inside [`AppDirs::watermark_dir`](crate::AppDirs::watermark_dir).
+    pub source: String,
+    /// Logical width in points/pixels before element and whole-stamp scaling.
+    pub width: f32,
+    /// Corner radius as a percentage of `min(width, height)` (`0` = square, `50` = circle).
+    pub corner_radius: f32,
+}
+
+impl Default for ImageWatermarkConfig {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            width: 120.0,
+            corner_radius: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct WatermarkElement {
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_watermark_kind")]
+    pub kind: WatermarkKind,
+    pub x: f32,
+    pub y: f32,
+    pub rotation_degrees: f32,
+    pub scale: f32,
+    pub opacity: f32,
+    pub text: TextWatermarkConfig,
+    pub image: ImageWatermarkConfig,
+}
+
+impl Default for WatermarkElement {
+    fn default() -> Self {
+        Self {
+            id: "el-1".into(),
+            kind: WatermarkKind::Text,
+            x: 0.0,
+            y: 0.0,
+            rotation_degrees: 0.0,
+            scale: 1.0,
+            opacity: 0.65,
+            text: TextWatermarkConfig::default(),
+            image: ImageWatermarkConfig::default(),
+        }
+    }
+}
+
+impl WatermarkElement {
+    pub fn new_text(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: WatermarkKind::Text,
+            text: TextWatermarkConfig {
+                content: content.into(),
+                ..TextWatermarkConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn new_image(id: impl Into<String>, source: impl Into<String>, width: f32) -> Self {
+        Self {
+            id: id.into(),
+            kind: WatermarkKind::Image,
+            image: ImageWatermarkConfig {
+                source: source.into(),
+                width,
+                ..ImageWatermarkConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn sanitize(&mut self, fallback_id: &str) {
+        let trimmed = self.id.trim();
+        self.id = if trimmed.is_empty() {
+            fallback_id.into()
+        } else {
+            trimmed.chars().take(64).collect()
+        };
+        self.x = finite_or(self.x, 0.0).clamp(-4096.0, 4096.0);
+        self.y = finite_or(self.y, 0.0).clamp(-4096.0, 4096.0);
+        self.rotation_degrees = finite_or(self.rotation_degrees, 0.0).clamp(-180.0, 180.0);
+        self.scale = finite_or(self.scale, 1.0).clamp(0.1, 8.0);
+        self.opacity = finite_or(self.opacity, 0.65).clamp(0.0, 1.0);
+        self.text.font_size = finite_or(self.text.font_size, 24.0).clamp(8.0, 256.0);
+        if self.text.color == hex_color::INVALID {
+            self.text.color = TextWatermarkConfig::default().color;
+        }
+        self.text.color &= 0x00FF_FFFF;
+        self.text.stroke_width = finite_or(self.text.stroke_width, 0.0).clamp(0.0, 12.0);
+        if self.text.stroke_color == hex_color::INVALID {
+            self.text.stroke_color = TextWatermarkConfig::default().stroke_color;
+        }
+        self.text.stroke_color &= 0x00FF_FFFF;
+        if self.text.background_color == hex_color::INVALID {
+            self.text.background_color = TextWatermarkConfig::default().background_color;
+        }
+        self.text.background_color &= 0x00FF_FFFF;
+        self.text.background_opacity =
+            finite_or(self.text.background_opacity, 0.55).clamp(0.0, 1.0);
+        if self.text.content.chars().count() > 512 {
+            self.text.content = self.text.content.chars().take(512).collect();
+        }
+        if self.kind == WatermarkKind::Text && self.text.content.trim().is_empty() {
+            self.text.content = TextWatermarkConfig::default().content;
+        }
+        self.image.width = finite_or(self.image.width, 120.0).clamp(8.0, 2048.0);
+        self.image.corner_radius = finite_or(self.image.corner_radius, 0.0).clamp(0.0, 50.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatermarkTarget {
+    Screenshot,
+    Animation,
+    Video,
+}
+
+impl WatermarkTarget {
+    pub const ALL: [Self; 3] = [Self::Screenshot, Self::Animation, Self::Video];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Animation => "animation",
+            Self::Video => "video",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|target| target.as_str() == value.trim().to_ascii_lowercase())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct WatermarkPreset {
+    pub elements: Vec<WatermarkElement>,
+    #[serde(deserialize_with = "deserialize_watermark_placement")]
+    pub placement: WatermarkPlacement,
+    pub margin_x: f32,
+    pub margin_y: f32,
+    pub rotation_degrees: f32,
+    pub scale: f32,
+    pub tiled: bool,
+    pub tile_spacing_x: f32,
+    pub tile_spacing_y: f32,
+}
+
+impl Default for WatermarkPreset {
+    fn default() -> Self {
+        Self {
+            elements: vec![WatermarkElement::default()],
+            placement: WatermarkPlacement::BottomRight,
+            margin_x: 24.0,
+            margin_y: 24.0,
+            rotation_degrees: 0.0,
+            scale: 1.0,
+            tiled: false,
+            tile_spacing_x: 160.0,
+            tile_spacing_y: 96.0,
+        }
+    }
+}
+
+impl WatermarkPreset {
+    pub const MAX_ELEMENTS: usize = 32;
+
+    pub fn next_element_id(&self) -> String {
+        let mut suffix = 1usize;
+        loop {
+            let candidate = format!("el-{suffix}");
+            if self.elements.iter().all(|el| el.id != candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    pub fn normalize_element_origins(&mut self) {
+        if self.elements.is_empty() {
+            return;
+        }
+        let min_x = self
+            .elements
+            .iter()
+            .map(|el| el.x)
+            .filter(|value| value.is_finite())
+            .fold(f32::INFINITY, f32::min);
+        let min_y = self
+            .elements
+            .iter()
+            .map(|el| el.y)
+            .filter(|value| value.is_finite())
+            .fold(f32::INFINITY, f32::min);
+        if min_x.is_finite() {
+            for el in &mut self.elements {
+                el.x -= min_x;
+            }
+        }
+        if min_y.is_finite() {
+            for el in &mut self.elements {
+                el.y -= min_y;
+            }
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        self.margin_x = finite_or(self.margin_x, 24.0).clamp(0.0, 2048.0);
+        self.margin_y = finite_or(self.margin_y, 24.0).clamp(0.0, 2048.0);
+        self.rotation_degrees = finite_or(self.rotation_degrees, 0.0).clamp(-180.0, 180.0);
+        self.scale = finite_or(self.scale, 1.0).clamp(0.1, 8.0);
+        self.tile_spacing_x = finite_or(self.tile_spacing_x, 160.0).clamp(8.0, 4096.0);
+        self.tile_spacing_y = finite_or(self.tile_spacing_y, 96.0).clamp(8.0, 4096.0);
+        self.elements.truncate(Self::MAX_ELEMENTS);
+        if self.elements.is_empty() {
+            self.elements.push(WatermarkElement::default());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut next_suffix = 1usize;
+        for (index, element) in self.elements.iter_mut().enumerate() {
+            element.sanitize(&format!("el-{}", index + 1));
+            if !seen.insert(element.id.clone()) {
+                loop {
+                    let candidate = format!("el-{next_suffix}");
+                    next_suffix += 1;
+                    if seen.insert(candidate.clone()) {
+                        element.id = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct WatermarkTemplate {
+    pub name: String,
+    pub preset: WatermarkPreset,
+}
+
+impl Default for WatermarkTemplate {
+    fn default() -> Self {
+        Self {
+            name: "SnapIt".into(),
+            preset: WatermarkPreset::default(),
+        }
+    }
+}
+
+impl WatermarkTemplate {
+    pub fn sanitize(&mut self) {
+        let name = self.name.trim();
+        self.name = if name.is_empty() {
+            "Watermark".into()
+        } else {
+            name.chars().take(64).collect()
+        };
+        self.preset.sanitize();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct WatermarkConfig {
+    pub enabled: bool,
+    pub shared: bool,
+    pub apply_to_screenshots: bool,
+    pub apply_to_animations: bool,
+    pub apply_to_videos: bool,
+    pub templates: BTreeMap<String, WatermarkTemplate>,
+    pub shared_template: Option<String>,
+    pub screenshots_template: Option<String>,
+    pub animations_template: Option<String>,
+    pub videos_template: Option<String>,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shared: true,
+            apply_to_screenshots: true,
+            apply_to_animations: false,
+            apply_to_videos: false,
+            templates: BTreeMap::from([("default".into(), WatermarkTemplate::default())]),
+            shared_template: Some("default".into()),
+            screenshots_template: None,
+            animations_template: None,
+            videos_template: None,
+        }
+    }
+}
+
+impl WatermarkConfig {
+    pub const DEFAULT_TEMPLATE_ID: &'static str = "default";
+
+    pub fn has_active_target(&self) -> bool {
+        self.apply_to_screenshots || self.apply_to_animations || self.apply_to_videos
+    }
+
+    pub fn target_enabled(&self, target: WatermarkTarget) -> bool {
+        match target {
+            WatermarkTarget::Screenshot => self.apply_to_screenshots,
+            WatermarkTarget::Animation => self.apply_to_animations,
+            WatermarkTarget::Video => self.apply_to_videos,
+        }
+    }
+
+    pub fn set_target_enabled(&mut self, target: WatermarkTarget, enabled: bool) {
+        match target {
+            WatermarkTarget::Screenshot => self.apply_to_screenshots = enabled,
+            WatermarkTarget::Animation => self.apply_to_animations = enabled,
+            WatermarkTarget::Video => self.apply_to_videos = enabled,
+        }
+    }
+
+    pub fn set_shared(&mut self, shared: bool) {
+        self.shared = shared;
+    }
+
+    fn selection(&self, target: WatermarkTarget) -> &Option<String> {
+        if self.shared {
+            return &self.shared_template;
+        }
+        match target {
+            WatermarkTarget::Screenshot => &self.screenshots_template,
+            WatermarkTarget::Animation => &self.animations_template,
+            WatermarkTarget::Video => &self.videos_template,
+        }
+    }
+
+    fn selection_mut(&mut self, target: WatermarkTarget) -> &mut Option<String> {
+        if self.shared {
+            return &mut self.shared_template;
+        }
+        match target {
+            WatermarkTarget::Screenshot => &mut self.screenshots_template,
+            WatermarkTarget::Animation => &mut self.animations_template,
+            WatermarkTarget::Video => &mut self.videos_template,
+        }
+    }
+
+    pub fn selected_template_id(&self, target: WatermarkTarget) -> Option<&str> {
+        self.selection(target).as_deref()
+    }
+
+    pub fn effective_template_id(&self, target: WatermarkTarget) -> Option<&str> {
+        self.selection(target)
+            .as_deref()
+            .or(self.shared_template.as_deref())
+            .or(Some(Self::DEFAULT_TEMPLATE_ID))
+            .filter(|id| self.templates.contains_key(*id))
+    }
+
+    pub fn template(&self, target: WatermarkTarget) -> Option<&WatermarkTemplate> {
+        self.effective_template_id(target)
+            .and_then(|id| self.templates.get(id))
+    }
+
+    pub fn preset(&self, target: WatermarkTarget) -> Option<&WatermarkPreset> {
+        self.template(target).map(|template| &template.preset)
+    }
+
+    pub fn template_mut(&mut self, id: &str) -> Option<&mut WatermarkTemplate> {
+        self.templates.get_mut(id)
+    }
+
+    pub fn select_template(&mut self, target: WatermarkTarget, id: Option<String>) {
+        if id
+            .as_ref()
+            .is_some_and(|id| !self.templates.contains_key(id))
+        {
+            return;
+        }
+        *self.selection_mut(target) = id;
+    }
+
+    pub fn template_name_exists(&self, name: &str, except: Option<&str>) -> bool {
+        let name = name.trim().to_lowercase();
+        self.templates.iter().any(|(id, template)| {
+            Some(id.as_str()) != except && template.name.trim().to_lowercase() == name
+        })
+    }
+
+    pub fn template_usages(&self, id: &str) -> Vec<WatermarkTarget> {
+        WatermarkTarget::ALL
+            .into_iter()
+            .filter(|target| self.effective_template_id(*target) == Some(id))
+            .collect()
+    }
+
+    pub fn duplicate_template(
+        &mut self,
+        source_id: &str,
+        target: WatermarkTarget,
+    ) -> Option<String> {
+        let source = self.templates.get(source_id)?.clone();
+        let base = source.name.trim();
+        let base = if base.is_empty() { "Watermark" } else { base };
+        let mut suffix = 2usize;
+        let unique_name = loop {
+            let candidate = format!("{base} {suffix}");
+            if !self.template_name_exists(&candidate, None) {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        Some(self.save_template(None, unique_name, source.preset, target))
+    }
+
+    pub fn rename_template(&mut self, id: &str, name: String) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || self.template_name_exists(trimmed, Some(id)) {
+            return false;
+        }
+        let Some(template) = self.templates.get_mut(id) else {
+            return false;
+        };
+        template.name = trimmed.chars().take(64).collect();
+        template.sanitize();
+        true
+    }
+
+    pub fn save_template(
+        &mut self,
+        id: Option<String>,
+        name: String,
+        preset: WatermarkPreset,
+        target: WatermarkTarget,
+    ) -> String {
+        let id = id
+            .filter(|id| self.templates.contains_key(id))
+            .unwrap_or_else(|| {
+                let mut suffix = self.templates.len() + 1;
+                loop {
+                    let candidate = format!("watermark-{suffix}");
+                    if !self.templates.contains_key(&candidate) {
+                        break candidate;
+                    }
+                    suffix += 1;
+                }
+            });
+        let mut template = WatermarkTemplate { name, preset };
+        template.sanitize();
+        self.templates.insert(id.clone(), template);
+        *self.selection_mut(target) = Some(id.clone());
+        id
+    }
+
+    /// Save the stamp composition from the designer without overwriting the
+    /// Settings-owned template name or output layout (`placement`, `margins`,
+    /// `tiled`, `tile_spacing_*`) on an existing template.
+    pub fn save_template_design(
+        &mut self,
+        id: Option<String>,
+        fallback_name: String,
+        mut design: WatermarkPreset,
+        target: WatermarkTarget,
+    ) -> String {
+        design.normalize_element_origins();
+        design.sanitize();
+        if let Some(existing_id) = id.filter(|id| self.templates.contains_key(id)) {
+            if let Some(template) = self.templates.get_mut(&existing_id) {
+                template.preset.elements = design.elements;
+                template.preset.rotation_degrees = design.rotation_degrees;
+                template.preset.scale = design.scale;
+                template.sanitize();
+            }
+            *self.selection_mut(target) = Some(existing_id.clone());
+            return existing_id;
+        }
+        let base_name = fallback_name.trim();
+        let base_name = if base_name.is_empty() {
+            "Watermark"
+        } else {
+            base_name
+        };
+        let mut unique_name = base_name.to_string();
+        let mut suffix = 2usize;
+        while self.template_name_exists(&unique_name, None) {
+            unique_name = format!("{base_name} {suffix}");
+            suffix += 1;
+        }
+        self.save_template(None, unique_name, design, target)
+    }
+
+    pub fn delete_template(&mut self, id: &str) -> bool {
+        if id == Self::DEFAULT_TEMPLATE_ID || self.templates.remove(id).is_none() {
+            return false;
+        }
+        for selection in [
+            &mut self.shared_template,
+            &mut self.screenshots_template,
+            &mut self.animations_template,
+            &mut self.videos_template,
+        ] {
+            if selection.as_deref() == Some(id) {
+                *selection = None;
+            }
+        }
+        true
+    }
+
+    pub fn sanitize(&mut self) {
+        if !self.templates.contains_key(Self::DEFAULT_TEMPLATE_ID) {
+            self.templates.insert(
+                Self::DEFAULT_TEMPLATE_ID.into(),
+                WatermarkTemplate::default(),
+            );
+        }
+        for template in self.templates.values_mut() {
+            template.sanitize();
+        }
+        for selection in [
+            &mut self.shared_template,
+            &mut self.screenshots_template,
+            &mut self.animations_template,
+            &mut self.videos_template,
+        ] {
+            if selection
+                .as_ref()
+                .is_some_and(|id| !self.templates.contains_key(id))
+            {
+                *selection = None;
+            }
+        }
+    }
+}
+
+fn finite_or(value: f32, default: f32) -> f32 {
+    if value.is_finite() { value } else { default }
+}
+
+fn deserialize_watermark_kind<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<WatermarkKind, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(WatermarkKind::parse(&value).unwrap_or_default())
+}
+
+fn deserialize_watermark_placement<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<WatermarkPlacement, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(WatermarkPlacement::parse(&value).unwrap_or(WatermarkPlacement::BottomRight))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct Config {
     pub general: GeneralConfig,
     pub hotkeys: Hotkeys,
     pub capture: CaptureConfig,
+    pub scroll: ScrollConfig,
     pub recording: RecordingConfig,
     pub ocr: OcrConfig,
     pub history: HistoryConfig,
     pub annotations: AnnotationConfig,
+    pub watermark: WatermarkConfig,
     pub update: UpdateConfig,
 }
 
 impl Config {
     /// Clamp values a hand-edited file may have pushed out of range.
     pub fn sanitize(&mut self) {
+        let (min_h, max_h) = ScrollConfig::HEIGHT_RANGE;
+        self.scroll.max_height = self.scroll.max_height.clamp(min_h, max_h);
         let (min_fps, max_fps) = RecordingConfig::FPS_RANGE;
         let (min_secs, max_secs) = RecordingConfig::DURATION_RANGE;
         self.recording.gif_fps = self.recording.gif_fps.clamp(min_fps, max_fps);
@@ -537,6 +1269,7 @@ impl Config {
             self.capture.save_dir = None;
         }
         self.annotations.sanitize();
+        self.watermark.sanitize();
     }
 
     pub fn to_toml(&self) -> Result<String> {
@@ -927,5 +1660,456 @@ mod tests {
 
         let written = Config::default().to_toml().unwrap();
         assert!(!written.contains("mp4_bitrate_kbps"));
+    }
+
+    #[test]
+    fn watermark_defaults_use_only_the_screenshot_target() {
+        let config = Config::from_toml("[recording]\ngif_fps = 20\n").unwrap();
+        assert_eq!(config.watermark, WatermarkConfig::default());
+        assert!(!config.watermark.enabled);
+        assert!(config.watermark.apply_to_screenshots);
+        assert!(!config.watermark.apply_to_animations);
+        assert!(!config.watermark.apply_to_videos);
+    }
+
+    #[test]
+    fn watermark_application_targets_round_trip_independently() {
+        for screenshots in [false, true] {
+            for animations in [false, true] {
+                for videos in [false, true] {
+                    let mut config = Config::default();
+                    config.watermark.apply_to_screenshots = screenshots;
+                    config.watermark.apply_to_animations = animations;
+                    config.watermark.apply_to_videos = videos;
+                    let reloaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+                    assert_eq!(reloaded.watermark, config.watermark);
+                    assert_eq!(
+                        reloaded.watermark.has_active_target(),
+                        screenshots || animations || videos
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watermark_templates_round_trip_and_unknown_preset_values_fall_back() {
+        let config = Config::from_toml(
+            "[watermark]\nenabled = true\nshared = false\napply_to_screenshots = false\n\
+             apply_to_animations = true\napply_to_videos = false\nshared_template = \"default\"\n\
+             screenshots_template = \"brand\"\n\
+             [watermark.templates.brand]\nname = \"Brand\"\n\
+             [watermark.templates.brand.preset]\nplacement = \"top-center\"\n\
+             margin_x = 12.5\nrotation_degrees = -15.0\nscale = 1.75\ntiled = true\n\
+             [[watermark.templates.brand.preset.elements]]\nid = \"title\"\nkind = \"text\"\n\
+             x = 10.0\ny = 20.0\nopacity = 0.5\n\
+             [watermark.templates.brand.preset.elements.text]\ncontent = \"测试\"\n\
+             font_size = 32.0\ncolor = \"#112233\"\n\
+             [[watermark.templates.brand.preset.elements]]\nid = \"badge\"\nkind = \"image\"\n\
+             x = 40.0\ny = 60.0\nopacity = 0.75\n\
+             [watermark.templates.brand.preset.elements.image]\nsource = \"logo.png\"\nwidth = 96.0\n",
+        )
+        .unwrap();
+        let preset = config
+            .watermark
+            .preset(WatermarkTarget::Screenshot)
+            .unwrap();
+        assert_eq!(preset.elements.len(), 2);
+        assert_eq!(preset.elements[0].kind, WatermarkKind::Text);
+        assert_eq!(preset.elements[0].text.content, "测试");
+        assert_eq!(preset.elements[0].text.color, 0x11_22_33);
+        assert_eq!(preset.elements[1].kind, WatermarkKind::Image);
+        assert_eq!(preset.elements[1].image.source, "logo.png");
+        assert_eq!(preset.elements[1].image.width, 96.0);
+        assert_eq!(preset.placement, WatermarkPlacement::TopCenter);
+        assert_eq!(preset.scale, 1.75);
+        assert!(preset.tiled);
+        assert!(!config.watermark.apply_to_screenshots);
+        assert!(config.watermark.apply_to_animations);
+        assert!(!config.watermark.apply_to_videos);
+        let reloaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(reloaded.watermark, config.watermark);
+
+        let fallback = Config::from_toml(
+            "[watermark.templates.brand.preset]\nplacement = \"diagonal\"\n\
+             [[watermark.templates.brand.preset.elements]]\nkind = \"video\"\n\
+             [watermark.templates.brand.preset.elements.text]\ncolor = \"nope\"\n",
+        )
+        .unwrap();
+        let preset = fallback
+            .watermark
+            .templates
+            .get("brand")
+            .unwrap()
+            .preset
+            .clone();
+        assert_eq!(preset.elements[0].kind, WatermarkKind::Text);
+        assert_eq!(preset.placement, WatermarkPlacement::BottomRight);
+        assert_eq!(
+            preset.elements[0].text.color,
+            TextWatermarkConfig::default().color
+        );
+    }
+
+    #[test]
+    fn legacy_inline_watermark_preset_is_not_migrated() {
+        let config = Config::from_toml(
+            "[watermark]\nenabled = true\nkind = \"image\"\ncontent = \"Old\"\n\
+             margin_x = 2.0\napply_to_videos = true\n",
+        )
+        .unwrap();
+        assert!(config.watermark.enabled);
+        assert!(config.watermark.apply_to_videos);
+        assert_eq!(
+            config.watermark.templates,
+            WatermarkConfig::default().templates
+        );
+        assert_eq!(
+            config
+                .watermark
+                .preset(WatermarkTarget::Screenshot)
+                .unwrap(),
+            &WatermarkPreset::default()
+        );
+    }
+
+    #[test]
+    fn watermark_template_non_finite_and_out_of_range_values_are_sanitized() {
+        let mut config = Config::default();
+        let preset = &mut config
+            .watermark
+            .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap()
+            .preset;
+        preset.margin_x = f32::NAN;
+        preset.margin_y = f32::INFINITY;
+        preset.rotation_degrees = f32::NEG_INFINITY;
+        preset.scale = 100.0;
+        preset.tile_spacing_x = -10.0;
+        let mut second = WatermarkElement::new_image("el-1", "logo.png", f32::NAN);
+        second.x = f32::INFINITY;
+        second.y = -9999.0;
+        second.opacity = -1.0;
+        preset.elements[0].text.font_size = 1000.0;
+        preset.elements[0].opacity = 4.0;
+        preset.elements.push(second);
+        config.sanitize();
+        let preset = config
+            .watermark
+            .preset(WatermarkTarget::Screenshot)
+            .unwrap();
+        assert_eq!(preset.margin_x, WatermarkPreset::default().margin_x);
+        assert_eq!(preset.margin_y, WatermarkPreset::default().margin_y);
+        assert_eq!(preset.rotation_degrees, 0.0);
+        assert_eq!(preset.scale, 8.0);
+        assert_eq!(preset.tile_spacing_x, 8.0);
+        assert_eq!(preset.elements[0].text.font_size, 256.0);
+        assert_eq!(preset.elements[0].opacity, 1.0);
+        assert_ne!(preset.elements[0].id, preset.elements[1].id);
+        assert_eq!(preset.elements[1].image.width, 120.0);
+        assert_eq!(preset.elements[1].x, 0.0);
+        assert_eq!(preset.elements[1].y, -4096.0);
+        assert_eq!(preset.elements[1].opacity, 0.0);
+    }
+
+    #[test]
+    fn watermark_templates_are_independent_with_shared_inheritance() {
+        let mut watermark = WatermarkConfig::default();
+        let mut shared = WatermarkPreset::default();
+        shared.elements[0].text.content = "Shared".into();
+        watermark.save_template(
+            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()),
+            "Shared".into(),
+            shared,
+            WatermarkTarget::Screenshot,
+        );
+        watermark.set_shared(false);
+
+        let mut animation = WatermarkPreset::default();
+        animation.elements[0].text.content = "Animation".into();
+        watermark.save_template(
+            None,
+            "Animation".into(),
+            animation,
+            WatermarkTarget::Animation,
+        );
+        let mut video = WatermarkPreset::default();
+        video.elements[0].text.content = "Video".into();
+        watermark.save_template(None, "Video".into(), video, WatermarkTarget::Video);
+
+        assert_eq!(
+            watermark
+                .preset(WatermarkTarget::Screenshot)
+                .unwrap()
+                .elements[0]
+                .text
+                .content,
+            "Shared"
+        );
+        assert_eq!(
+            watermark
+                .preset(WatermarkTarget::Animation)
+                .unwrap()
+                .elements[0]
+                .text
+                .content,
+            "Animation"
+        );
+        assert_eq!(
+            watermark.preset(WatermarkTarget::Video).unwrap().elements[0]
+                .text
+                .content,
+            "Video"
+        );
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+
+        watermark.set_shared(true);
+        for target in WatermarkTarget::ALL {
+            assert_eq!(
+                watermark.preset(target).unwrap().elements[0].text.content,
+                "Shared"
+            );
+        }
+        watermark.set_shared(false);
+        assert_eq!(
+            watermark
+                .preset(WatermarkTarget::Animation)
+                .unwrap()
+                .elements[0]
+                .text
+                .content,
+            "Animation"
+        );
+        assert_eq!(
+            watermark.preset(WatermarkTarget::Video).unwrap().elements[0]
+                .text
+                .content,
+            "Video"
+        );
+    }
+
+    #[test]
+    fn watermark_rename_and_design_save_preserve_settings_layout() {
+        let mut watermark = WatermarkConfig::default();
+        let template = watermark
+            .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap();
+        template.preset.placement = WatermarkPlacement::TopLeft;
+        template.preset.margin_x = 40.0;
+        template.preset.margin_y = 50.0;
+        template.preset.tiled = true;
+        template.preset.tile_spacing_x = 200.0;
+        template.preset.tile_spacing_y = 140.0;
+
+        assert!(watermark.rename_template(WatermarkConfig::DEFAULT_TEMPLATE_ID, "Primary".into()));
+        assert!(!watermark.rename_template(WatermarkConfig::DEFAULT_TEMPLATE_ID, "  ".into()));
+
+        let design = WatermarkPreset {
+            elements: vec![
+                WatermarkElement {
+                    x: 20.0,
+                    y: 30.0,
+                    ..WatermarkElement::new_text("el-1", "Line A")
+                },
+                WatermarkElement {
+                    x: 50.0,
+                    y: 70.0,
+                    ..WatermarkElement::new_text("el-2", "Line B")
+                },
+            ],
+            rotation_degrees: 15.0,
+            scale: 1.5,
+            placement: WatermarkPlacement::Center,
+            margin_x: 0.0,
+            tiled: false,
+            ..WatermarkPreset::default()
+        };
+
+        let saved_id = watermark.save_template_design(
+            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()),
+            "Ignored".into(),
+            design,
+            WatermarkTarget::Screenshot,
+        );
+        assert_eq!(saved_id, WatermarkConfig::DEFAULT_TEMPLATE_ID);
+        let updated = watermark
+            .templates
+            .get(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap();
+        assert_eq!(updated.name, "Primary");
+        assert_eq!(updated.preset.placement, WatermarkPlacement::TopLeft);
+        assert_eq!(updated.preset.margin_x, 40.0);
+        assert_eq!(updated.preset.margin_y, 50.0);
+        assert!(updated.preset.tiled);
+        assert_eq!(updated.preset.tile_spacing_x, 200.0);
+        assert_eq!(updated.preset.tile_spacing_y, 140.0);
+        assert_eq!(updated.preset.rotation_degrees, 15.0);
+        assert_eq!(updated.preset.scale, 1.5);
+        assert_eq!(updated.preset.elements[0].x, 0.0);
+        assert_eq!(updated.preset.elements[0].y, 0.0);
+        assert_eq!(updated.preset.elements[1].x, 30.0);
+        assert_eq!(updated.preset.elements[1].y, 40.0);
+    }
+
+    #[test]
+    fn watermark_template_names_are_unique_and_delete_clears_references() {
+        let mut watermark = WatermarkConfig::default();
+        assert!(watermark.template_name_exists(" snapIT ", None));
+        assert!(!watermark.template_name_exists("snapIT", Some("default")));
+        let id = watermark.save_template(
+            None,
+            "Brand".into(),
+            WatermarkPreset::default(),
+            WatermarkTarget::Screenshot,
+        );
+        assert!(watermark.template_name_exists("brand", None));
+        assert!(!watermark.template_name_exists("brand", Some(&id)));
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            Some(id.as_str())
+        );
+        assert!(!watermark.delete_template(WatermarkConfig::DEFAULT_TEMPLATE_ID));
+        assert!(watermark.delete_template(&id));
+        assert!(!watermark.templates.contains_key(&id));
+        assert_eq!(
+            watermark.effective_template_id(WatermarkTarget::Screenshot),
+            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+        );
+    }
+
+    #[test]
+    fn watermark_invalid_template_references_fall_back_after_sanitize() {
+        let mut watermark = WatermarkConfig {
+            shared_template: Some("missing".into()),
+            screenshots_template: Some("missing".into()),
+            animations_template: Some("missing".into()),
+            videos_template: Some("missing".into()),
+            ..WatermarkConfig::default()
+        };
+        watermark.sanitize();
+        for target in WatermarkTarget::ALL {
+            assert_eq!(
+                watermark.effective_template_id(target),
+                Some(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            );
+        }
+    }
+
+    #[test]
+    fn watermark_styles_duplicate_and_usages_work_correctly() {
+        let mut watermark = WatermarkConfig::default();
+        let text = &mut watermark
+            .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap()
+            .preset
+            .elements[0]
+            .text;
+        text.bold = true;
+        text.shadow = true;
+        text.stroke_width = 2.5;
+        text.stroke_color = 0x11_22_33;
+        text.background = true;
+        text.background_color = 0x44_55_66;
+        text.background_opacity = 0.8;
+
+        let mut img = WatermarkElement::new_image("el-2", "badge.png", 64.0);
+        img.image.corner_radius = 50.0;
+        watermark
+            .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap()
+            .preset
+            .elements
+            .push(img);
+
+        let config = Config {
+            watermark: watermark.clone(),
+            ..Config::default()
+        };
+        let round_tripped = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        let loaded = round_tripped
+            .watermark
+            .preset(WatermarkTarget::Screenshot)
+            .unwrap();
+        assert!(loaded.elements[0].text.bold);
+        assert!(loaded.elements[0].text.shadow);
+        assert_eq!(loaded.elements[0].text.stroke_width, 2.5);
+        assert_eq!(loaded.elements[0].text.stroke_color, 0x11_22_33);
+        assert!(loaded.elements[0].text.background);
+        assert_eq!(loaded.elements[0].text.background_color, 0x44_55_66);
+        assert_eq!(loaded.elements[0].text.background_opacity, 0.8);
+        assert_eq!(loaded.elements[1].image.corner_radius, 50.0);
+
+        let mut bad = config.watermark.clone();
+        let bad_el = &mut bad
+            .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap()
+            .preset
+            .elements[0];
+        bad_el.text.stroke_width = 999.0;
+        bad_el.text.background_opacity = f32::NAN;
+        bad_el.text.stroke_color = hex_color::INVALID;
+        bad_el.text.background_color = hex_color::INVALID;
+        bad.template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            .unwrap()
+            .preset
+            .elements[1]
+            .image
+            .corner_radius = 200.0;
+        bad.sanitize();
+        let sanitized = bad.preset(WatermarkTarget::Screenshot).unwrap();
+        assert_eq!(sanitized.elements[0].text.stroke_width, 12.0);
+        assert_eq!(sanitized.elements[0].text.background_opacity, 0.55);
+        assert_eq!(
+            sanitized.elements[0].text.stroke_color,
+            TextWatermarkConfig::default().stroke_color
+        );
+        assert_eq!(
+            sanitized.elements[0].text.background_color,
+            TextWatermarkConfig::default().background_color
+        );
+        assert_eq!(sanitized.elements[1].image.corner_radius, 50.0);
+
+        assert_eq!(
+            watermark.template_usages(WatermarkConfig::DEFAULT_TEMPLATE_ID),
+            WatermarkTarget::ALL.to_vec()
+        );
+        watermark.set_shared(false);
+        let dup_id = watermark
+            .duplicate_template(WatermarkConfig::DEFAULT_TEMPLATE_ID, WatermarkTarget::Video)
+            .unwrap();
+        assert_eq!(watermark.templates.get(&dup_id).unwrap().name, "SnapIt 2");
+        assert_eq!(
+            watermark.template_usages(WatermarkConfig::DEFAULT_TEMPLATE_ID),
+            vec![WatermarkTarget::Screenshot, WatermarkTarget::Animation]
+        );
+        assert_eq!(
+            watermark.template_usages(&dup_id),
+            vec![WatermarkTarget::Video]
+        );
+    }
+
+    #[test]
+    fn scroll_config_and_hotkey_defaults_sanitize_and_round_trip() {
+        let legacy = Config::from_toml("[hotkeys]\ngif = \"Alt+Shift+G\"\n").unwrap();
+        assert_eq!(legacy.hotkeys.scroll, Hotkeys::default().scroll);
+        assert_eq!(legacy.scroll, ScrollConfig::default());
+
+        let mut custom = Config::from_toml(
+            "[scroll]\nmax_height = 999999\nauto_scroll_speed = \"fast\"\nshow_preview = false\n",
+        )
+        .unwrap();
+        assert_eq!(custom.scroll.max_height, ScrollConfig::HEIGHT_RANGE.1);
+        assert_eq!(custom.scroll.auto_scroll_speed, ScrollSpeed::Fast);
+        assert!(!custom.scroll.show_preview);
+
+        custom.scroll.max_height = 10;
+        custom.sanitize();
+        assert_eq!(custom.scroll.max_height, ScrollConfig::HEIGHT_RANGE.0);
+
+        let reloaded = Config::from_toml(&custom.to_toml().unwrap()).unwrap();
+        assert_eq!(reloaded.scroll, custom.scroll);
     }
 }
