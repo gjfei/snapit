@@ -10,6 +10,11 @@
 //! `moov`, so a box inserted inside `moov` moves no sample data and the
 //! absolute chunk offsets in `stco` stay correct — which is why [`insert`]
 //! refuses a file laid out any other way.
+//!
+//! Media Foundation exposes no supported way to reserve a container box or
+//! atomically splice metadata in place. Publication therefore uses a sibling
+//! copy followed by `ReplaceFileW`. `CopyFileExW` performs the large immutable
+//! prefix copy in the OS; only the small metadata tail passes through Rust.
 
 use std::{
     fs::{File, OpenOptions},
@@ -19,6 +24,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 
 /// The colour signalling of a `colr` box of type `nclx` (ISO/IEC 23001-8):
 /// three code tables plus the sample range.
@@ -63,17 +70,15 @@ struct Found {
 
 impl Found {
     fn fourcc(&self, bytes: &[u8]) -> Option<[u8; 4]> {
-        Some(
-            bytes
-                .get(self.start + 4..self.start + 8)?
-                .try_into()
-                .unwrap(),
-        )
+        let start = self.start.checked_add(4)?;
+        let end = self.start.checked_add(8)?;
+        bytes.get(start..end)?.try_into().ok()
     }
 }
 
 /// The video sample entry plus every box enclosing it, in the order a size
 /// rewrite needs them.
+#[derive(Debug)]
 struct Entry {
     payload: usize,
     end: usize,
@@ -94,16 +99,20 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
     // The top-level walk reads one header at a time; `mdat` can be gigabytes.
     let mut at = 0usize;
     let (mut mdat, mut moov) = (None, None);
-    while at + 8 <= length {
+    while at < length {
+        let remaining = length - at;
         file.seek(SeekFrom::Start(at as u64))?;
         let mut header = [0u8; 16];
-        if file.read(&mut header)? < 8 {
-            break;
-        }
-        let size = resolve(&header, 0, length - at).ok_or_else(|| anyhow!("box at {at}"))?;
-        if size.end == 0 {
-            bail!("a zero-length box at {at}");
-        }
+        file.read_exact(&mut header[..8])?;
+        let raw = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let header_len = if raw == 1 {
+            file.read_exact(&mut header[8..16])?;
+            16
+        } else {
+            8
+        };
+        let size = resolve_stream_header(&header[..header_len], remaining)
+            .ok_or_else(|| anyhow!("malformed box header at {at}"))?;
         match header[4..8] {
             [b'm', b'd', b'a', b't'] => mdat = Some(at),
             [b'm', b'o', b'o', b'v'] => moov = Some((at, size.header, size.end)),
@@ -111,7 +120,9 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
         }
         // `end` is relative to the header just read, since the walk resolves
         // each box in a buffer of its own.
-        at += size.end;
+        at = at
+            .checked_add(size.end)
+            .ok_or_else(|| anyhow!("box end overflow at {at}"))?;
     }
     let (moov_at, moov_header, moov_end) = moov.ok_or_else(|| anyhow!("no moov box"))?;
     // Chunk offsets are absolute, so inserting ahead of the sample data would
@@ -123,9 +134,12 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
     // Everything from `moov` on is metadata, small enough to patch in memory,
     // and with the moov at offset 0 of it the walk needs no file offsets. The
     // trailing boxes a writer may add after it shift right with the patch.
-    let mut tail = Vec::with_capacity(length - moov_at);
+    let tail_len = length
+        .checked_sub(moov_at)
+        .ok_or_else(|| anyhow!("moov offset exceeds file size"))?;
+    let mut tail = vec![0u8; tail_len];
     file.seek(SeekFrom::Start(moov_at as u64))?;
-    file.read_to_end(&mut tail)?;
+    file.read_exact(&mut tail)?;
 
     let entry = video_sample_entry(&tail, moov_header, moov_end)?;
     let base = entry.payload;
@@ -139,8 +153,12 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
         return Ok(());
     }
 
+    let splice_end = insert_at
+        .checked_add(replaced)
+        .filter(|end| *end <= tail.len())
+        .ok_or_else(|| anyhow!("colour insertion range is outside the sample entry"))?;
     let before = tail.len();
-    tail.splice(insert_at..insert_at + replaced, added);
+    tail.splice(insert_at..splice_end, added);
     let delta = tail.len() as i64 - before as i64;
     for start in entry.ancestors {
         patch_ancestor_size(&mut tail, start, delta)?;
@@ -150,28 +168,36 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let (temporary_path, mut temporary) = loop {
+    let temporary_path = loop {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let candidate = parent.unwrap_or(Path::new(".")).join(format!(
             ".{name}.{}.{}.colr.tmp",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => break (candidate, file),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err).with_context(|| "failed to create the colour-tag patch"),
+        // FAIL_IF_EXISTS reserves the destination atomically inside the copy;
+        // probing with create_new and deleting first would introduce a race.
+        match copy_file(path, &candidate) {
+            Ok(()) => break candidate,
+            Err(err) if already_exists(&err) => {
+                continue;
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&candidate);
+                return Err(err).with_context(|| "failed to copy the recording for colour tagging");
+            }
         }
     };
     let result = (|| {
-        file.seek(SeekFrom::Start(0))?;
-        let mut prefix = (&mut file).take(moov_at as u64);
-        std::io::copy(&mut prefix, &mut temporary)?;
+        let mut temporary = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary_path)
+            .context("failed to reopen the colour-tag patch")?;
+        temporary.seek(SeekFrom::Start(moov_at as u64))?;
         temporary.write_all(&tail)?;
+        let patched_length = temporary.stream_position()?;
+        temporary.set_len(patched_length)?;
         temporary.sync_all()?;
         drop(temporary);
         drop(file);
@@ -184,9 +210,12 @@ pub(crate) fn insert(path: &Path, colour: &Nclx) -> Result<()> {
 }
 
 fn patch_ancestor_size(bytes: &mut [u8], start: usize, delta: i64) -> Result<()> {
+    let size_end = start
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("box size offset overflow at {start}"))?;
     let raw = u32::from_be_bytes(
         bytes
-            .get(start..start + 4)
+            .get(start..size_end)
             .ok_or_else(|| anyhow!("no box header at {start}"))?
             .try_into()
             .map_err(|_| anyhow!("no box header at {start}"))?,
@@ -197,28 +226,86 @@ fn patch_ancestor_size(bytes: &mut [u8], start: usize, delta: i64) -> Result<()>
         return Ok(());
     }
     if raw == 1 {
-        let at = start + 8;
+        let at = start
+            .checked_add(8)
+            .ok_or_else(|| anyhow!("large box size offset overflow at {start}"))?;
+        let end = at
+            .checked_add(8)
+            .ok_or_else(|| anyhow!("large box size range overflow at {start}"))?;
         let large = u64::from_be_bytes(
             bytes
-                .get(at..at + 8)
+                .get(at..end)
                 .ok_or_else(|| anyhow!("no large box size at {start}"))?
                 .try_into()
                 .map_err(|_| anyhow!("no large box size at {start}"))?,
         );
         let patched = large
             .checked_add_signed(delta)
+            .filter(|size| *size >= 16)
             .ok_or_else(|| anyhow!("the metadata no longer fits a 64-bit box size"))?;
-        bytes[at..at + 8].copy_from_slice(&patched.to_be_bytes());
+        bytes
+            .get_mut(at..end)
+            .ok_or_else(|| anyhow!("no large box size at {start}"))?
+            .copy_from_slice(&patched.to_be_bytes());
     } else {
         let patched = i64::from(raw)
             .checked_add(delta)
             .and_then(|size| u32::try_from(size).ok())
+            .filter(|size| *size >= 8)
             .ok_or_else(|| anyhow!("the metadata no longer fits a 32-bit box size"))?;
-        bytes[start..start + 4].copy_from_slice(&patched.to_be_bytes());
+        bytes
+            .get_mut(start..size_end)
+            .ok_or_else(|| anyhow!("no box header at {start}"))?
+            .copy_from_slice(&patched.to_be_bytes());
     }
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn already_exists(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists
+        || error.raw_os_error() == Some(ERROR_ALREADY_EXISTS.0 as i32)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn already_exists(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+#[cfg(target_os = "windows")]
+fn copy_file(source: &Path, temporary: &Path) -> std::io::Result<()> {
+    use windows::{
+        Win32::Storage::FileSystem::{COPY_FILE_FAIL_IF_EXISTS, CopyFileExW},
+        core::HSTRING,
+    };
+    unsafe {
+        CopyFileExW(
+            &HSTRING::from(source.as_os_str()),
+            &HSTRING::from(temporary.as_os_str()),
+            None,
+            None,
+            None,
+            COPY_FILE_FAIL_IF_EXISTS,
+        )?;
+    }
+    Ok(())
+}
+
+// The parser and splice tests run on every host. Production only calls these
+// portable counterparts from the test-only module inclusion on non-Windows.
+#[cfg(not(target_os = "windows"))]
+fn copy_file(source: &Path, temporary: &Path) -> std::io::Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn replace_file(path: &Path, temporary: &Path) -> Result<()> {
     use windows::{
         Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW},
@@ -237,21 +324,39 @@ fn replace_file(path: &Path, temporary: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn replace_file(path: &Path, temporary: &Path) -> Result<()> {
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 /// The `colr` box's own values, read back so a second pass changes nothing.
 fn tags(bytes: &[u8], at: usize, colour: &Nclx) -> bool {
-    let Some(payload) = bytes.get(at + 8..at + 19) else {
+    let Some(start) = at.checked_add(8) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(11) else {
+        return false;
+    };
+    let Some(payload) = bytes.get(start..end) else {
         return false;
     };
     payload[..4] == *b"nclx"
-        && u16::from_be_bytes(payload[4..6].try_into().unwrap()) == colour.primaries
-        && u16::from_be_bytes(payload[6..8].try_into().unwrap()) == colour.transfer
-        && u16::from_be_bytes(payload[8..10].try_into().unwrap()) == colour.matrix
+        && u16::from_be_bytes([payload[4], payload[5]]) == colour.primaries
+        && u16::from_be_bytes([payload[6], payload[7]]) == colour.transfer
+        && u16::from_be_bytes([payload[8], payload[9]]) == colour.matrix
         // The range is the top bit; the seven below it are reserved as zero.
         && payload[10] == (u8::from(colour.full_range) << 7)
 }
 
 /// Walk `moov` down to the codec's sample entry the way a demuxer finds it.
 fn video_sample_entry(bytes: &[u8], moov_header: usize, moov_end: usize) -> Result<Entry> {
+    if !matches!(moov_header, 8 | 16) || moov_header >= moov_end || moov_end > bytes.len() {
+        bail!(
+            "invalid moov bounds: header={moov_header}, end={moov_end}, len={}",
+            bytes.len()
+        );
+    }
     let mut ancestors = vec![0];
     let mut parent = Found {
         start: 0,
@@ -269,12 +374,37 @@ fn video_sample_entry(bytes: &[u8], moov_header: usize, moov_end: usize) -> Resu
         child(bytes, parent.payload, parent.end, b"stsd").ok_or_else(|| anyhow!("no stsd box"))?;
     ancestors.push(stsd.start);
     // A `SampleTableBox` is a full box: version and flags, then an entry count.
-    stsd.payload += 8;
+    let entries_at = stsd
+        .payload
+        .checked_add(8)
+        .filter(|end| *end <= stsd.end)
+        .ok_or_else(|| anyhow!("stsd is too short for its full-box header and entry count"))?;
+    let count_at = stsd
+        .payload
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("stsd entry count offset overflow"))?;
+    let count = u32::from_be_bytes(
+        bytes
+            .get(count_at..entries_at)
+            .ok_or_else(|| anyhow!("stsd has no entry count"))?
+            .try_into()
+            .map_err(|_| anyhow!("stsd has no entry count"))?,
+    );
+    if count == 0 {
+        bail!("stsd contains no video sample entry");
+    }
+    stsd.payload = entries_at;
     for fourcc in [b"hvc1", b"hev1", b"avc1", b"avc3"] {
         if let Some(found) = child(bytes, stsd.payload, stsd.end, fourcc) {
             ancestors.push(found.start);
+            let payload = found
+                .start
+                .checked_add(found.header)
+                .and_then(|start| start.checked_add(VISUAL_ENTRY_BASE))
+                .filter(|payload| *payload <= found.end)
+                .ok_or_else(|| anyhow!("video sample entry is shorter than its 78-byte base"))?;
             return Ok(Entry {
-                payload: found.start + found.header + VISUAL_ENTRY_BASE,
+                payload,
                 end: found.end,
                 ancestors,
             });
@@ -283,35 +413,96 @@ fn video_sample_entry(bytes: &[u8], moov_header: usize, moov_end: usize) -> Resu
     bail!("no video sample entry to tag")
 }
 
-/// The first box of this type in `[start, end)`.
+/// The first box of this type in `[start, end)`. A malformed preceding box is
+/// rejected rather than clamped or skipped, so a broken size cannot make the
+/// walk accept bytes outside their parent.
 fn child(bytes: &[u8], start: usize, end: usize, fourcc: &[u8; 4]) -> Option<Found> {
+    if start > end || start > bytes.len() || end > bytes.len() {
+        return None;
+    }
     let mut at = start;
-    loop {
+    while at < end {
         let found = resolve(bytes, at, end)?;
         if found.fourcc(bytes) == Some(*fourcc) {
             return Some(found);
         }
-        if found.end <= at {
-            return None;
-        }
         at = found.end;
     }
+    None
 }
 
-/// A box header at `at`, clamped so a child cannot claim more than its parent.
+/// Resolve a top-level header read from the stream. Unlike [`resolve`], the
+/// box payload need not be in `header`; its declared extent is checked against
+/// `remaining`, which is the file length from this box's start.
+fn resolve_stream_header(header: &[u8], remaining: usize) -> Option<Found> {
+    if header.len() < 8 {
+        return None;
+    }
+    let raw = u32::from_be_bytes(header[..4].try_into().ok()?);
+    let header_len = if raw == 1 { 16 } else { 8 };
+    if header.len() != header_len || remaining < header_len {
+        return None;
+    }
+    let size = if raw == 1 {
+        usize::try_from(u64::from_be_bytes(header[8..16].try_into().ok()?)).ok()?
+    } else if raw == 0 {
+        // A zero-size box extends to EOF, including an empty final box.
+        return Some(Found {
+            start: 0,
+            payload: header_len,
+            end: remaining,
+            header: header_len,
+        });
+    } else {
+        raw as usize
+    };
+    if size < header_len {
+        return None;
+    }
+    let end = 0usize.checked_add(size)?;
+    if end > remaining {
+        return None;
+    }
+    Some(Found {
+        start: 0,
+        payload: header_len,
+        end,
+        header: header_len,
+    })
+}
+
+/// Parse one box header without clamping it to its parent. Every box must have
+/// a complete header and stay inside its parent; empty boxes are legal, and a
+/// zero-sized child extends to the parent's end.
 fn resolve(bytes: &[u8], at: usize, end: usize) -> Option<Found> {
-    let raw = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().unwrap()) as usize;
+    if at > end || end > bytes.len() {
+        return None;
+    }
+    let size_end = at.checked_add(4)?;
+    let raw = u32::from_be_bytes(bytes.get(at..size_end)?.try_into().ok()?) as usize;
     let (size, header) = if raw == 1 {
-        let large = bytes.get(at + 8..at + 16)?.try_into().unwrap();
-        (usize::try_from(u64::from_be_bytes(large)).ok()?, 16)
+        let large_at = at.checked_add(8)?;
+        let large_end = at.checked_add(16)?;
+        if large_end > end {
+            return None;
+        }
+        let large = u64::from_be_bytes(bytes.get(large_at..large_end)?.try_into().ok()?);
+        (usize::try_from(large).ok()?, 16)
     } else {
         (raw, 8)
     };
-    let end = if raw == 0 { end } else { (at + size).min(end) };
+    if raw != 0 && size < header {
+        return None;
+    }
+    let payload = at.checked_add(header)?;
+    let box_end = if raw == 0 { end } else { at.checked_add(size)? };
+    if box_end > end || box_end < payload {
+        return None;
+    }
     Some(Found {
         start: at,
-        payload: at + header,
-        end,
+        payload,
+        end: box_end,
         header,
     })
 }
@@ -341,7 +532,7 @@ mod tests {
         let mdia = box_of(b"mdia", &minf);
         let trak = box_of(b"trak", &mdia);
         let mut moov = box_of(b"moov", &trak);
-        moov.extend_from_slice(&box_of(b"free", b""));
+        moov.extend_from_slice(&box_of(b"free", b"x"));
         let mut file = box_of(b"ftyp", b"isom");
         file.extend_from_slice(&mdat(200));
         file.extend_from_slice(&moov);
@@ -364,8 +555,7 @@ mod tests {
         bytes
     }
 
-    /// Patch a synthetic file and read the result back.
-    fn roundtrip(colr: Option<Vec<u8>>, colour: &Nclx) -> (Vec<u8>, Vec<u8>) {
+    fn patch_file(before: Vec<u8>, colour: &Nclx) -> Vec<u8> {
         // Tests run in parallel and share a process, so every call needs its
         // own file or one test reads another's half-written bytes.
         static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -376,11 +566,17 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("case.mp4");
-        let before = sample_file(colr.as_deref());
         std::fs::write(&path, &before).unwrap();
         insert(&path, colour).unwrap();
         let after = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+        after
+    }
+
+    /// Patch a synthetic file and read the result back.
+    fn roundtrip(colr: Option<Vec<u8>>, colour: &Nclx) -> (Vec<u8>, Vec<u8>) {
+        let before = sample_file(colr.as_deref());
+        let after = patch_file(before.clone(), colour);
         (before, after)
     }
 
@@ -399,6 +595,84 @@ mod tests {
 
     fn position(bytes: &[u8], fourcc: &[u8; 4]) -> usize {
         bytes.windows(4).position(|w| w == fourcc).unwrap()
+    }
+
+    fn moov_with_stsd(stsd_payload: Vec<u8>) -> Vec<u8> {
+        let stsd = box_of(b"stsd", &stsd_payload);
+        let stbl = box_of(b"stbl", &stsd);
+        let minf = box_of(b"minf", &stbl);
+        let mdia = box_of(b"mdia", &minf);
+        let trak = box_of(b"trak", &mdia);
+        box_of(b"moov", &trak)
+    }
+
+    #[test]
+    fn malformed_box_headers_are_rejected_without_clamping() {
+        let short = [0, 0, 0, 4, b'f', b'r', b'e', b'e'];
+        assert!(resolve(&short, 0, short.len()).is_none());
+        let empty = box_of(b"free", b"");
+        assert_eq!(resolve(&empty, 0, empty.len()).unwrap().end, 8);
+        assert_eq!(resolve_stream_header(&empty, empty.len()).unwrap().end, 8);
+
+        let zero = [0, 0, 0, 0, b'f', b'r', b'e', b'e'];
+        assert_eq!(resolve(&zero, 0, zero.len()).unwrap().end, 8);
+        assert_eq!(resolve_stream_header(&zero, zero.len()).unwrap().end, 8);
+        assert!(resolve_stream_header(&zero, 0).is_none());
+
+        let mut overrun = box_of(b"free", b"x");
+        overrun[..4].copy_from_slice(&100u32.to_be_bytes());
+        assert!(resolve(&overrun, 0, overrun.len()).is_none());
+
+        let truncated_large = [0, 0, 0, 1, b'f', b'r', b'e', b'e'];
+        assert!(resolve(&truncated_large, 0, truncated_large.len()).is_none());
+        assert!(resolve(&[0; 8], usize::MAX, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn stsd_requires_a_complete_full_box_header() {
+        let moov = moov_with_stsd(vec![0; 4]);
+        let error = video_sample_entry(&moov, 8, moov.len()).unwrap_err();
+        assert!(error.to_string().contains("full-box"));
+    }
+
+    #[test]
+    fn video_sample_entry_requires_its_visual_base_and_insertion_range() {
+        let mut payload = vec![0; 8];
+        payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&box_of(b"hvc1", &[0; 76]));
+        let moov = moov_with_stsd(payload);
+        let error = video_sample_entry(&moov, 8, moov.len()).unwrap_err();
+        assert!(error.to_string().contains("78-byte base"));
+    }
+
+    #[test]
+    fn ancestor_patch_rejects_truncated_headers_and_invalid_shrinks() {
+        assert!(patch_ancestor_size(&mut [0; 3], 0, 1).is_err());
+        let mut large = vec![0; 12];
+        large[..4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(patch_ancestor_size(&mut large, 0, 1).is_err());
+        let mut short = vec![0; 8];
+        short[..4].copy_from_slice(&8u32.to_be_bytes());
+        assert!(patch_ancestor_size(&mut short, 0, -1).is_err());
+        assert!(!tags(&[0; 8], usize::MAX, &Nclx::HDR10));
+    }
+
+    #[test]
+    fn truncated_top_level_file_is_left_untouched() {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "snapit-colr-truncated-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("case.mp4");
+        let mut file = sample_file(None);
+        file.pop();
+        std::fs::write(&path, &file).unwrap();
+        assert!(insert(&path, &Nclx::HDR10).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -443,7 +717,9 @@ mod tests {
         while at < end {
             assert!(at + 8 <= end, "truncated box header at {at}");
             let mut size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            if size == 1 {
+            if size == 0 {
+                size = end - at;
+            } else if size == 1 {
                 size = usize::try_from(u64::from_be_bytes(
                     bytes[at + 8..at + 16].try_into().unwrap(),
                 ))
@@ -516,6 +792,35 @@ mod tests {
         let mut to_parent_end = vec![0; 8];
         patch_ancestor_size(&mut to_parent_end, 0, 19).unwrap();
         assert_eq!(to_parent_end[..4], [0; 4]);
+    }
+
+    #[test]
+    fn zero_sized_ancestors_extend_after_the_patch() {
+        for fourcc in [b"moov", b"stsd"] {
+            let before = sample_file(None);
+            let at = position(&before, fourcc) - 4;
+            let mut source = before.clone();
+            source[at..at + 4].fill(0);
+            let after = patch_file(source, &Nclx::HDR10);
+            assert_eq!(after[at..at + 4], [0; 4]);
+            assert_eq!(nclx_in(&after), Some((9, 16, 9, 0)));
+            assert_fills(&after, 0, after.len());
+        }
+    }
+
+    #[test]
+    fn empty_and_zero_sized_top_level_tail_boxes_are_accepted() {
+        for tail in [
+            box_of(b"free", b""),
+            vec![0, 0, 0, 0, b'f', b'r', b'e', b'e'],
+        ] {
+            let before = sample_file(None);
+            let mut source = before.clone();
+            source.extend_from_slice(&tail);
+            let after = patch_file(source, &Nclx::HDR10);
+            assert_eq!(nclx_in(&after), Some((9, 16, 9, 0)));
+            assert_fills(&after, 0, after.len());
+        }
     }
 
     #[test]

@@ -31,7 +31,8 @@ use objc2_core_media::CMTime;
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
     CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetDataSize, CVPixelBufferGetHeightOfPlane,
+    CVPixelBufferGetPlaneCount, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
@@ -209,12 +210,15 @@ impl Mp4Sink {
         let buffer = pixel_buffer(frame)?;
         self.t_buffer += buffer_started.elapsed();
         let copy_started = Instant::now();
-        if unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) } != 0 {
-            bail!("failed to lock the pixel buffer");
-        }
-        let base = CVPixelBufferGetBaseAddress(&buffer) as *mut u8;
-        let stride = CVPixelBufferGetBytesPerRow(&buffer);
-        if !base.is_null() {
+        {
+            let _lock = lock_pixel_buffer(&buffer)?;
+            let base = CVPixelBufferGetBaseAddress(&buffer) as *mut u8;
+            if base.is_null() {
+                bail!("the BGRA pixel buffer has a null base address");
+            }
+            let stride = CVPixelBufferGetBytesPerRow(&buffer);
+            let data_size = CVPixelBufferGetDataSize(&buffer);
+            validate_bgra_rows(width as usize, height as usize, stride, data_size)?;
             // RGBA in, BGRA out: the encoder's native layout. Writing whole
             // pixels at once lets the compiler emit one 32-bit store instead of
             // four byte stores with a bounds check each.
@@ -233,7 +237,6 @@ impl Mp4Sink {
                 }
             }
         }
-        unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
         self.t_copy += copy_started.elapsed();
 
         // The hardware encoder drains on the capture thread, so waiting for
@@ -270,8 +273,8 @@ impl Mp4Sink {
     }
 }
 
-/// The writer lives entirely on the capture thread once it is moved there, so
-/// handing it over is safe even though AVFoundation's classes are not `Send`.
+/// AVFoundation access is serialized: capture-thread pushes stop before
+/// `finish` runs on the scoped finisher thread. No callback retains Rust state.
 unsafe impl Send for Mp4Sink {}
 
 impl FrameSink for Mp4Sink {
@@ -373,6 +376,9 @@ pub(crate) struct HdrMp4Sink {
     width: usize,
     height: usize,
     max_width: Option<u32>,
+    reference_white_nits: f32,
+    sdr_white_nits: f32,
+    mixed_sdr_logged: bool,
     /// The converter's output buffers. They still hold the frame that was
     /// encoded last, which is what the closing still sample needs — so, unlike
     /// the SDR sink, nothing has to be kept per frame.
@@ -389,6 +395,7 @@ pub(crate) struct HdrMp4Sink {
     presentation: PresentationTimes,
 }
 
+/// Same serialized AVFoundation ownership as `Mp4Sink`.
 unsafe impl Send for HdrMp4Sink {}
 
 impl HdrMp4Sink {
@@ -507,6 +514,9 @@ impl HdrMp4Sink {
             width: width_usize,
             height: height_usize,
             max_width: options.max_width,
+            reference_white_nits: probe.reference_white_nits(),
+            sdr_white_nits: probe.sdr_white_nits(),
+            mixed_sdr_logged: false,
             y: vec![0u8; y_len],
             uv: vec![0u8; uv_len],
             last_at: None,
@@ -527,24 +537,48 @@ impl HdrMp4Sink {
         let buffer = planar_pixel_buffer(self.width, self.height)?;
         self.t_buffer += buffer_started.elapsed();
         let copy_started = Instant::now();
-        if unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) } != 0 {
-            bail!("failed to lock the pixel buffer");
-        }
-        let row = self.width * 2;
-        unsafe {
-            for (plane, source) in [(0usize, &self.y[..]), (1, &self.uv[..])] {
-                let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane) as *mut u8;
-                if base.is_null() {
-                    CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0));
-                    bail!("the 10-bit pixel buffer has no plane {plane}");
+        {
+            let _lock = lock_pixel_buffer(&buffer)?;
+            let row = self
+                .width
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("10-bit row size overflow"))?;
+            let data_size = CVPixelBufferGetDataSize(&buffer);
+            unsafe {
+                if CVPixelBufferGetPlaneCount(&buffer) != 2 {
+                    bail!("the 10-bit pixel buffer does not have two planes");
                 }
-                let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane);
-                for (y, line) in source.chunks_exact(row).enumerate() {
-                    let dst = std::slice::from_raw_parts_mut(base.add(y * stride), row);
-                    dst.copy_from_slice(line);
+                let first_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as usize;
+                if first_base == 0 {
+                    bail!("the 10-bit pixel buffer has no luma plane");
+                }
+                for (plane, source) in [(0usize, &self.y[..]), (1, &self.uv[..])] {
+                    let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane) as *mut u8;
+                    if base.is_null() {
+                        bail!("the 10-bit pixel buffer has no plane {plane}");
+                    }
+                    let plane_height = CVPixelBufferGetHeightOfPlane(&buffer, plane);
+                    let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane);
+                    let offset = (base as usize)
+                        .checked_sub(first_base)
+                        .ok_or_else(|| anyhow!("10-bit plane {plane} precedes the allocation"))?;
+                    validate_plane_rows(offset, row, plane_height, stride, data_size)?;
+                    let expected = row
+                        .checked_mul(plane_height)
+                        .ok_or_else(|| anyhow!("10-bit plane {plane} size overflow"))?;
+                    if source.len() != expected {
+                        bail!(
+                            "10-bit plane {plane} has {} bytes, expected {expected}",
+                            source.len()
+                        );
+                    }
+                    for (y, line) in source.chunks_exact(row).enumerate() {
+                        let dst = std::slice::from_raw_parts_mut(base.add(y * stride), stride);
+                        dst.fill(0);
+                        dst[..row].copy_from_slice(line);
+                    }
                 }
             }
-            CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0));
         }
         self.t_copy += copy_started.elapsed();
 
@@ -581,13 +615,10 @@ impl HdrMp4Sink {
     }
 }
 
-impl FrameSink for HdrMp4Sink {
-    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
-        let FrameData::Hdr(hdr) = frame else {
-            bail!("the HEVC Main10 sink only accepts extended-range frames");
-        };
+impl HdrMp4Sink {
+    fn append_hdr(&mut self, hdr: &HdrImage, at: Duration) -> Result<()> {
         let scaled_started = Instant::now();
-        let scaled = hdr::prepare(&hdr, self.max_width);
+        let scaled = hdr::prepare(hdr, self.max_width);
         self.t_scale += scaled_started.elapsed();
         // The plane buffers are sized for the first frame; a mid-recording
         // resolution change must error like the SDR sink, not silently write a
@@ -604,7 +635,31 @@ impl FrameSink for HdrMp4Sink {
         let convert_started = Instant::now();
         hdr::convert_into(&scaled, &mut self.y, &mut self.uv);
         self.t_convert += convert_started.elapsed();
-        self.append_planes(at)?;
+        self.append_planes(at)
+    }
+}
+
+impl FrameSink for HdrMp4Sink {
+    fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
+        match frame {
+            FrameData::Hdr(hdr) => self.append_hdr(&hdr, at)?,
+            FrameData::Sdr(image) => {
+                if !self.mixed_sdr_logged {
+                    log::info!(
+                        "HDR MP4 session received an SDR frame; lifting sRGB at {} nits (reference {} nits)",
+                        self.sdr_white_nits,
+                        self.reference_white_nits
+                    );
+                    self.mixed_sdr_logged = true;
+                }
+                // SCK can change its delivered pixel format when HDR mode is
+                // toggled. Keep the Main10 session and preserve SDR white
+                // instead of failing the whole recording mid-stream.
+                let lifted =
+                    hdr::promote_sdr(&image, self.reference_white_nits, self.sdr_white_nits)?;
+                self.append_hdr(&lifted, at)?;
+            }
+        }
         Ok(true)
     }
 
@@ -666,6 +721,68 @@ fn planar_pixel_buffer(width: usize, height: usize) -> Result<CFRetained<CVPixel
     }
     let raw = NonNull::new(raw).ok_or_else(|| anyhow!("CVPixelBufferCreate returned null"))?;
     Ok(unsafe { CFRetained::from_raw(raw) })
+}
+
+struct LockedPixelBuffer<'a> {
+    buffer: &'a CVPixelBuffer,
+}
+
+impl Drop for LockedPixelBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe { CVPixelBufferUnlockBaseAddress(self.buffer, CVPixelBufferLockFlags(0)) };
+    }
+}
+
+fn lock_pixel_buffer(buffer: &CVPixelBuffer) -> Result<LockedPixelBuffer<'_>> {
+    if unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags(0)) } != 0 {
+        bail!("failed to lock the pixel buffer");
+    }
+    Ok(LockedPixelBuffer { buffer })
+}
+
+fn validate_bgra_rows(width: usize, height: usize, stride: usize, data_size: usize) -> Result<()> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("BGRA row size overflow"))?;
+    if width == 0 || height == 0 || stride < row_bytes {
+        bail!("invalid BGRA layout: {width}x{height}, stride={stride}, data_size={data_size}");
+    }
+    let last_end = (height - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or_else(|| anyhow!("BGRA row range overflow"))?;
+    if last_end > data_size {
+        bail!(
+            "BGRA rows exceed the pixel buffer: last_end={last_end}, data_size={data_size}, \
+             width={width}, height={height}, stride={stride}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_plane_rows(
+    plane_offset: usize,
+    row_bytes: usize,
+    height: usize,
+    stride: usize,
+    data_size: usize,
+) -> Result<()> {
+    if row_bytes == 0 || height == 0 || stride < row_bytes {
+        bail!(
+            "invalid 10-bit plane layout: offset={plane_offset}, height={height}, \
+             stride={stride}, row_bytes={row_bytes}, data_size={data_size}"
+        );
+    }
+    let last_end = height
+        .checked_mul(stride)
+        .and_then(|end| plane_offset.checked_add(end))
+        .ok_or_else(|| anyhow!("10-bit plane row range overflow"))?;
+    if last_end > data_size {
+        bail!(
+            "10-bit plane rows exceed the pixel buffer: last_end={last_end}, data_size={data_size}"
+        );
+    }
+    Ok(())
 }
 
 fn pixel_buffer(frame: &RgbaImage) -> Result<CFRetained<CVPixelBuffer>> {
@@ -731,6 +848,48 @@ fn any<T: Message>(object: &T) -> &AnyObject {
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+
+    #[test]
+    fn bgra_pixel_buffer_rows_require_a_valid_stride_and_data_size() {
+        assert!(validate_bgra_rows(2, 2, 8, 16).is_ok());
+        assert!(validate_bgra_rows(2, 2, 7, 16).is_err());
+        assert!(validate_bgra_rows(2, 2, 8, 11).is_err());
+        assert!(validate_bgra_rows(0, 2, 8, 16).is_err());
+        assert!(validate_bgra_rows(usize::MAX, 2, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn planar_pixel_buffer_rows_require_valid_offsets_strides_and_lengths() {
+        assert!(validate_plane_rows(0, 8, 2, 8, 16).is_ok());
+        assert!(validate_plane_rows(16, 8, 1, 8, 24).is_ok());
+        assert!(validate_plane_rows(0, 8, 2, 7, 16).is_err());
+        assert!(validate_plane_rows(0, 8, 2, 8, 15).is_err());
+        assert!(validate_plane_rows(16, 8, 1, 8, 23).is_err());
+        assert!(validate_plane_rows(0, 8, 2, 16, 24).is_err());
+        assert!(validate_plane_rows(0, 8, 0, 8, 16).is_err());
+        assert!(validate_plane_rows(usize::MAX, 8, 2, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn created_planar_buffer_satisfies_the_checked_layout() {
+        let buffer = planar_pixel_buffer(320, 200).expect("10-bit pixel buffer");
+        let _lock = lock_pixel_buffer(&buffer).expect("lock pixel buffer");
+        let data_size = CVPixelBufferGetDataSize(&buffer);
+        let first = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as usize;
+        assert_ne!(first, 0);
+        for plane in 0..2 {
+            let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane) as usize;
+            let offset = base.checked_sub(first).expect("plane follows luma");
+            validate_plane_rows(
+                offset,
+                320 * 2,
+                CVPixelBufferGetHeightOfPlane(&buffer, plane),
+                CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane),
+                data_size,
+            )
+            .expect("CoreVideo's planar layout fits its data size");
+        }
+    }
 
     #[test]
     fn sub_tick_timestamps_still_advance_by_one_media_tick() {
@@ -849,8 +1008,18 @@ mod hdr_sink_tests {
         let mut sink = open(&path, &options, &first).expect("mp4 sink");
 
         for (index, colour) in colours.into_iter().cycle().take(10).enumerate() {
-            let frame = FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)))
-                .apply_watermark(Some(&watermark));
+            let frame = if index == 5 {
+                // SCK may deliver SDR after an HDR first frame. Exercise the
+                // real sink's promotion branch, not only the converter test.
+                FrameData::Sdr(Arc::new(RgbaImage::from_pixel(
+                    width,
+                    height,
+                    image::Rgba([255, 255, 255, 255]),
+                )))
+            } else {
+                FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)))
+            }
+            .apply_watermark(Some(&watermark));
             sink.push(frame, Duration::from_millis(index as u64 * 66))
                 .expect("push");
         }

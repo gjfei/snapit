@@ -207,7 +207,7 @@ impl PointerState {
         self.pointer_dirty |= !self.clicks.is_empty();
         #[cfg(target_os = "windows")]
         {
-            let cursor = self.cursor.get_or_insert_with(|| CursorState {
+            let cursor = self.cursor.get_or_insert(CursorState {
                 handle: sample.cursor_handle,
                 visible: sample.cursor_visible,
                 image: None,
@@ -240,6 +240,14 @@ impl PointerState {
     }
 
     pub(crate) fn apply(&mut self, frame: FrameData, at: Duration) -> FrameData {
+        // DXGI reports desktop changes, not pointer movement. Keep every clean
+        // incoming frame (an Arc clone, not a pixel copy) so a timeout can move
+        // or animate the cursor over the latest static desktop. This must happen
+        // before either early return below.
+        #[cfg(target_os = "windows")]
+        if self.captures_cursor {
+            self.base = Some(frame.clone());
+        }
         if self.monitor.is_none()
             || (!self.click_effects && (!self.captures_cursor || self.native_cursor))
         {
@@ -290,7 +298,10 @@ impl PointerState {
         }
 
         // Timeout redraws need the unmodified pixels only while a click is
-        // expanding. A plain cursor frame can consume its unique allocation.
+        // expanding. Windows already retained the clean incoming frame above so
+        // cursor-only timeouts have a base too. A plain cursor frame elsewhere
+        // can still consume its unique allocation.
+        #[cfg(not(target_os = "windows"))]
         if active_clicks > 0 {
             self.base = Some(frame.clone());
         } else {
@@ -428,11 +439,11 @@ impl PointerState {
         if !cursor.visible || cursor.handle == 0 {
             return false;
         }
-        if cursor.image.is_none() {
-            if let Some((image, hotspot)) = windows_cursor_image(cursor.handle) {
-                cursor.image = Some(image);
-                cursor.hotspot = hotspot;
-            }
+        if cursor.image.is_none()
+            && let Some((image, hotspot)) = windows_cursor_image(cursor.handle)
+        {
+            cursor.image = Some(image);
+            cursor.hotspot = hotspot;
         }
         let Some(cursor_image) = cursor.image.as_ref() else {
             return false;
@@ -465,11 +476,11 @@ impl PointerState {
         if !cursor.visible || cursor.handle == 0 {
             return false;
         }
-        if cursor.image.is_none() {
-            if let Some((image, hotspot)) = windows_cursor_image(cursor.handle) {
-                cursor.image = Some(image);
-                cursor.hotspot = hotspot;
-            }
+        if cursor.image.is_none()
+            && let Some((image, hotspot)) = windows_cursor_image(cursor.handle)
+        {
+            cursor.image = Some(image);
+            cursor.hotspot = hotspot;
         }
         let Some(cursor_image) = cursor.image.as_ref() else {
             return false;
@@ -1545,6 +1556,16 @@ fn blend_cursor_hdr(
     drawn
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn checked_dib_size(width: i32, height: i32) -> Option<usize> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    let bytes = width.checked_mul(4)?.checked_mul(height)?;
+    // GDI's section size is a DWORD; do not truncate a large cursor before
+    // passing it to CreateDIBSection or constructing the pixel slice.
+    u32::try_from(bytes).ok().map(|bytes| bytes as usize)
+}
+
 #[cfg(target_os = "windows")]
 fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
     use std::mem::{size_of, zeroed};
@@ -1552,32 +1573,72 @@ fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
         Foundation::HANDLE,
         Graphics::Gdi::{
             BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
-            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetObjectW, HDC, SelectObject,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetObjectW, HBITMAP, HDC, HGDIOBJ,
+            SelectObject,
         },
         UI::WindowsAndMessaging::{DI_NORMAL, DrawIconEx, GetIconInfo, HICON, ICONINFO},
     };
+
+    // Every GDI allocation in this function has one owner. In particular, an
+    // invalid DIB pointer or an early SelectObject failure cannot leak the icon
+    // bitmaps or DC through a hand-written cleanup branch.
+    struct CursorGdiResources {
+        color: Option<HBITMAP>,
+        mask: Option<HBITMAP>,
+        dc: Option<HDC>,
+        bitmap: Option<HBITMAP>,
+        previous: Option<HGDIOBJ>,
+    }
+
+    impl Drop for CursorGdiResources {
+        fn drop(&mut self) {
+            unsafe {
+                if let (Some(dc), Some(previous)) = (self.dc, self.previous) {
+                    SelectObject(dc, previous);
+                }
+                if let Some(bitmap) = self.bitmap {
+                    let _ = DeleteObject(bitmap.into());
+                }
+                if let Some(dc) = self.dc {
+                    let _ = DeleteDC(dc);
+                }
+                if let Some(color) = self.color {
+                    let _ = DeleteObject(color.into());
+                }
+                if let Some(mask) = self.mask {
+                    let _ = DeleteObject(mask.into());
+                }
+            }
+        }
+    }
+
     unsafe {
         let mut icon = ICONINFO::default();
         GetIconInfo(HICON(handle as *mut _), &mut icon).ok()?;
+        let mut resources = CursorGdiResources {
+            color: Some(icon.hbmColor),
+            mask: Some(icon.hbmMask),
+            dc: None,
+            bitmap: None,
+            previous: None,
+        };
         let mut mask = BITMAP::default();
         if GetObjectW(
-            icon.hbmMask.into(),
+            resources.mask?.into(),
             size_of::<BITMAP>() as i32,
             Some((&mut mask as *mut BITMAP).cast()),
         ) == 0
         {
-            let _ = DeleteObject(icon.hbmColor.into());
-            let _ = DeleteObject(icon.hbmMask.into());
             return None;
         }
         let width = mask.bmWidth.max(1);
         let height = mask.bmHeight.max(1);
+        let byte_len = checked_dib_size(width, height)?;
         let dc = CreateCompatibleDC(None);
         if dc.is_invalid() {
-            let _ = DeleteObject(icon.hbmColor.into());
-            let _ = DeleteObject(icon.hbmMask.into());
             return None;
         }
+        resources.dc = Some(dc);
         let mut bits = std::ptr::null_mut();
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -1586,7 +1647,7 @@ fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
                 biHeight: -height,
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: BI_RGB.0 as u32,
+                biCompression: BI_RGB.0,
                 ..zeroed()
             },
             bmiColors: [zeroed()],
@@ -1600,16 +1661,19 @@ fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
             0,
         ) {
             Ok(bitmap) => bitmap,
-            Err(_) => {
-                let _ = DeleteObject(icon.hbmColor.into());
-                let _ = DeleteObject(icon.hbmMask.into());
-                let _ = DeleteDC(dc);
-                return None;
-            }
+            Err(_) => return None,
         };
+        resources.bitmap = Some(bitmap);
+        if bits.is_null() {
+            log::warn!("CreateDIBSection returned a cursor bitmap with null bits");
+            return None;
+        }
         let previous = SelectObject(dc, bitmap.into());
-        let bgra =
-            std::slice::from_raw_parts_mut(bits.cast::<u8>(), width as usize * height as usize * 4);
+        if previous.is_invalid() {
+            return None;
+        }
+        resources.previous = Some(previous);
+        let bgra = std::slice::from_raw_parts_mut(bits.cast::<u8>(), byte_len);
         for pixel in bgra.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[0, 0, 0, 0]);
         }
@@ -1632,11 +1696,6 @@ fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
                 image::Rgba([0, 0, 0, 0])
             }
         });
-        SelectObject(dc, previous);
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(dc);
-        let _ = DeleteObject(icon.hbmColor.into());
-        let _ = DeleteObject(icon.hbmMask.into());
         result
             .is_ok()
             .then_some((image, (f64::from(icon.xHotspot), f64::from(icon.yHotspot))))
@@ -1646,6 +1705,14 @@ fn windows_cursor_image(handle: isize) -> Option<(RgbaImage, (f64, f64))> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_dib_size_is_checked() {
+        assert_eq!(checked_dib_size(32, 32), Some(32 * 32 * 4));
+        assert_eq!(checked_dib_size(0, 32), Some(0));
+        assert!(checked_dib_size(-1, 32).is_none());
+        assert!(checked_dib_size(i32::MAX, i32::MAX).is_none());
+    }
 
     #[test]
     fn hdr_blending_keeps_the_frame_in_linear_scrgb() {
@@ -1777,6 +1844,103 @@ mod tests {
         assert!(needs_pointer_redraw(0, 1, false, false));
         assert!(needs_pointer_redraw(1, 0, false, false));
         assert!(needs_pointer_redraw(0, 0, true, false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_timeout_redraws_use_the_latest_clean_frame() {
+        let Some(monitor) = snapit_capture::monitors()
+            .ok()
+            .and_then(|monitors| monitors.into_iter().next())
+        else {
+            return;
+        };
+        let region = Region::new(0.0, 0.0, 8.0, 8.0);
+        let mut state = PointerState::new(monitor.id, region, true, true, ClickEffect::Dot);
+        // No pointer redraw is needed yet: the incoming allocation is returned
+        // directly, but its clean pixels are retained for later timeouts.
+        state.cursor_dirty = false;
+        let clean = Arc::new(RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255])));
+        let unchanged = state.apply(FrameData::Sdr(clean.clone()), Duration::ZERO);
+        assert!(matches!(unchanged, FrameData::Sdr(ref image) if Arc::ptr_eq(image, &clean)));
+        assert!(
+            matches!(state.base, Some(FrameData::Sdr(ref image)) if Arc::ptr_eq(image, &clean))
+        );
+
+        // Even the monitor-unavailable early return refreshes the retained base.
+        let latest = Arc::new(RgbaImage::from_pixel(8, 8, image::Rgba([30, 20, 10, 255])));
+        state.monitor = None;
+        state.apply(FrameData::Sdr(latest.clone()), Duration::from_millis(1));
+        assert!(
+            matches!(state.base, Some(FrameData::Sdr(ref image)) if Arc::ptr_eq(image, &latest))
+        );
+        state.monitor = Some(monitor.clone());
+
+        let mut cursor = RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        cursor.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        state.cursor = Some(CursorState {
+            handle: 1,
+            visible: true,
+            image: Some(cursor),
+            hotspot: (0.0, 0.0),
+        });
+        state.position = Some((monitor.x + 1, monitor.y + 1));
+        state.cursor_dirty = true;
+        state.pointer_dirty = true;
+        let drawn = state
+            .apply_timeout(Duration::from_millis(10))
+            .expect("cursor movement redraw");
+        let FrameData::Sdr(drawn) = drawn else {
+            panic!("cursor redraw changed the frame variant");
+        };
+        assert_eq!(drawn.get_pixel(1, 1).0, [255, 0, 0, 255]);
+        assert_eq!(drawn.get_pixel(5, 5).0, [30, 20, 10, 255]);
+
+        // Moving again must erase the old cursor by starting from `latest`, not
+        // from the previously composited timeout frame.
+        state.position = Some((monitor.x + 4, monitor.y + 1));
+        state.cursor_dirty = true;
+        state.pointer_dirty = true;
+        let moved = state
+            .apply_timeout(Duration::from_millis(20))
+            .expect("second cursor redraw");
+        let FrameData::Sdr(moved) = moved else {
+            panic!("cursor redraw changed the frame variant");
+        };
+        assert_eq!(moved.get_pixel(1, 1).0, [30, 20, 10, 255]);
+        assert_eq!(moved.get_pixel(4, 1).0, [255, 0, 0, 255]);
+
+        // Clicks use the same clean base, and the final redraw removes the
+        // expired effect without removing the cursor.
+        state.clicks.push(Click {
+            position: (monitor.x + 5, monitor.y + 5),
+            started: Duration::from_millis(20),
+        });
+        state.pointer_dirty = true;
+        let clicked = state
+            .apply_timeout(Duration::from_millis(30))
+            .expect("click redraw");
+        let FrameData::Sdr(clicked) = clicked else {
+            panic!("click redraw changed the frame variant");
+        };
+        assert_eq!(
+            clicked.get_pixel(5, 5).0,
+            [CLICK_COLOR[0], CLICK_COLOR[1], CLICK_COLOR[2], 255]
+        );
+        assert_eq!(clicked.get_pixel(4, 1).0, [255, 0, 0, 255]);
+
+        state.pointer_dirty = true;
+        let faded = state
+            .apply_timeout(Duration::from_millis(500))
+            .expect("expired click redraw");
+        let FrameData::Sdr(faded) = faded else {
+            panic!("click redraw changed the frame variant");
+        };
+        assert_eq!(faded.get_pixel(5, 5).0, [30, 20, 10, 255]);
+        assert_eq!(faded.get_pixel(4, 1).0, [255, 0, 0, 255]);
+        assert!(
+            matches!(state.base, Some(FrameData::Sdr(ref image)) if Arc::ptr_eq(image, &latest))
+        );
     }
 
     #[test]

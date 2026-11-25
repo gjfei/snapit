@@ -5,8 +5,8 @@
 //!
 //! The sink writer is created in a multithreaded apartment and used from the
 //! capture thread. Objects created in the MTA are agile, so no marshalling is
-//! needed; both threads just have to have joined the MTA, which `ensure_com`
-//! does.
+//! needed; both threads just have to have joined the MTA, which `ComSession`
+//! does for the duration of each operation.
 
 use std::{
     path::{Path, PathBuf},
@@ -17,21 +17,24 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use snapit_capture::{HdrImage, RgbaImage};
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFSinkWriter, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
-    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_VERSION,
-    MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFCreateSinkWriterFromURL, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_LITE,
-    MFShutdown, MFStartup, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_P010,
-    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
-    MFVideoPrimaries_BT2020, MFVideoTransFunc_709, MFVideoTransFunc_2084,
+    IMFAttributes, IMFMediaBuffer, IMFSinkWriter, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Video,
+    MFNominalRange_16_235, MFSTARTUP_LITE, MFShutdown, MFStartup, MFVideoFormat_H264,
+    MFVideoFormat_HEVC, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
+    MFVideoPrimaries_BT709, MFVideoPrimaries_BT2020, MFVideoTransFunc_709, MFVideoTransFunc_2084,
     MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10, eAVEncH265VProfile_Main_420_10,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::HSTRING;
 
-use super::{Nclx, bitrate, hdr, mp4_colour, prepare_video};
+use super::{
+    Nclx, bitrate, checked_negative_rgba_stride, checked_p010_buffer_size, checked_padded_stride,
+    checked_rgba_buffer_size, hdr, mp4_colour, prepare_video, validate_locked_buffer,
+};
 use crate::{FrameData, FrameSink, RecordOptions};
 
 /// Media Foundation counts time in 100 ns units.
@@ -41,6 +44,70 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 /// whose 16-bit-per-sample rows are aligned, so the padded layout is the one
 /// every HEVC MFT accepts.
 const PITCH_ALIGNMENT: usize = 64;
+
+/// Owns one successful `MFStartup`. Sinks declare this after their writer so
+/// field destruction releases the writer before `MFShutdown`, including every
+/// construction, push and finalization failure path.
+struct MfSession;
+
+impl MfSession {
+    fn new() -> Result<Self> {
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.context("Media Foundation unavailable")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MfSession {
+    fn drop(&mut self) {
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
+/// Balances every successful `CoInitializeEx`, including `S_FALSE` (already
+/// initialized), for the scope in which Media Foundation objects are used.
+struct ComSession;
+
+impl ComSession {
+    fn new() -> Result<Self> {
+        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if result.is_err() {
+            return Err(windows::core::Error::from(result).into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComSession {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Constructed immediately after a successful lock: even a null pointer or a
+/// short buffer returns through this guard and unlocks the media buffer.
+struct LockedMfBuffer<'a> {
+    buffer: &'a IMFMediaBuffer,
+}
+
+impl Drop for LockedMfBuffer<'_> {
+    fn drop(&mut self) {
+        let _ = unsafe { self.buffer.Unlock() };
+    }
+}
+
+impl<'a> LockedMfBuffer<'a> {
+    fn lock(buffer: &'a IMFMediaBuffer, required_bytes: u32) -> Result<(Self, *mut u8)> {
+        let mut raw = std::ptr::null_mut();
+        let mut max_bytes = 0;
+        unsafe { buffer.Lock(&mut raw, Some(&mut max_bytes), None) }?;
+        let locked = Self { buffer };
+        validate_locked_buffer(max_bytes, required_bytes)?;
+        if raw.is_null() {
+            bail!("Media Foundation returned an empty frame buffer");
+        }
+        Ok((locked, raw))
+    }
+}
 
 /// The MP4 backend for these frames: HEVC Main10 for extended range, H.264 for
 /// 8-bit. A machine without a usable 10-bit HEVC encoder — no extension
@@ -67,6 +134,8 @@ pub(crate) fn open(
 
 pub(crate) struct Mp4Sink {
     writer: IMFSinkWriter,
+    /// Must follow `writer`: dropping the sink releases the writer first.
+    _mf: MfSession,
     stream: u32,
     width: u32,
     height: u32,
@@ -81,17 +150,21 @@ pub(crate) struct Mp4Sink {
     t_write: Duration,
 }
 
-/// The writer lives on the capture thread after construction and Media
-/// Foundation requires nothing else of it, so moving it there is safe.
+/// Media Foundation objects are created in the MTA and are agile. Access is
+/// serialized: pushes happen on the capture thread and `finish` runs on the
+/// scoped finisher thread only after capture has stopped. Both scopes join the
+/// MTA with `ComSession`, so moving the sink does not introduce concurrent use.
 unsafe impl Send for Mp4Sink {}
 
 impl Mp4Sink {
     pub(crate) fn new(path: &Path, options: &RecordOptions, probe: &RgbaImage) -> Result<Self> {
-        ensure_com()?;
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.context("Media Foundation unavailable")?;
+        let _com = ComSession::new()?;
+        let mf = MfSession::new()?;
 
         let first = prepare_video(probe, options.max_width);
         let (width, height) = first.dimensions();
+        checked_rgba_buffer_size(width, height)?;
+        let negative_stride = checked_negative_rgba_stride(width)?;
         let fps = options.fps.max(1);
         let bitrate = bitrate(width, height, options);
 
@@ -127,7 +200,7 @@ impl Mp4Sink {
             input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             input.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             // Negative stride marks a bottom-up DIB, which is what RGB32 means.
-            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, (width * 4).wrapping_neg())?;
+            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, negative_stride)?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             writer.SetInputMediaType(stream, &input, None)?;
             writer.BeginWriting()?;
@@ -135,6 +208,7 @@ impl Mp4Sink {
 
         Ok(Self {
             writer,
+            _mf: mf,
             stream,
             width,
             height,
@@ -164,17 +238,13 @@ impl Mp4Sink {
             );
         }
 
-        let stride = (width * 4) as usize;
+        let (stride, total_bytes) = checked_rgba_buffer_size(width, height)?;
         let buffer_started = Instant::now();
-        let buffer = unsafe { MFCreateMemoryBuffer((stride * height as usize) as u32) }?;
+        let buffer = unsafe { MFCreateMemoryBuffer(total_bytes) }?;
         self.t_buffer += buffer_started.elapsed();
         let copy_started = Instant::now();
         {
-            let mut raw: *mut u8 = std::ptr::null_mut();
-            unsafe { buffer.Lock(&mut raw, None, None) }?;
-            if raw.is_null() {
-                bail!("Media Foundation returned an empty frame buffer");
-            }
+            let (_locked, raw) = LockedMfBuffer::lock(&buffer, total_bytes)?;
             // RGBA in, BGRA out, rows bottom-up: RGB32 is a DIB.
             unsafe {
                 for y in 0..height as usize {
@@ -186,9 +256,8 @@ impl Mp4Sink {
                     }
                 }
             }
-            unsafe { buffer.Unlock() }?;
         }
-        unsafe { buffer.SetCurrentLength((stride * height as usize) as u32) }?;
+        unsafe { buffer.SetCurrentLength(total_bytes) }?;
         self.t_copy += copy_started.elapsed();
 
         let write_started = Instant::now();
@@ -207,10 +276,8 @@ impl Mp4Sink {
 
 impl FrameSink for Mp4Sink {
     fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
-        // The capture thread has to be in the MTA as well; the call is a no-op
-        // when it already is.
-        ensure_com()?;
-        // `open` only routes SDR frames here; tonemapping keeps the sink
+        let _com = ComSession::new()?;
+        // `open` routes SDR frames here; tonemapping keeps the sink
         // correct for a caller that hands it an extended-range frame.
         let frame = match frame {
             FrameData::Sdr(image) => image,
@@ -234,7 +301,7 @@ impl FrameSink for Mp4Sink {
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
-        ensure_com()?;
+        let _com = ComSession::new()?;
         let closing_started = Instant::now();
         let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
@@ -246,10 +313,11 @@ impl FrameSink for Mp4Sink {
             closing = closing_started.elapsed();
         }
         let finalize_started = Instant::now();
-        unsafe {
-            self.writer.Finalize()?;
-            let _ = MFShutdown();
-        }
+        unsafe { self.writer.Finalize() }?;
+        // Release the writer before MFShutdown; both explicit drops also make
+        // the ordering independent of sink field destruction.
+        drop(self.writer);
+        drop(self._mf);
         log::info!("encoded {} frames to MP4", self.frames);
         log::info!(
             target: "timing",
@@ -268,13 +336,18 @@ impl FrameSink for Mp4Sink {
 
 /// HDR10: PQ BT.2020 in 10-bit 4:2:0, encoded by the system HEVC MFT.
 pub(crate) struct HdrMp4Sink {
-    /// The muxer writes no colour signalling, so `finish` reopens the file to
-    /// put the HDR10 tagging into the container itself.
+    /// The muxer may omit colour signalling, so `finish` reopens the file to
+    /// ensure the container itself carries the HDR10 tagging.
     path: PathBuf,
     writer: IMFSinkWriter,
+    /// Must follow `writer`: dropping the sink releases the writer first.
+    _mf: MfSession,
     stream: u32,
     width: u32,
     height: u32,
+    reference_white_nits: f32,
+    sdr_white_nits: f32,
+    mixed_sdr_logged: bool,
     /// Padded row length both planes are written with.
     stride: usize,
     max_width: Option<u32>,
@@ -292,18 +365,22 @@ pub(crate) struct HdrMp4Sink {
     t_write: Duration,
 }
 
-/// Same reasoning as the SDR sink: the writer lives on the capture thread.
+/// The same serialized MTA ownership as `Mp4Sink`; finalization may run on the
+/// finisher thread, with a fresh `ComSession` covering writer and MF shutdown.
 unsafe impl Send for HdrMp4Sink {}
 
 impl HdrMp4Sink {
     pub(crate) fn new(path: &Path, options: &RecordOptions, probe: &HdrImage) -> Result<Self> {
-        ensure_com()?;
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.context("Media Foundation unavailable")?;
+        let _com = ComSession::new()?;
+        let mf = MfSession::new()?;
 
         let first = hdr::prepare(probe, options.max_width);
         let (width, height) = (first.width(), first.height());
         let (y_len, uv_len) = hdr::plane_lens(width, height);
-        let stride = (width as usize * 2).next_multiple_of(PITCH_ALIGNMENT);
+        let stride = checked_padded_stride(width, 2, PITCH_ALIGNMENT)? as usize;
+        checked_p010_buffer_size(stride, height)?;
+        let reference_white_nits = probe.reference_white_nits();
+        let sdr_white_nits = probe.sdr_white_nits();
         let fps = options.fps.max(1);
         let bitrate = bitrate(width, height, options);
 
@@ -322,8 +399,9 @@ impl HdrMp4Sink {
         }
         .with_context(|| format!("failed to open {}", path.display()))?;
 
-        // Output: HDR10 as the decoder must read it. The colour attributes also
-        // seed the container tagging that `finish` adds by hand.
+        // Output: HDR10 as the decoder must read it. These attributes are a
+        // best-effort request to the encoder/muxer; `finish` verifies and repairs
+        // the container's `colr` because either component may ignore them.
         let output = unsafe { MFCreateMediaType() }?;
         unsafe {
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -339,9 +417,9 @@ impl HdrMp4Sink {
             output.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             output.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
-            // The colour signalling, on both the input and the output type:
-            // the encoder copies it into the bitstream, the sink writer into
-            // the container's `colr` box.
+            // Request the colour signalling on both types. Drivers may still
+            // omit it from the bitstream VUI or the container; the container is
+            // checked and patched after finalization, but VUI remains best-effort.
             output.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT2020.0 as u32)?;
             output.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_2084.0 as u32)?;
             output.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT2020_10.0 as u32)?;
@@ -357,7 +435,10 @@ impl HdrMp4Sink {
             input.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             input.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
-            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, stride as u32)?;
+            input.SetUINT32(
+                &MF_MT_DEFAULT_STRIDE,
+                u32::try_from(stride).context("P010 stride exceeds Media Foundation's u32 size")?,
+            )?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             input.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT2020.0 as u32)?;
             input.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_2084.0 as u32)?;
@@ -370,9 +451,13 @@ impl HdrMp4Sink {
         Ok(Self {
             path: path.to_path_buf(),
             writer,
+            _mf: mf,
             stream,
             width,
             height,
+            reference_white_nits,
+            sdr_white_nits,
+            mixed_sdr_logged: false,
             stride,
             max_width: options.max_width,
             frame_ticks: TICKS_PER_SECOND / fps as i64,
@@ -391,32 +476,43 @@ impl HdrMp4Sink {
     /// Hand the converter's tightly packed planes to the encoder, one padded
     /// row at a time.
     fn append_planes(&mut self, at: Duration, duration_ticks: i64) -> Result<()> {
-        let row = self.width as usize * 2;
-        let luma_len = self.stride * self.height as usize;
-        let total = luma_len + luma_len / 2;
+        let row = (self.width as usize)
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("P010 row size overflow"))?;
+        let total_bytes = checked_p010_buffer_size(self.stride, self.height)?;
+        let luma_len = self
+            .stride
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| anyhow::anyhow!("P010 luma size overflow"))?;
         let buffer_started = Instant::now();
-        let buffer = unsafe { MFCreateMemoryBuffer(total as u32) }?;
+        let buffer = unsafe { MFCreateMemoryBuffer(total_bytes) }?;
         self.t_buffer += buffer_started.elapsed();
         let copy_started = Instant::now();
         {
-            let mut raw: *mut u8 = std::ptr::null_mut();
-            unsafe { buffer.Lock(&mut raw, None, None) }?;
-            if raw.is_null() {
-                bail!("Media Foundation returned an empty frame buffer");
-            }
-            let dst = unsafe { std::slice::from_raw_parts_mut(raw, total) };
+            let (_locked, raw) = LockedMfBuffer::lock(&buffer, total_bytes)?;
+            let dst = unsafe { std::slice::from_raw_parts_mut(raw, total_bytes as usize) };
             let (luma, chroma) = dst.split_at_mut(luma_len);
-            for (y, line) in self.y.chunks_exact(row).enumerate() {
-                let at = y * self.stride;
-                luma[at..at + row].copy_from_slice(line);
+            for (destination, source, plane_height) in [
+                (luma, &self.y[..], self.height as usize),
+                (chroma, &self.uv[..], self.height as usize / 2),
+            ] {
+                let expected = row
+                    .checked_mul(plane_height)
+                    .ok_or_else(|| anyhow::anyhow!("P010 plane size overflow"))?;
+                if source.len() != expected {
+                    bail!("P010 plane has {} bytes, expected {expected}", source.len());
+                }
+                for (y, line) in source.chunks_exact(row).enumerate() {
+                    let at = y * self.stride;
+                    let out = &mut destination[at..at + self.stride];
+                    // MF memory buffers are not guaranteed to be zeroed.
+                    // Encoders must not receive stale process data in padding.
+                    out.fill(0);
+                    out[..row].copy_from_slice(line);
+                }
             }
-            for (y, line) in self.uv.chunks_exact(row).enumerate() {
-                let at = y * self.stride;
-                chroma[at..at + row].copy_from_slice(line);
-            }
-            unsafe { buffer.Unlock() }?;
         }
-        unsafe { buffer.SetCurrentLength(total as u32) }?;
+        unsafe { buffer.SetCurrentLength(total_bytes) }?;
         self.t_copy += copy_started.elapsed();
 
         let write_started = Instant::now();
@@ -436,12 +532,33 @@ impl HdrMp4Sink {
 
 impl FrameSink for HdrMp4Sink {
     fn push(&mut self, frame: FrameData, at: Duration) -> Result<bool> {
-        ensure_com()?;
-        let FrameData::Hdr(hdr) = frame else {
-            bail!("the HEVC Main10 sink only accepts extended-range frames");
+        let _com = ComSession::new()?;
+        // ScreenCaptureKit can change dynamic range mid-session. Keep the
+        // Main10 sink and promote SDR through linear scRGB, preserving its
+        // absolute SDR/reference-white brightness instead of failing the
+        // recording or treating sRGB values as HDR luminance.
+        let frame_hdr = match frame {
+            FrameData::Hdr(hdr) => hdr,
+            FrameData::Sdr(image) => {
+                if !self.mixed_sdr_logged {
+                    log::info!(
+                        "HEVC Main10 sink received SDR mid-session; promoting from {}x{} with reference white {} nits / SDR white {} nits",
+                        image.width(),
+                        image.height(),
+                        self.reference_white_nits,
+                        self.sdr_white_nits
+                    );
+                    self.mixed_sdr_logged = true;
+                }
+                Arc::new(hdr::promote_sdr(
+                    &image,
+                    self.reference_white_nits,
+                    self.sdr_white_nits,
+                )?)
+            }
         };
         let scaled_started = Instant::now();
-        let scaled = hdr::prepare(&hdr, self.max_width);
+        let scaled = hdr::prepare(&frame_hdr, self.max_width);
         self.t_scale += scaled_started.elapsed();
         // The plane buffers are sized for the first frame; a mid-recording
         // resolution change must error like the SDR sink, not silently write a
@@ -463,7 +580,7 @@ impl FrameSink for HdrMp4Sink {
     }
 
     fn finish(mut self: Box<Self>, end: Duration) -> Result<()> {
-        ensure_com()?;
+        let _com = ComSession::new()?;
         let closing_started = Instant::now();
         let mut closing = Duration::ZERO;
         // A container ends at its last sample, so the closing still stretch
@@ -475,13 +592,11 @@ impl FrameSink for HdrMp4Sink {
             closing = closing_started.elapsed();
         }
         let finalize_started = Instant::now();
-        unsafe {
-            self.writer.Finalize()?;
-            let _ = MFShutdown();
-        }
+        unsafe { self.writer.Finalize() }?;
         // Release the sink writer before reopening the file: while it holds the
         // byte stream, the write-open below can fail with a sharing violation
-        // and leave the recording untagged.
+        // and leave the recording untagged. MFShutdown must also follow the
+        // writer release, not merely Finalize.
         drop(self.writer);
         // The muxer may omit the colour box and the encoder may omit the VUI
         // description, so a Main10 PQ file could play back as a dull SDR clip.
@@ -489,6 +604,7 @@ impl FrameSink for HdrMp4Sink {
         if let Err(err) = mp4_colour::insert(&self.path, &Nclx::HDR10) {
             log::warn!("failed to tag {} as HDR10: {err:#}", self.path.display());
         }
+        drop(self._mf);
         log::info!("encoded {} HDR frames to MP4", self.frames);
         log::info!(
             target: "timing",
@@ -522,14 +638,6 @@ fn closing_sample(at: Duration, end: Duration, frame_ticks: i64) -> Option<(Dura
     let duration =
         (end.saturating_sub(hold).as_secs_f64() * TICKS_PER_SECOND as f64).round() as i64;
     Some((hold, duration.clamp(1, frame_ticks.max(1))))
-}
-
-fn ensure_com() -> Result<()> {
-    let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if result.is_err() {
-        return Err(windows::core::Error::from(result).into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -579,11 +687,24 @@ mod hdr_sink_tests {
         // motion to encode rather than one infinite-length P frame.
         let colours = [[1.0, 1.0, 1.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let (width, height) = (320, 200);
-        let first = FrameData::Hdr(Arc::new(synth_solid(width, height, colours[0], 203.0)));
+        let first = FrameData::Hdr(Arc::new(
+            synth_solid(width, height, colours[0], 80.0).with_sdr_white(200.0),
+        ));
         let mut sink = open(&path, &options, &first).expect("mp4 sink");
 
         for (index, colour) in colours.into_iter().cycle().take(10).enumerate() {
-            let frame = FrameData::Hdr(Arc::new(synth_solid(width, height, colour, 203.0)));
+            let frame = if index == 5 {
+                // Exercise promotion through the real Media Foundation sink.
+                FrameData::Sdr(Arc::new(RgbaImage::from_pixel(
+                    width,
+                    height,
+                    image::Rgba([255, 255, 255, 255]),
+                )))
+            } else {
+                FrameData::Hdr(Arc::new(
+                    synth_solid(width, height, colour, 80.0).with_sdr_white(200.0),
+                ))
+            };
             sink.push(frame, Duration::from_millis(index as u64 * 66))
                 .expect("push");
         }

@@ -14,7 +14,8 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use snapit_capture::HdrImage;
+use anyhow::{Result, bail};
+use snapit_capture::{HdrImage, RgbaImage};
 
 /// A converted frame: the Y plane followed by interleaved CbCr, both
 /// little-endian u16 with the 10-bit code in the high bits (`code << 6`).
@@ -118,6 +119,46 @@ fn box_downscale(hdr: &HdrImage, target_width: u32, target_height: u32) -> HdrIm
         hdr.reference_white_nits(),
     )
     .with_sdr_white(hdr.sdr_white_nits())
+}
+
+/// Lift an 8-bit sRGB frame into the HDR10 sink without changing the apparent
+/// brightness of SDR content. sRGB white is linear `1.0`; in scRGB it therefore
+/// sits at `sdr_white / reference_white`, which keeps Windows' boosted SDR
+/// white (and macOS' 203-nit reference white) at the same absolute luminance.
+pub(crate) fn promote_sdr(
+    frame: &RgbaImage,
+    reference_white_nits: f32,
+    sdr_white_nits: f32,
+) -> Result<HdrImage> {
+    let (width, height) = frame.dimensions();
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow::anyhow!("SDR frame pixel count overflow"))?;
+    let raw_len = pixels
+        .checked_mul(6)
+        .ok_or_else(|| anyhow::anyhow!("SDR frame HDR sample size overflow"))?;
+    let scale = sdr_white_nits / reference_white_nits;
+    if !scale.is_finite() || scale <= 0.0 {
+        bail!("invalid SDR/reference white ratio: {sdr_white_nits}/{reference_white_nits}");
+    }
+    let mut raw = Vec::with_capacity(raw_len);
+    for pixel in frame.as_raw().as_chunks::<4>().0 {
+        for channel in &pixel[..3] {
+            let linear = srgb_to_linear(f32::from(*channel) / 255.0) * scale;
+            raw.extend_from_slice(&f32_to_f16_bits(linear).to_le_bytes());
+        }
+    }
+    HdrImage::try_new(width, height, raw, reference_white_nits)?
+        .try_with_sdr_white(sdr_white_nits)
+        .map_err(Into::into)
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// Byte lengths of the two planes of a frame of this size: 10-bit samples are
@@ -533,6 +574,37 @@ mod tests {
                 assert!(got.abs_diff(want) <= 1, "row {y}: {got} vs {want}");
             }
         }
+    }
+
+    #[test]
+    fn promoted_sdr_keeps_absolute_sdr_white_in_a_mixed_hdr_session() {
+        let white = RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
+        let promoted = promote_sdr(&white, 80.0, 200.0).unwrap();
+        assert_eq!(promoted.pixel_f32(0, 0), [2.5; 3]);
+        assert_eq!(promoted.reference_white_nits(), 80.0);
+        assert_eq!(promoted.sdr_white_nits(), 200.0);
+        assert!(!promoted.has_highlights());
+
+        // A real HDR frame carrying the same 200-nit neutral must produce the
+        // same PQ codes as the promoted SDR frame in this HDR10 session.
+        let hdr = solid(2, 2, [2.5; 3], 80.0).with_sdr_white(200.0);
+        let sdr_codes = convert(&promoted);
+        let hdr_codes = convert(&hdr);
+        assert_eq!(sdr_codes.y, hdr_codes.y);
+        assert_eq!(sdr_codes.uv, hdr_codes.uv);
+
+        let mac_white = promote_sdr(&white, 203.0, 203.0).unwrap();
+        assert_eq!(mac_white.pixel_f32(0, 0), [1.0; 3]);
+    }
+
+    #[test]
+    fn promoted_sdr_decodes_channels_in_linear_light_and_keeps_black() {
+        let frame = RgbaImage::from_pixel(2, 1, image::Rgba([0, 128, 255, 255]));
+        let promoted = promote_sdr(&frame, 203.0, 203.0).unwrap();
+        let [r, g, b] = promoted.pixel_f32(0, 0);
+        assert_eq!(r, 0.0);
+        assert!((g - 0.215_86).abs() < 0.001, "mid sRGB green: {g}");
+        assert!((b - 1.0).abs() < 0.001, "sRGB white blue: {b}");
     }
 
     #[test]

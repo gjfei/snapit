@@ -7,6 +7,8 @@
 
 use std::borrow::Cow;
 
+#[cfg(any(target_os = "windows", test))]
+use anyhow::Context as _;
 use snapit_capture::RgbaImage;
 
 use crate::RecordOptions;
@@ -16,7 +18,7 @@ mod hdr;
 /// Media Foundation may omit the `colr` box, so the finished file needs its HDR
 /// tagging inspected and added by hand when necessary. AVFoundation writes it
 /// from `AVVideoColorPropertiesKey`.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod mp4_colour;
 #[cfg(target_os = "windows")]
 pub(crate) use mp4_colour::Nclx;
@@ -78,6 +80,72 @@ pub(crate) fn bitrate(width: u32, height: u32, options: &RecordOptions) -> u32 {
         options.fps
     );
     bits
+}
+
+/// Checked Media Foundation buffer layout helpers. They are shared with the
+/// host tests so malformed dimensions and lock sizes are exercised without a
+/// Windows encoder or capture device.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn checked_rgba_buffer_size(width: u32, height: u32) -> anyhow::Result<(usize, u32)> {
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("RGBA row size overflow"))?;
+    let total = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow::anyhow!("RGBA buffer size overflow"))?;
+    let total = u32::try_from(total).context("RGBA buffer exceeds Media Foundation's u32 size")?;
+    Ok((row_bytes, total))
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn checked_negative_rgba_stride(width: u32) -> anyhow::Result<u32> {
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("RGBA stride overflow"))?;
+    let stride =
+        i32::try_from(row_bytes).context("RGBA stride exceeds Media Foundation's signed stride")?;
+    Ok(stride.wrapping_neg() as u32)
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn checked_padded_stride(
+    width: u32,
+    bytes_per_sample: usize,
+    alignment: usize,
+) -> anyhow::Result<u32> {
+    if alignment == 0 {
+        anyhow::bail!("row alignment must be positive");
+    }
+    let row = (width as usize)
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow::anyhow!("row size overflow"))?;
+    let padded = row
+        .checked_add(alignment - 1)
+        .and_then(|value| value.checked_div(alignment))
+        .and_then(|value| value.checked_mul(alignment))
+        .ok_or_else(|| anyhow::anyhow!("padded row size overflow"))?;
+    u32::try_from(padded).context("padded row exceeds Media Foundation's u32 stride")
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn checked_p010_buffer_size(stride: usize, height: u32) -> anyhow::Result<u32> {
+    let luma = stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow::anyhow!("P010 luma size overflow"))?;
+    let total = luma
+        .checked_add(luma / 2)
+        .ok_or_else(|| anyhow::anyhow!("P010 buffer size overflow"))?;
+    u32::try_from(total).context("P010 buffer exceeds Media Foundation's u32 size")
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn validate_locked_buffer(max_bytes: u32, required_bytes: u32) -> anyhow::Result<()> {
+    if max_bytes < required_bytes {
+        anyhow::bail!(
+            "Media Foundation locked {max_bytes} bytes, but the frame needs {required_bytes}"
+        );
+    }
+    Ok(())
 }
 
 /// Area-average downscale in one sequential pass over the source.
@@ -143,6 +211,20 @@ mod tests {
 
     fn frame(width: u32, height: u32) -> RgbaImage {
         RgbaImage::new(width, height)
+    }
+
+    #[test]
+    fn media_foundation_buffer_sizes_are_checked() {
+        assert_eq!(checked_rgba_buffer_size(2, 2).unwrap(), (8, 16));
+        assert!(checked_rgba_buffer_size(u32::MAX, u32::MAX).is_err());
+        assert_eq!(checked_negative_rgba_stride(2).unwrap(), (-8i32) as u32);
+        assert!(checked_negative_rgba_stride(u32::MAX).is_err());
+        assert_eq!(checked_padded_stride(320, 2, 64).unwrap(), 640);
+        assert!(checked_padded_stride(u32::MAX, 2, 64).is_err());
+        assert_eq!(checked_p010_buffer_size(640, 200).unwrap(), 192_000);
+        assert!(checked_p010_buffer_size(usize::MAX, u32::MAX).is_err());
+        assert!(validate_locked_buffer(16, 16).is_ok());
+        assert!(validate_locked_buffer(15, 16).is_err());
     }
 
     #[test]

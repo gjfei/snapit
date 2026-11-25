@@ -40,9 +40,11 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use color_quant::NeuQuant;
 use gif::Repeat;
+#[cfg(target_os = "windows")]
+use snapit_capture::RegionCapturer;
 use snapit_capture::{
     DynamicRange, HdrImage, LiveFrameData, LiveFrameWait, LiveRecorder, OutputSize, PixelRect,
-    RasterLayer, Region, RegionCapturer, RgbaImage, WatermarkSpec,
+    RasterLayer, Region, RgbaImage, WatermarkSpec,
 };
 
 mod apng;
@@ -86,6 +88,10 @@ const GIF_PARTIAL_MAX_PERCENT: u64 = 70;
 /// Queued animation frames share this budget. The writer still needs its own
 /// scratch buffers, and capture keeps the previous/current frames separately.
 const ANIMATION_QUEUE_BUDGET: usize = 128 * 1024 * 1024;
+/// DXGI only reports desktop changes. A static desktop therefore gets one
+/// bounded grace period before a still seeds the encoder and the recording.
+#[cfg(target_os = "windows")]
+const WINDOWS_FIRST_FRAME_GRACE: Duration = Duration::from_millis(250);
 const FRAME_SAMPLE_GRID: u32 = 4;
 
 /// Container the frames are written to.
@@ -445,7 +451,19 @@ impl PauseClock {
     }
 }
 
+/// Recording time starts when the first sample is accepted (or the Windows
+/// static-desktop still is encoded), never at backend or encoder creation.
+/// Warm-up and sink setup therefore cannot consume the cap or make the UI clock
+/// run ahead of the encoded timeline.
+fn recording_elapsed(origin: Option<Instant>, now: Instant, paused: Duration) -> Duration {
+    origin
+        .map(|origin| now.saturating_duration_since(origin))
+        .unwrap_or_default()
+        .saturating_sub(paused)
+}
+
 type CaptureResult = Result<(Duration, Option<RgbaImage>)>;
+type StartReady = std::result::Result<Instant, String>;
 
 /// Cancels a recorder that is still waiting for its platform's first frame.
 #[derive(Clone, Default)]
@@ -456,6 +474,14 @@ pub struct RecorderStart {
 impl RecorderStart {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn remove_cancelled_start(output: &Path) {
+    match std::fs::remove_file(output) {
+        Ok(()) => log::info!("removed output from cancelled recording start"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!("failed to remove cancelled recording output: {err}"),
     }
 }
 
@@ -503,7 +529,7 @@ impl Recorder {
         if output.exists() {
             anyhow::bail!("recording output already exists: {}", output.display());
         }
-        let started = Instant::now();
+        let requested_at = Instant::now();
         // Surface a missing permission before threads spawn. A full-screen
         // capture was used here only for this check; on macOS TCC answers the
         // same question instantly, and the fall-back capture is now deferred
@@ -518,7 +544,7 @@ impl Recorder {
         // AVFoundation takes about a second to start delivering frames. Wait
         // for the first one so the UI timer and the saved clip share an origin
         // and the first second is not silently lost.
-        let (ready_tx, ready_rx) = sync_channel::<std::result::Result<(), String>>(1);
+        let (ready_tx, ready_rx) = sync_channel::<StartReady>(1);
         let capture_thread = {
             let stop = stop.clone();
             let frames = frames.clone();
@@ -541,31 +567,34 @@ impl Recorder {
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        let media_origin = loop {
             if start.cancelled.load(Ordering::Relaxed) {
                 stop.store(true, Ordering::Relaxed);
                 let _ = capture_thread.join();
+                remove_cancelled_start(&output);
                 anyhow::bail!("recording start cancelled");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 stop.store(true, Ordering::Relaxed);
                 let _ = capture_thread.join();
+                remove_cancelled_start(&output);
                 anyhow::bail!("the platform recorder delivered no frame within 5 s");
             }
             match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                Ok(Ok(())) => {
+                Ok(Ok(origin)) => {
                     if start.cancelled.load(Ordering::Relaxed) {
                         stop.store(true, Ordering::Relaxed);
                         let _ = capture_thread.join();
+                        remove_cancelled_start(&output);
                         anyhow::bail!("recording start cancelled");
                     }
                     log::info!(
                         target: "timing",
                         "recorder start: ready after {:.1} ms (permission preflight only, no probe capture)",
-                        ms(started.elapsed())
+                        ms(requested_at.elapsed())
                     );
-                    break;
+                    break origin;
                 }
                 Ok(Err(message)) => {
                     stop.store(true, Ordering::Relaxed);
@@ -574,7 +603,9 @@ impl Recorder {
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     stop.store(true, Ordering::Relaxed);
-                    return match capture_thread.join() {
+                    let result = capture_thread.join();
+                    remove_cancelled_start(&output);
+                    return match result {
                         Ok(Err(err)) => Err(err.context("recorder stopped before its first frame")),
                         _ => Err(anyhow!(
                             "the platform recorder stopped before its first frame"
@@ -583,13 +614,13 @@ impl Recorder {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
-        }
+        };
 
         Ok(Self {
             stop,
             paused,
             frames,
-            started: Instant::now(),
+            started: media_origin,
             max_duration: options.max_duration,
             output,
             format: options.format,
@@ -600,9 +631,11 @@ impl Recorder {
     /// Time actually recorded, excluding paused stretches. This is what the UI
     /// shows and what the duration cap compares against.
     pub fn elapsed(&self) -> Duration {
-        self.started
-            .elapsed()
-            .saturating_sub(self.paused.paused_duration())
+        recording_elapsed(
+            Some(self.started),
+            Instant::now(),
+            self.paused.paused_duration(),
+        )
     }
 
     pub fn is_paused(&self) -> bool {
@@ -716,10 +749,10 @@ pub(crate) trait FrameSink: Send {
 }
 
 /// The pixels of one frame: 8-bit SDR, or the extended-range samples an HDR
-/// display delivered. A recorder stays in one variant for its whole session —
-/// the platform either honours the HDR request or delivers SDR from the first
-/// frame — so a sink picks its encoder from the frame it is opened with and
-/// never has to handle the other kind.
+/// display delivered. The first frame chooses the MP4 encoder, but the capture
+/// platform may change dynamic range during the session. HDR sinks promote SDR
+/// frames through linear scRGB without changing absolute SDR white; SDR sinks
+/// tone-map any later HDR frames.
 #[derive(Clone)]
 pub(crate) enum FrameData {
     Sdr(Arc<RgbaImage>),
@@ -834,7 +867,31 @@ fn sampled_pixels_equal(
 }
 
 fn animation_queue_capacity(frame_bytes: usize) -> usize {
-    (ANIMATION_QUEUE_BUDGET / frame_bytes.max(1)).clamp(2, 8)
+    (ANIMATION_QUEUE_BUDGET / frame_bytes.max(1)).clamp(1, 8)
+}
+
+fn validate_animation_frame_size(frame_bytes: usize) -> Result<()> {
+    if frame_bytes > ANIMATION_QUEUE_BUDGET {
+        anyhow::bail!(
+            "first animation frame is {:.2} MiB, exceeding the {:.0} MiB queue budget; \
+             recording was not downscaled",
+            frame_bytes as f64 / (1024.0 * 1024.0),
+            ANIMATION_QUEUE_BUDGET as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(())
+}
+
+fn validate_animation_queue_frame(frame_bytes: usize, capacity: usize) -> Result<()> {
+    let max_frame_bytes = ANIMATION_QUEUE_BUDGET / capacity.max(1);
+    if frame_bytes > max_frame_bytes {
+        anyhow::bail!(
+            "animation frame is {:.2} MiB, exceeding the {:.2} MiB per-frame limit for a {capacity}-frame queue",
+            frame_bytes as f64 / (1024.0 * 1024.0),
+            max_frame_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(())
 }
 
 /// A frame handed to the writer thread: the image plus how long it stays on
@@ -849,6 +906,7 @@ struct PendingFrame {
 struct AnimationSink {
     format: RecordFormat,
     sender: Option<SyncSender<PendingFrame>>,
+    queue_capacity: usize,
     writer: Option<JoinHandle<Result<()>>>,
     pending: Option<Arc<RgbaImage>>,
     pending_at: Option<Duration>,
@@ -864,6 +922,15 @@ impl AnimationSink {
         watermark: Option<Arc<RasterLayer>>,
         source_dimensions: (u32, u32),
     ) -> Result<Self> {
+        // Reject before creating the output so an impossible queue never leaves
+        // an empty container behind. Native dimensions are never changed here.
+        validate_animation_frame_size(first_frame_bytes)?;
+        let capacity = animation_queue_capacity(first_frame_bytes);
+        log::info!(
+            "animation queue: capacity={capacity}, frame={:.2} MiB, queued budget={} MiB",
+            first_frame_bytes as f64 / (1024.0 * 1024.0),
+            ANIMATION_QUEUE_BUDGET / (1024 * 1024)
+        );
         // Never truncate a previous recording if a stale path is reused.
         let (file, name) = match format {
             RecordFormat::Gif => (
@@ -880,14 +947,6 @@ impl AnimationSink {
         let max_width = options.max_width;
         let quality = options.quality;
         let click_effects = options.click_effects;
-        // Capture drops frames instead of blocking when this queue fills. At
-        // physical resolution one 5K RGBA frame is already about 50 MiB.
-        let capacity = animation_queue_capacity(first_frame_bytes);
-        log::info!(
-            "animation queue: capacity={capacity}, frame={:.2} MiB, queued budget={} MiB",
-            first_frame_bytes as f64 / (1024.0 * 1024.0),
-            ANIMATION_QUEUE_BUDGET / (1024 * 1024)
-        );
         let (sender, receiver) = sync_channel::<PendingFrame>(capacity);
         let writer = thread::Builder::new()
             .name(name.into())
@@ -907,6 +966,7 @@ impl AnimationSink {
         Ok(Self {
             format,
             sender: Some(sender),
+            queue_capacity: capacity,
             writer: Some(writer),
             pending: None,
             pending_at: None,
@@ -927,6 +987,7 @@ impl FrameSink for AnimationSink {
             .sender
             .as_ref()
             .ok_or_else(|| anyhow!("{:?} encoder already closed", self.format))?;
+        validate_animation_queue_frame(frame.as_raw().len(), self.queue_capacity)?;
         if let (Some(image), Some(started)) = (self.pending.take(), self.pending_at) {
             let duration = at.saturating_sub(started).max(Duration::from_millis(1));
             match sender.try_send(PendingFrame { image, duration }) {
@@ -1571,10 +1632,7 @@ fn open_first_sink(
     Ok((sink, thumbnail))
 }
 
-fn signal_ready(
-    ready: &mut Option<SyncSender<std::result::Result<(), String>>>,
-    result: std::result::Result<(), String>,
-) {
+fn signal_ready(ready: &mut Option<SyncSender<StartReady>>, result: StartReady) {
     if let Some(ready) = ready.take() {
         let _ = ready.send(result);
     }
@@ -1676,7 +1734,7 @@ fn rasterize_recording_watermark(
 
 fn capture_loop(
     job: CaptureJob,
-    mut ready: Option<SyncSender<std::result::Result<(), String>>>,
+    mut ready: Option<SyncSender<StartReady>>,
 ) -> Result<(Duration, Option<RgbaImage>)> {
     let CaptureJob {
         monitor_id,
@@ -1694,6 +1752,7 @@ fn capture_loop(
         options.captures_cursor,
         options.click_effects
     );
+    #[cfg(target_os = "windows")]
     let started = Instant::now();
     let logical_width = region.width.round().max(1.0) as u32;
     let logical_height = region.height.round().max(1.0) as u32;
@@ -1740,6 +1799,11 @@ fn capture_loop(
     let mut sink: Option<Box<dyn FrameSink>> = None;
     let mut origin: Option<Duration> = None;
     let mut first_received: Option<Instant> = None;
+    // A Windows fallback still seeds timestamp zero. DXGI timestamps remain
+    // relative to backend creation, so keep the offset that aligns the first
+    // live frame with wall time and apply it to every later frame as well.
+    let mut rebase_next_frame = false;
+    let mut live_timestamp_offset = Duration::ZERO;
     let mut first: Option<RgbaImage> = None;
     let mut previous: Option<FrameData> = None;
     let mut pending_duplicate_at: Option<Duration> = None;
@@ -1752,6 +1816,25 @@ fn capture_loop(
     let animation_interval = Duration::from_secs_f64(1.0 / options.fps.max(1) as f64);
     let mut pushed = 0usize;
     let mut stage_stats = CaptureStageStats::default();
+
+    let initialize_sink = |image: FrameData, at: Duration| -> Result<_> {
+        // A/B evidence: the delivered size next to the selection's logical
+        // size shows whether the compositor honoured the native-size hint.
+        let (width, height) = image.dimensions();
+        let range = match &image {
+            FrameData::Hdr(_) => "hdr",
+            FrameData::Sdr(_) => "sdr",
+        };
+        log::info!(
+            "first capture frame {width}x{height} ({range}, output size hint \
+             {output_size:?}, logical selection {logical_width}x{logical_height})"
+        );
+        let watermark =
+            rasterize_recording_watermark(&options, &image, logical_width, logical_height)?;
+        let (created, thumbnail) =
+            open_first_sink(&output, &options, &image, at, watermark.as_ref())?;
+        Ok((created, thumbnail, watermark))
+    };
 
     let push = |sink: &mut Box<dyn FrameSink>,
                 frames: &Arc<AtomicUsize>,
@@ -1770,7 +1853,7 @@ fn capture_loop(
 
     while !stop.load(Ordering::Relaxed)
         && !past_duration_limit(
-            started.elapsed().saturating_sub(paused.paused_duration()),
+            recording_elapsed(first_received, Instant::now(), paused.paused_duration()),
             options.max_duration,
         )
     {
@@ -1796,15 +1879,21 @@ fn capture_loop(
                 }
                 let first_frame = origin.is_none();
                 let frame_origin = *origin.get_or_insert(frame.timestamp);
-                if first_frame {
-                    first_received.get_or_insert_with(Instant::now);
-                }
-                let at = if first_frame {
+                let at = if rebase_next_frame {
+                    rebase_next_frame = false;
+                    let wall_time = first_received
+                        .expect("fallback frame established the media origin")
+                        .elapsed()
+                        .saturating_sub(paused.paused_duration());
+                    live_timestamp_offset = frame.timestamp.saturating_sub(wall_time);
+                    wall_time
+                } else if first_frame {
                     Duration::ZERO
                 } else {
                     frame
                         .timestamp
                         .saturating_sub(frame_origin)
+                        .saturating_sub(live_timestamp_offset)
                         .saturating_sub(paused.paused_duration())
                 };
                 let at = if at > last_at {
@@ -1818,34 +1907,19 @@ fn capture_loop(
                 let image = pointer.apply(FrameData::from(frame.data), at);
                 let pointer_elapsed = pointer_started.elapsed();
                 if sink.is_none() {
-                    // A/B evidence: the delivered size next to the selection's
-                    // logical size shows whether the compositor honoured the
-                    // hint. A mismatch only costs performance — `prepare`
-                    // still scales native frames before they reach the sink.
-                    let (width, height) = image.dimensions();
-                    let range = match &image {
-                        FrameData::Hdr(_) => "hdr",
-                        FrameData::Sdr(_) => "sdr",
-                    };
-                    log::info!(
-                        "first capture frame {width}x{height} ({range}, output size hint \
-                         {output_size:?}, logical selection {logical_width}x{logical_height})"
-                    );
-                    watermark_layer = rasterize_recording_watermark(
-                        &options,
-                        &image,
-                        logical_width,
-                        logical_height,
-                    )?;
                     let sink_started = Instant::now();
-                    let (created, thumbnail) =
-                        open_first_sink(&output, &options, &image, at, watermark_layer.as_ref())?;
+                    let (created, thumbnail, watermark) = initialize_sink(image.clone(), at)?;
                     let sink_elapsed = sink_started.elapsed();
                     sink = Some(created);
+                    watermark_layer = watermark;
                     pushed = 1;
                     frames.store(pushed, Ordering::Relaxed);
                     first = Some(thumbnail);
-                    signal_ready(&mut ready, Ok(()));
+                    // Encoder setup is outside the media timeline. Start the
+                    // UI clock only once the first sample has been accepted.
+                    let received = Instant::now();
+                    first_received = Some(received);
+                    signal_ready(&mut ready, Ok(received));
                     previous = Some(image);
                     stage_stats.record(pointer_elapsed, Duration::ZERO, sink_elapsed, false);
                     continue;
@@ -1880,6 +1954,64 @@ fn capture_loop(
             LiveFrameWait::Timeout => {
                 if paused.is_paused() {
                     pointer.sample_paused();
+                    continue;
+                }
+                #[cfg(target_os = "windows")]
+                if sink.is_none()
+                    && first_received.is_none()
+                    && !stop.load(Ordering::Relaxed)
+                    && started.elapsed() >= WINDOWS_FIRST_FRAME_GRACE
+                {
+                    // DXGI only reports changes. Give the stream a short chance
+                    // to deliver, then seed a static desktop from one still. A
+                    // cancellation that lands during this capture still takes
+                    // the discard-only path and never opens an output file.
+                    log::info!(
+                        "no live frame after {:.1} ms; capturing Windows fallback still",
+                        ms(started.elapsed())
+                    );
+                    let capture_started = Instant::now();
+                    let probe = match RegionCapturer::new(monitor_id, region).and_then(|capturer| {
+                        capturer
+                            .capture()
+                            .context("failed to capture Windows fallback still")
+                    }) {
+                        Ok(image) => FrameData::Sdr(Arc::new(image)),
+                        Err(err) => {
+                            signal_ready(&mut ready, Err(format!("{err:#}")));
+                            return Err(err);
+                        }
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok((Duration::ZERO, None));
+                    }
+                    let still_elapsed = capture_started.elapsed();
+                    origin = Some(Duration::ZERO);
+                    pointer.sample(Duration::ZERO);
+                    let pointer_started = Instant::now();
+                    let image = pointer.apply(probe, Duration::ZERO);
+                    let pointer_elapsed = pointer_started.elapsed();
+                    let sink_started = Instant::now();
+                    let (created, thumbnail, watermark) =
+                        initialize_sink(image.clone(), Duration::ZERO)?;
+                    let sink_elapsed = sink_started.elapsed();
+                    sink = Some(created);
+                    watermark_layer = watermark;
+                    rebase_next_frame = true;
+                    pushed = 1;
+                    frames.store(pushed, Ordering::Relaxed);
+                    first = Some(thumbnail);
+                    previous = Some(image);
+                    stage_stats.record(pointer_elapsed, Duration::ZERO, sink_elapsed, false);
+                    let received = Instant::now();
+                    first_received = Some(received);
+                    signal_ready(&mut ready, Ok(received));
+                    log::info!(
+                        "Windows fallback first frame ready after {:.1} ms (still {:.1} ms, sink {:.1} ms); HDR request falls back to SDR when no HDR frame arrived",
+                        ms(started.elapsed()),
+                        ms(still_elapsed),
+                        ms(sink_elapsed)
+                    );
                     continue;
                 }
                 let at = first_received
@@ -1927,35 +2059,12 @@ fn capture_loop(
     stage_stats.log();
     let closing = Instant::now();
     if sink.is_none() {
-        if stop.load(Ordering::Relaxed) {
-            // Cancellation during warm-up must not trigger the lazy fallback
-            // capture: the user already asked for no recording or file.
-            return Ok((Duration::ZERO, None));
-        }
-        // Windows duplication only reports changes, so a static screen can
-        // yield no frame at all. Capture one now, only on this rare path: doing
-        // it at `start` cost ~10 ms on every recording for no benefit. The
-        // still screenshot is SDR, so this also decides an HDR session that
-        // never delivered a frame as an ordinary H.264 file.
-        let probe = FrameData::Sdr(Arc::new(
-            RegionCapturer::new(monitor_id, region)?
-                .capture()
-                .context("failed to capture region")?,
-        ));
-        watermark_layer =
-            rasterize_recording_watermark(&options, &probe, logical_width, logical_height)?;
-        let (created, thumbnail) = open_first_sink(
-            &output,
-            &options,
-            &probe,
-            Duration::ZERO,
-            watermark_layer.as_ref(),
-        )?;
-        pushed += 1;
-        frames.store(pushed, Ordering::Relaxed);
-        first = Some(thumbnail);
-        sink = Some(created);
-    } else if let (Some(image), Some(timestamp), Some(created)) =
+        // The Windows static-desktop fallback runs inside the timeout branch.
+        // Reaching here means cancellation or a disconnected backend: neither
+        // may create a file after start has failed or been cancelled.
+        return Ok((Duration::ZERO, None));
+    }
+    if let (Some(image), Some(timestamp), Some(created)) =
         (&previous, pending_duplicate_at, sink.as_mut())
     {
         // Keep the final still stretch visible for its real duration.
@@ -1970,10 +2079,7 @@ fn capture_loop(
     }
     let last_frame = closing.elapsed();
 
-    let duration = first_received
-        .map(|received| received.elapsed())
-        .unwrap_or_default()
-        .saturating_sub(paused.paused_duration());
+    let duration = recording_elapsed(first_received, closing, paused.paused_duration());
     // Platform stop and container finalisation are independent: the capture
     // loop has already pushed its last frame, so the sink only has to flush
     // what it holds, and stopping the stream talks to SCK/DXGI. Overlap them.
@@ -2218,7 +2324,71 @@ mod tests {
         assert_eq!(animation_queue_capacity(1), 8);
         assert_eq!(animation_queue_capacity(1920 * 1080 * 4), 8);
         assert_eq!(animation_queue_capacity(5120 * 2880 * 4), 2);
-        assert!(animation_queue_capacity(7680 * 4320 * 4) >= 2);
+        assert_eq!(animation_queue_capacity(7680 * 4320 * 4), 1);
+        assert_eq!(animation_queue_capacity(ANIMATION_QUEUE_BUDGET), 1);
+        assert_eq!(animation_queue_capacity(ANIMATION_QUEUE_BUDGET + 1), 1);
+    }
+
+    #[test]
+    fn animation_queue_rejects_a_frame_larger_than_its_budget() {
+        assert!(validate_animation_frame_size(ANIMATION_QUEUE_BUDGET).is_ok());
+        let error = validate_animation_frame_size(ANIMATION_QUEUE_BUDGET + 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("first animation frame"));
+        assert!(message.contains("128 MiB queue budget"));
+        assert!(message.contains("not downscaled"));
+
+        let dir = temp_dir("oversized-animation");
+        let output = dir.join("out.gif");
+        let error = AnimationSink::new(
+            &output,
+            &RecordOptions::default(),
+            RecordFormat::Gif,
+            ANIMATION_QUEUE_BUDGET + 1,
+            None,
+            (1, 1),
+        )
+        .err()
+        .expect("oversized animation frame must be rejected");
+        assert!(error.to_string().contains("128 MiB queue budget"));
+        assert!(!output.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn animation_queue_rejects_later_frames_that_exceed_its_byte_budget() {
+        assert!(validate_animation_queue_frame(ANIMATION_QUEUE_BUDGET / 8, 8).is_ok());
+        let error = validate_animation_queue_frame(ANIMATION_QUEUE_BUDGET / 8 + 1, 8).unwrap_err();
+        assert!(error.to_string().contains("per-frame limit"));
+    }
+
+    #[test]
+    fn recording_time_starts_at_the_media_origin_and_subtracts_pauses() {
+        let backend_started = Instant::now();
+        let warmup = Duration::from_secs(2);
+        let media_origin = backend_started + warmup;
+        let paused = Duration::from_millis(750);
+
+        assert_eq!(
+            recording_elapsed(None, backend_started + warmup, paused),
+            Duration::ZERO
+        );
+        assert_eq!(
+            recording_elapsed(Some(media_origin), media_origin, paused),
+            Duration::ZERO
+        );
+        assert_eq!(
+            recording_elapsed(
+                Some(media_origin),
+                media_origin + Duration::from_secs(3),
+                paused
+            ),
+            Duration::from_millis(2250)
+        );
+        assert_eq!(
+            recording_elapsed(Some(media_origin), media_origin - warmup, paused),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -2306,6 +2476,7 @@ mod tests {
         let mut sink = AnimationSink {
             format: RecordFormat::Gif,
             sender: Some(sender),
+            queue_capacity: 1,
             writer: None,
             pending: None,
             pending_at: None,
@@ -2516,6 +2687,7 @@ mod tests {
         let mut sink = AnimationSink {
             format: RecordFormat::Apng,
             sender: Some(sender),
+            queue_capacity: 1,
             writer: None,
             pending: None,
             pending_at: None,
