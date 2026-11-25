@@ -6,7 +6,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/bundle-windows.sh [--bin PATH] [--out DIR] [--setup-out DIR] [--release] [--target TRIPLE]
+Usage: scripts/bundle-windows.sh [--bin PATH] [--out DIR] [--setup-out DIR] [--release] [--target TRIPLE] [--version]
 
   --bin PATH      Use this Windows snapit.exe instead of building.
   --out DIR       Staging directory for SnapIt/ (default: dist/windows).
@@ -14,6 +14,7 @@ Usage: scripts/bundle-windows.sh [--bin PATH] [--out DIR] [--setup-out DIR] [--r
   --release       Build release (default).
   --debug         Use/build the debug profile instead.
   --target TRIPLE Host triple on Windows; x86_64-pc-windows-msvc elsewhere.
+  --version       Print the workspace package version from cargo metadata.
 
 Setup: dist/SnapIt-<version>-windows-x86_64-setup.exe or ...-windows-aarch64-setup.exe.
 Installs to %ProgramFiles%\SnapIt for all users. Needs makensis (NSIS);
@@ -35,6 +36,7 @@ SETUP_OUT="$ROOT/dist"
 BUILD_RELEASE=1
 TARGET=""
 TARGET_EXPLICIT=0
+PRINT_VERSION=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       TARGET_EXPLICIT=1
       shift 2
       ;;
+    --version)
+      PRINT_VERSION=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -76,25 +82,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 workspace_version() {
-  awk '
-    /^\[workspace\.package\]$/ { in_pkg = 1; next }
-    in_pkg && /^\[/ { exit }
-    in_pkg && /^version[[:space:]]*=/ {
-      sub(/^[^=]*=[[:space:]]*/, "")
-      gsub(/["[:space:]]/, "")
-      print
-      exit
-    }
-  ' Cargo.toml
+  cargo metadata --format-version 1 --no-deps | python3 -c '
+import json, re, sys
+metadata = json.load(sys.stdin)
+packages = [p for p in metadata["packages"] if p["name"] == "snapit"]
+if len(packages) != 1:
+    raise SystemExit("cargo metadata did not return exactly one snapit package")
+version = packages[0]["version"]
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+    raise SystemExit(f"invalid snapit package version: {version!r}")
+print(version)
+'
 }
 
+VERSION="$(workspace_version)"
+if [[ "$PRINT_VERSION" -eq 1 ]]; then
+  printf '%s\n' "$VERSION"
+  exit 0
+fi
+
 version_quad() {
-  local major rest minor patch
-  IFS=. read -r major minor patch rest <<< "$1"
-  major="${major//[^0-9]/}"
-  minor="${minor//[^0-9]/}"
-  patch="${patch//[^0-9]/}"
-  printf '%s.%s.%s.0\n' "${major:-0}" "${minor:-0}" "${patch:-0}"
+  if [[ "$1" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]]; then
+    printf '%s.%s.%s.0\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  else
+    echo "invalid package version: $1" >&2
+    return 1
+  fi
 }
 
 windows_key() {
@@ -108,7 +121,11 @@ windows_key() {
   fi
   case "$target" in
     aarch64-pc-windows-msvc) echo windows-aarch64 ;;
-    *) echo windows-x86_64 ;;
+    x86_64-pc-windows-msvc) echo windows-x86_64 ;;
+    *)
+      echo "unsupported Windows target: $target" >&2
+      return 1
+      ;;
   esac
 }
 
@@ -199,21 +216,40 @@ profile_dir() {
   fi
 }
 
+cargo_target_dir() {
+  cargo metadata --format-version 1 --no-deps \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['target_directory'])"
+}
+
 default_bin_path() {
+  local target_dir
+  target_dir="$(cargo_target_dir)"
   if is_host_target; then
-    echo "$ROOT/target/$(profile_dir)/snapit.exe"
+    echo "$target_dir/$(profile_dir)/snapit.exe"
   else
-    echo "$ROOT/target/$TARGET/$(profile_dir)/snapit.exe"
+    echo "$target_dir/$TARGET/$(profile_dir)/snapit.exe"
   fi
 }
 
 looks_like_windows_exe() {
   local path="$1"
-  if command -v file >/dev/null 2>&1; then
-    file "$path" | grep -Eqi 'PE32(\+|)|MS Windows|Windows PE'
-  else
-    return 0
-  fi
+  python3 - "$path" <<'PY'
+import struct
+import sys
+
+with open(sys.argv[1], "rb") as executable:
+    header = executable.read(64)
+    if len(header) < 64 or header[:2] != b"MZ":
+        raise SystemExit(1)
+    pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+    executable.seek(pe_offset)
+    signature = executable.read(6)
+    if len(signature) != 6 or signature[:4] != b"PE\0\0":
+        raise SystemExit(1)
+    machine = struct.unpack_from("<H", signature, 4)[0]
+    if machine not in {0x014C, 0x8664, 0xAA64}:
+        raise SystemExit(1)
+PY
 }
 
 find_makensis() {
@@ -282,9 +318,9 @@ if [[ -z "$BIN" ]]; then
       extra+=(--release)
     fi
     if command -v cargo-xwin >/dev/null 2>&1 && ! is_windows_host; then
-      cargo xwin build -p snapit "${extra[@]}"
+      cargo xwin build --locked -p snapit "${extra[@]}"
     else
-      cargo build -p snapit "${extra[@]}"
+      cargo build --locked -p snapit "${extra[@]}"
     fi
     BIN="$(default_bin_path)"
   else
@@ -302,16 +338,51 @@ if ! looks_like_windows_exe "$BIN"; then
 fi
 
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-VERSION="$(workspace_version)"
 KEY="$(windows_key)"
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 STAGE="$OUT_DIR/SnapIt"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-# NSIS resolves File paths against the .nsi directory, not our cwd, so the
-# staged exe handed to -DBIN must be absolute (see also native_path below).
-STAGE="$(cd "$STAGE" && pwd)"
-cp "$BIN" "$STAGE/SnapIt.exe"
+STAGE_WORK="$(mktemp -d "$OUT_DIR/.SnapIt-stage.XXXXXX")"
+TEMP_STAGE="$STAGE_WORK/SnapIt"
+PREVIOUS_STAGE=""
+SETUP_WORK=""
 
+cleanup() {
+  local status=$?
+  if [[ -n "$PREVIOUS_STAGE" && ! -e "$STAGE" && ! -L "$STAGE" ]]; then
+    if ! mv "$PREVIOUS_STAGE" "$STAGE"; then
+      echo "could not restore $STAGE; previous stage preserved in $PREVIOUS_STAGE" >&2
+    fi
+  fi
+  if [[ -z "$PREVIOUS_STAGE" || ! -e "$PREVIOUS_STAGE" ]]; then
+    rm -rf "$STAGE_WORK" || true
+  else
+    echo "preserving previous stage and build directory: $STAGE_WORK" >&2
+  fi
+  if [[ -n "$SETUP_WORK" ]]; then
+    rm -rf "$SETUP_WORK" || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+mkdir -p "$TEMP_STAGE"
+cp "$BIN" "$TEMP_STAGE/SnapIt.exe"
+
+# Publish the staged tree only after the copy succeeds, retaining the old tree
+# until the rename so a failed copy cannot destroy a previous bundle.
+if [[ -e "$STAGE" || -L "$STAGE" ]]; then
+  PREVIOUS_STAGE="$STAGE_WORK/SnapIt.previous"
+  mv "$STAGE" "$PREVIOUS_STAGE"
+fi
+if mv "$TEMP_STAGE" "$STAGE"; then
+  PREVIOUS_STAGE=""
+else
+  if [[ -n "$PREVIOUS_STAGE" ]]; then
+    mv "$PREVIOUS_STAGE" "$STAGE" || true
+  fi
+  exit 1
+fi
 echo "bundled $STAGE/SnapIt.exe"
 
 MAKENSIS_BIN="$(find_makensis || true)"
@@ -324,7 +395,8 @@ fi
 mkdir -p "$SETUP_OUT"
 SETUP_OUT="$(cd "$SETUP_OUT" && pwd)"
 SETUP="$SETUP_OUT/SnapIt-${VERSION}-${KEY}-setup.exe"
-rm -f "$SETUP"
+SETUP_WORK="$(mktemp -d "$SETUP_OUT/.SnapIt-nsis.XXXXXX")"
+TEMP_SETUP="$SETUP_WORK/$(basename "$SETUP")"
 if is_windows_host; then
   export MSYS_NO_PATHCONV=1
 fi
@@ -333,8 +405,14 @@ fi
   "$(makensis_flag "DVERSIONQUAD=$(version_quad "$VERSION")")" \
   "$(makensis_flag "DBIN=$(native_path "$STAGE/SnapIt.exe")")" \
   "$(makensis_flag "DICON=$(native_path "$ROOT/assets/snapit.ico")")" \
-  "$(makensis_flag "DOUT=$(native_path "$SETUP")")" \
+  "$(makensis_flag "DOUT=$(native_path "$TEMP_SETUP")")" \
   "$(native_path "$ROOT/scripts/windows/snapit.nsi")"
+
+if [[ ! -s "$TEMP_SETUP" ]]; then
+  echo "NSIS did not produce a non-empty installer: $TEMP_SETUP" >&2
+  exit 1
+fi
+mv -f "$TEMP_SETUP" "$SETUP"
 
 echo "setup    $SETUP"
 echo "binary   $BIN"

@@ -2,7 +2,7 @@
 # Wrap SnapIt.app in a SwitchHostsLite-style zip + ULMO DMG.
 #
 # Usage: scripts/package-macos.sh [--app PATH] [--out DIR] [--name NAME]
-#                                 [--bundle] [--release] [--target TRIPLE]
+#                                 [--bundle] [--release] [--target TRIPLE] [--version]
 #
 # Mirrors SwitchHostsLite (.github/workflows/release.yml + scripts/bundle-macos.sh):
 #   1. Keep the existing .app step (scripts/bundle-macos.sh → SnapIt.app).
@@ -25,7 +25,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: scripts/package-macos.sh [--app PATH] [--out DIR] [--name NAME]
-                                [--bundle] [--release] [--target TRIPLE]
+                                [--bundle] [--release] [--target TRIPLE] [--version]
 
   --app PATH      SnapIt.app to wrap (default: target/macos/SnapIt.app).
   --out DIR       Directory for the .dmg and .zip (default: dist).
@@ -34,6 +34,7 @@ Usage: scripts/package-macos.sh [--app PATH] [--out DIR] [--name NAME]
   --bundle        Run scripts/bundle-macos.sh first.
   --release       With --bundle, pass --release to the bundler.
   --target TRIPLE With --bundle, pass --target to the bundler.
+  --version       Print the workspace package version from cargo metadata.
 
 Sign / notarize / staple only when the SwitchHostsLite secret names are set.
 Otherwise the ad-hoc .app is packed as-is. Missing secrets are not an error.
@@ -49,6 +50,7 @@ NAME=""
 DO_BUNDLE=0
 BUILD_RELEASE=0
 TARGET=""
+PRINT_VERSION=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -76,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       TARGET="${2:?--target requires a value}"
       shift 2
       ;;
+    --version)
+      PRINT_VERSION=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -88,6 +94,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+workspace_version() {
+  cargo metadata --format-version 1 --no-deps | python3 -c '
+import json, re, sys
+metadata = json.load(sys.stdin)
+packages = [p for p in metadata["packages"] if p["name"] == "snapit"]
+if len(packages) != 1:
+    raise SystemExit("cargo metadata did not return exactly one snapit package")
+version = packages[0]["version"]
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+    raise SystemExit(f"invalid snapit package version: {version!r}")
+print(version)
+'
+}
+
+VERSION="$(workspace_version)"
+if [[ "$PRINT_VERSION" -eq 1 ]]; then
+  printf '%s\n' "$VERSION"
+  exit 0
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "scripts/package-macos.sh requires macOS (hdiutil / codesign / ditto)" >&2
   exit 1
@@ -96,24 +122,6 @@ fi
 if [[ -z "$APP" ]]; then
   APP="$ROOT/target/macos/SnapIt.app"
 fi
-
-workspace_version() {
-  python3 - <<'PY'
-from pathlib import Path
-text = Path("Cargo.toml").read_text()
-in_pkg = False
-for line in text.splitlines():
-    if line.strip() == "[workspace.package]":
-        in_pkg = True
-        continue
-    if in_pkg and line.startswith("["):
-        break
-    if in_pkg and line.startswith("version"):
-        print(line.split("=", 1)[1].strip().strip('"'))
-        raise SystemExit(0)
-print("0.0.2")
-PY
-}
 
 macos_key() {
   local bin="$1/Contents/MacOS/SnapIt"
@@ -184,15 +192,44 @@ APP="$(cd "$APP" && pwd)"
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
-VERSION="$(workspace_version)"
 if [[ -z "$NAME" ]]; then
   NAME="SnapIt-${VERSION}-$(macos_key "$APP")"
 fi
+if [[ "$NAME" == */* || "$NAME" == "." || "$NAME" == ".." ]]; then
+  echo "--name must be a basename, not a path: $NAME" >&2
+  exit 1
+fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/snapit-pkg.XXXXXX")"
+WORK=""
+PUBLISH=""
 KEYCHAIN=""
 ORIG_KEYCHAIN=""
 SIGN_STATUS="ad-hoc (MACOS_CERTIFICATE / MACOS_SIGNING_IDENTITY not set)"
+ZIP_PREVIOUS=""
+DMG_PREVIOUS=""
+ZIP_PUBLISHED=0
+DMG_PUBLISHED=0
+PUBLISH_COMPLETE=0
+RESTORE_FAILED=0
+
+restore_artifact() {
+  local target="$1" previous="$2" published="$3"
+  if [[ -n "$previous" ]]; then
+    if [[ "$published" -eq 1 ]]; then
+      if [[ -e "$target" || -L "$target" ]] && ! rm -f "$target"; then
+        RESTORE_FAILED=1
+        return
+      fi
+    fi
+    if [[ -e "$target" || -L "$target" ]]; then
+      RESTORE_FAILED=1
+    elif ! mv "$previous" "$target"; then
+      RESTORE_FAILED=1
+    fi
+  elif [[ "$published" -eq 1 ]] && ! rm -f "$target"; then
+    RESTORE_FAILED=1
+  fi
+}
 
 cleanup() {
   if [[ -n "$ORIG_KEYCHAIN" ]]; then
@@ -201,10 +238,25 @@ cleanup() {
   if [[ -n "$KEYCHAIN" ]]; then
     security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
   fi
-  rm -rf "$WORK"
+  if [[ -n "$WORK" ]]; then
+    rm -rf "$WORK" || true
+  fi
+  if [[ -n "$PUBLISH" ]]; then
+    if [[ "$PUBLISH_COMPLETE" -eq 0 ]]; then
+      restore_artifact "$OUT_DIR/$NAME.zip" "$ZIP_PREVIOUS" "$ZIP_PUBLISHED"
+      restore_artifact "$OUT_DIR/$NAME.dmg" "$DMG_PREVIOUS" "$DMG_PUBLISHED"
+    fi
+    if [[ "$RESTORE_FAILED" -eq 0 ]]; then
+      rm -rf "$PUBLISH" || true
+    else
+      echo "could not restore every previous artifact; backups preserved in $PUBLISH" >&2
+    fi
+  fi
 }
 trap cleanup EXIT
 
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/snapit-pkg.XXXXXX")"
+PUBLISH="$(mktemp -d "$OUT_DIR/.snapit-publish.XXXXXX")"
 STAGED="$WORK/SnapIt.app"
 ditto "$APP" "$STAGED"
 
@@ -253,9 +305,10 @@ fi
 
 ZIP_PATH="$OUT_DIR/$NAME.zip"
 DMG_PATH="$OUT_DIR/$NAME.dmg"
-rm -f "$ZIP_PATH" "$DMG_PATH"
+ZIP_TMP="$PUBLISH/$NAME.zip"
+DMG_TMP="$PUBLISH/$NAME.dmg"
 
-ditto -c -k --zlibCompressionLevel 9 --keepParent "$STAGED" "$ZIP_PATH"
+ditto -c -k --zlibCompressionLevel 9 --keepParent "$STAGED" "$ZIP_TMP"
 
 DMG_STAGE="$WORK/dmg"
 mkdir -p "$DMG_STAGE"
@@ -266,7 +319,7 @@ ln -s /Applications "$DMG_STAGE/Applications"
 # ULMO (lzma) needs macOS 10.15+ to open and is a third smaller than UDZO.
 attempt=1
 while true; do
-  if hdiutil create -volname "SnapIt" -srcfolder "$DMG_STAGE" -ov -format ULMO "$DMG_PATH"; then
+  if hdiutil create -volname "SnapIt" -srcfolder "$DMG_STAGE" -ov -format ULMO "$DMG_TMP"; then
     break
   fi
   if [[ "$attempt" -eq 5 ]]; then
@@ -276,6 +329,24 @@ while true; do
   attempt=$((attempt + 1))
   sleep 5
 done
+
+if [[ ! -s "$ZIP_TMP" || ! -s "$DMG_TMP" ]]; then
+  echo "packaging did not produce non-empty zip and dmg files" >&2
+  exit 1
+fi
+if [[ -e "$ZIP_PATH" || -L "$ZIP_PATH" ]]; then
+  ZIP_PREVIOUS="$PUBLISH/previous.zip"
+  mv "$ZIP_PATH" "$ZIP_PREVIOUS"
+fi
+if [[ -e "$DMG_PATH" || -L "$DMG_PATH" ]]; then
+  DMG_PREVIOUS="$PUBLISH/previous.dmg"
+  mv "$DMG_PATH" "$DMG_PREVIOUS"
+fi
+mv "$ZIP_TMP" "$ZIP_PATH"
+ZIP_PUBLISHED=1
+mv "$DMG_TMP" "$DMG_PATH"
+DMG_PUBLISHED=1
+PUBLISH_COMPLETE=1
 
 echo "packaged $DMG_PATH"
 echo "zip      $ZIP_PATH"

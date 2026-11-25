@@ -27,6 +27,92 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  quality:
+    name: Tests, clippy and release scripts
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$channel"
+          rustc --version
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Release script syntax and version failure tests
+        run: |
+          for script in scripts/bundle-macos.sh scripts/package-macos.sh scripts/bundle-windows.sh; do
+            bash -n "$script"
+          done
+          fake_dir="$(mktemp -d)"
+          trap 'rm -rf "$fake_dir"' EXIT
+          PYTHONPYCACHEPREFIX="$fake_dir/pycache" python3 -m py_compile scripts/release-manifest.py scripts/test-release-rollback.py
+          python3 scripts/test-release-rollback.py
+          cat > "$fake_dir/cargo" <<'EOF'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"packages":[{"name":"snapit","version":"9.8.7-beta.1"}]}'
+          EOF
+          chmod +x "$fake_dir/cargo"
+          for script in scripts/bundle-macos.sh scripts/package-macos.sh scripts/bundle-windows.sh; do
+            version="$(PATH="$fake_dir:$PATH" "$script" --version)"
+            [[ "$version" == "9.8.7-beta.1" ]] || { echo "bad version from $script: $version" >&2; exit 1; }
+          done
+          cat > "$fake_dir/cargo" <<'EOF'
+          #!/usr/bin/env bash
+          exit 42
+          EOF
+          chmod +x "$fake_dir/cargo"
+          for script in scripts/bundle-macos.sh scripts/package-macos.sh scripts/bundle-windows.sh; do
+            if PATH="$fake_dir:$PATH" "$script" --version >/dev/null 2>&1; then
+              echo "$script silently accepted failed cargo metadata" >&2
+              exit 1
+            fi
+          done
+          cat > "$fake_dir/cargo" <<'EOF'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"packages":[]}'
+          EOF
+          chmod +x "$fake_dir/cargo"
+          for script in scripts/bundle-macos.sh scripts/package-macos.sh scripts/bundle-windows.sh; do
+            if PATH="$fake_dir:$PATH" "$script" --version >/dev/null 2>&1; then
+              echo "$script silently accepted a missing package version" >&2
+              exit 1
+            fi
+          done
+
+          mkdir "$fake_dir/assets"
+          for asset in \
+            SnapIt-9.8.7-beta.1-macos-aarch64.zip \
+            SnapIt-9.8.7-beta.1-macos-aarch64.dmg \
+            SnapIt-9.8.7-beta.1-macos-x86_64.zip \
+            SnapIt-9.8.7-beta.1-macos-x86_64.dmg \
+            SnapIt-9.8.7-beta.1-windows-x86_64-setup.exe \
+            SnapIt-9.8.7-beta.1-windows-aarch64-setup.exe; do
+            printf 'release asset\n' > "$fake_dir/assets/$asset"
+          done
+          python3 scripts/release-manifest.py --dir "$fake_dir/assets" \
+            --version 9.8.7-beta.1 --repo owner/repo >/dev/null
+          python3 - "$fake_dir/assets/latest.json" <<'PY'
+          import json, sys
+          expected = {
+              "macos-aarch64", "macos-aarch64-dmg",
+              "macos-x86_64", "macos-x86_64-dmg",
+              "windows-x86_64", "windows-aarch64",
+          }
+          assets = json.load(open(sys.argv[1], encoding="utf-8"))["assets"]
+          if set(assets) != expected:
+              raise SystemExit(f"bad release asset keys: {sorted(assets)}")
+          PY
+
   prepare:
     name: Check version
     runs-on: ubuntu-latest
@@ -41,23 +127,15 @@ jobs:
       - name: Tag matches Cargo.toml
         id: version
         run: |
-          version="$(python3 - <<'PY'
-          from pathlib import Path
-          text = Path("Cargo.toml").read_text()
-          in_pkg = False
-          for line in text.splitlines():
-              if line.strip() == "[workspace.package]":
-                  in_pkg = True
-                  continue
-              if in_pkg and line.startswith("["):
-                  break
-              if in_pkg and line.startswith("version"):
-                  print(line.split("=", 1)[1].strip().strip('"'))
-                  raise SystemExit(0)
-          raise SystemExit("workspace.package version not found in Cargo.toml")
-          PY
-          )"
-          if [[ "$TAG" != "v$version" ]]; then
+          version="$(cargo metadata --format-version 1 --no-deps | python3 -c '
+          import json, sys
+          metadata = json.load(sys.stdin)
+          packages = [p for p in metadata["packages"] if p["name"] == "snapit"]
+          if len(packages) != 1:
+              raise SystemExit("cargo metadata did not return exactly one snapit package")
+          print(packages[0]["version"])
+          ')"
+          if [[ -z "$version" || "$TAG" != "v$version" ]]; then
             echo "::error::Tag $TAG does not match the Cargo.toml version $version (expected v$version)"
             exit 1
           fi
@@ -65,7 +143,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.key }}
-    needs: prepare
+    needs: [prepare, quality]
     strategy:
       fail-fast: false
       matrix:
@@ -171,12 +249,16 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.key }}
-          path: out/*
+          # Do not upload the unpacked SnapIt.app directory as a release asset.
+          path: |
+            out/*.zip
+            out/*.dmg
+            out/*.exe
           if-no-files-found: error
 
   release:
     name: Publish release
-    needs: [prepare, build]
+    needs: [prepare, quality, build]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -204,6 +286,33 @@ jobs:
         run: |
           python3 scripts/release-manifest.py --dir dist --version "$VERSION" --tag "$TAG" \
             --repo "${{ github.repository }}" --notes-file notes.md
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          version = os.environ["VERSION"]
+          expected = {
+              "macos-aarch64": "macos-aarch64.zip",
+              "macos-aarch64-dmg": "macos-aarch64.dmg",
+              "macos-x86_64": "macos-x86_64.zip",
+              "macos-x86_64-dmg": "macos-x86_64.dmg",
+              "windows-x86_64": "windows-x86_64-setup.exe",
+              "windows-aarch64": "windows-aarch64-setup.exe",
+          }
+          assets = json.loads(pathlib.Path("dist/latest.json").read_text())["assets"]
+          if set(assets) != set(expected):
+              raise SystemExit(f"incomplete release asset keys: {sorted(assets)}")
+          for key, suffix in expected.items():
+              name = f"SnapIt-{version}-{suffix}"
+              path = pathlib.Path("dist") / name
+              asset = assets[key]
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"missing or empty release asset: {name}")
+              if not asset["url"].endswith("/" + name) or asset["size"] != path.stat().st_size:
+                  raise SystemExit(f"bad manifest entry for {name}")
+              with path.open("rb") as f:
+                  checksum = hashlib.file_digest(f, "sha256").hexdigest()
+              if asset["sha256"] != checksum:
+                  raise SystemExit(f"bad checksum for {name}")
+          PY
           cat dist/latest.json dist/SHA256SUMS.txt
           ls -l dist
 

@@ -3,7 +3,7 @@
 # attach to the bundle (dev.SnapIt.SnapIt) instead of Terminal / Cursor / `snapit`.
 # Does not change `cargo run -p snapit`.
 #
-# Usage: scripts/bundle-macos.sh [--bin PATH] [--out DIR] [--release] [--target TRIPLE]
+# Usage: scripts/bundle-macos.sh [--bin PATH] [--out DIR] [--release] [--target TRIPLE] [--version]
 #   --target  Rust target triple, e.g. aarch64-apple-darwin or x86_64-apple-darwin
 #             (default: the host). Builds a release binary with --locked, like
 #             SwitchHostsLite.
@@ -12,7 +12,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/bundle-macos.sh [--bin PATH] [--out DIR] [--release] [--target TRIPLE]
+Usage: scripts/bundle-macos.sh [--bin PATH] [--out DIR] [--release] [--target TRIPLE] [--version]
 
   --bin PATH      Use this snapit binary (default: target/debug/snapit if present,
                   else target/release/snapit, else cargo build -p snapit).
@@ -20,6 +20,7 @@ Usage: scripts/bundle-macos.sh [--bin PATH] [--out DIR] [--release] [--target TR
   --release       Prefer/build target/release/snapit instead of debug.
   --target TRIPLE Rust target, e.g. aarch64-apple-darwin or x86_64-apple-darwin.
                   Builds `cargo build --release --locked --target` (CI).
+  --version       Print the workspace package version from cargo metadata.
 
 The app is ad-hoc signed (codesign --sign - --force --deep). Rebuilding
 changes the signature; macOS may require Screen Recording to be re-granted.
@@ -33,6 +34,7 @@ BIN=""
 OUT_DIR="$ROOT/target/macos"
 BUILD_RELEASE=0
 TARGET=""
+PRINT_VERSION=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       TARGET="${2:?--target requires a value}"
       shift 2
       ;;
+    --version)
+      PRINT_VERSION=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -63,9 +69,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-mkdir -p "$OUT_DIR"
-OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 cargo_target_dir() {
   cargo metadata --format-version 1 --no-deps \
@@ -89,7 +92,7 @@ resolve_bin() {
   fi
   if [[ "$BUILD_RELEASE" -eq 1 ]]; then
     if [[ ! -x "$target_dir/release/snapit" ]]; then
-      cargo build -p snapit --release
+      cargo build -p snapit --release --locked
     fi
     BIN="$target_dir/release/snapit"
     return
@@ -99,7 +102,7 @@ resolve_bin() {
   elif [[ -x "$target_dir/release/snapit" ]]; then
     BIN="$target_dir/release/snapit"
   else
-    cargo build -p snapit
+    cargo build -p snapit --locked
     BIN="$target_dir/debug/snapit"
   fi
 }
@@ -116,31 +119,53 @@ ensure_icon() {
 }
 
 workspace_version() {
-  python3 - <<'PY'
-from pathlib import Path
-text = Path("Cargo.toml").read_text()
-in_pkg = False
-for line in text.splitlines():
-    if line.strip() == "[workspace.package]":
-        in_pkg = True
-        continue
-    if in_pkg and line.startswith("["):
-        break
-    if in_pkg and line.startswith("version"):
-        print(line.split("=", 1)[1].strip().strip('"'))
-        raise SystemExit(0)
-print("0.0.2")
-PY
+  cargo metadata --format-version 1 --no-deps | python3 -c '
+import json, re, sys
+metadata = json.load(sys.stdin)
+packages = [p for p in metadata["packages"] if p["name"] == "snapit"]
+if len(packages) != 1:
+    raise SystemExit("cargo metadata did not return exactly one snapit package")
+version = packages[0]["version"]
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+    raise SystemExit(f"invalid snapit package version: {version!r}")
+print(version)
+'
 }
+
+VERSION="$(workspace_version)"
+if [[ "$PRINT_VERSION" -eq 1 ]]; then
+  printf '%s\n' "$VERSION"
+  exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 resolve_bin
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 ICON="$(ensure_icon)"
-VERSION="$(workspace_version)"
 APP="$OUT_DIR/SnapIt.app"
-CONTENTS="$APP/Contents"
+WORK="$(mktemp -d "$OUT_DIR/.SnapIt-build.XXXXXX")"
+TEMP_APP="$WORK/SnapIt.app"
+PREVIOUS_APP=""
+CONTENTS="$TEMP_APP/Contents"
 
-rm -rf "$APP"
+cleanup() {
+  local status=$?
+  if [[ -n "$PREVIOUS_APP" && ! -e "$APP" && ! -L "$APP" ]]; then
+    if ! mv "$PREVIOUS_APP" "$APP"; then
+      echo "could not restore $APP; previous bundle preserved in $PREVIOUS_APP" >&2
+    fi
+  fi
+  if [[ -z "$PREVIOUS_APP" || ! -e "$PREVIOUS_APP" ]]; then
+    rm -rf "$WORK" || true
+  else
+    echo "preserving previous bundle and build directory: $WORK" >&2
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 if [[ -x /usr/libexec/PlistBuddy ]]; then
@@ -152,7 +177,16 @@ cp "$BIN" "$CONTENTS/MacOS/SnapIt"
 chmod +x "$CONTENTS/MacOS/SnapIt"
 cp "$ICON" "$CONTENTS/Resources/AppIcon.icns"
 
-codesign --sign - --force --deep "$APP"
+codesign --sign - --force --deep "$TEMP_APP"
+
+# Keep the previous bundle until the newly signed one is ready. If the final
+# rename fails, the EXIT trap puts the previous bundle back.
+if [[ -e "$APP" || -L "$APP" ]]; then
+  PREVIOUS_APP="$WORK/SnapIt.previous.app"
+  mv "$APP" "$PREVIOUS_APP"
+fi
+mv "$TEMP_APP" "$APP"
+PREVIOUS_APP=""
 
 echo "bundled $APP"
 echo "binary  $BIN"
