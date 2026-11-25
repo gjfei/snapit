@@ -28,8 +28,12 @@ env:
 
 jobs:
   quality:
-    name: Tests, clippy and release scripts
-    runs-on: macos-latest
+    name: Tests, clippy and release scripts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,18 +41,25 @@ jobs:
           submodules: recursive
 
       - name: Toolchain
+        shell: bash
         run: |
-          channel="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
-          rustup toolchain install "$channel"
+          rustup toolchain install
+          rustup component add clippy
           rustc --version
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --locked --workspace
+
+      - name: Test xcap
+        run: cargo test --manifest-path vendor/xcap/Cargo.toml --lib
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Release script syntax and version failure tests
+        if: runner.os == 'macOS'
         run: |
           for script in scripts/bundle-macos.sh scripts/package-macos.sh scripts/bundle-windows.sh; do
             bash -n "$script"
