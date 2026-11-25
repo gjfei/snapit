@@ -1918,7 +1918,7 @@ mod tests {
         });
         state.pointer_dirty = true;
         let clicked = state
-            .apply_timeout(Duration::from_millis(30))
+            .apply_timeout(Duration::from_millis(20))
             .expect("click redraw");
         let FrameData::Sdr(clicked) = clicked else {
             panic!("click redraw changed the frame variant");
