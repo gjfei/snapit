@@ -200,6 +200,17 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
         .collect()
 }
 
+/// Reported refresh rate (Hz) of the given display, when the OS provides a
+/// finite positive value.
+pub fn monitor_refresh_rate(monitor_id: u32) -> Option<f32> {
+    Monitor::all()
+        .ok()?
+        .into_iter()
+        .find(|monitor| monitor.id().ok() == Some(monitor_id))
+        .and_then(|monitor| monitor.frequency().ok())
+        .filter(|hz| hz.is_finite() && *hz > 0.0)
+}
+
 /// Monitors worth trying in HDR, by monitor id.
 ///
 /// Use the display's *potential* EDR headroom, not the current one.
@@ -529,6 +540,9 @@ impl LiveRecorder {
     /// `Native` for physical pixels. It is best-effort — DXGI ignores it and
     /// the platform may still deliver native frames — so callers must keep
     /// their own downscale as a fallback.
+    ///
+    /// `fps` sets the frame-rate cap (`0` requests the monitor's native
+    /// refresh rate).
     ///
     /// `dynamic_range` is best-effort the same way: `Hdr` asks for extended
     /// range frames where the display and platform support them, and the
