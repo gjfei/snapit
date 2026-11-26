@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{BufReader, BufWriter, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
@@ -110,10 +110,11 @@ impl DiskImage {
             "unsupported PNG output format"
         );
         let disk = Self::create(info.width, info.height)?;
-        let mut output = OpenOptions::new()
+        let raw_output = OpenOptions::new()
             .write(true)
             .open(disk.path.as_path())
             .with_context(|| format!("failed to open {}", disk.path.display()))?;
+        let mut output = BufWriter::with_capacity(IO_CHUNK_BYTES, raw_output);
         let mut rgba_row = vec![0u8; info.width as usize * 4];
         for _ in 0..info.height {
             let row = reader
@@ -161,6 +162,9 @@ impl DiskImage {
                 _ => unreachable!(),
             }
         }
+        output
+            .flush()
+            .context("failed to flush decoded PNG buffer")?;
         Ok(disk)
     }
 
@@ -210,12 +214,24 @@ impl DiskImage {
 
     pub fn write_rows_at(&self, start: u32, image: &RgbaImage) -> Result<()> {
         ensure!(image.width() == self.width, "disk image width mismatch");
-        ensure!(image.height() > 0, "disk image write is empty");
+        self.write_raw_rows_at(start, image.height(), image.as_raw())
+    }
+
+    pub fn write_raw_rows_at(&self, start: u32, rows: u32, raw: &[u8]) -> Result<()> {
+        ensure!(rows > 0, "disk image write is empty");
         ensure!(
             start
-                .checked_add(image.height())
+                .checked_add(rows)
                 .is_some_and(|end| end <= self.height),
             "disk image write is out of bounds"
+        );
+        let expected_len = (self.width as usize)
+            .checked_mul(4)
+            .and_then(|row_bytes| row_bytes.checked_mul(rows as usize))
+            .context("disk image write is too large")?;
+        ensure!(
+            raw.len() == expected_len,
+            "disk image write byte length mismatch"
         );
         let mut file = OpenOptions::new()
             .write(true)
@@ -223,8 +239,7 @@ impl DiskImage {
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         file.seek(SeekFrom::Start(start as u64 * self.width as u64 * 4))
             .context("failed to seek disk image")?;
-        file.write_all(image.as_raw())
-            .context("failed to write disk image")?;
+        file.write_all(raw).context("failed to write disk image")?;
         Ok(())
     }
 
@@ -266,28 +281,31 @@ impl DiskImage {
             MAX_READ_BYTES as f64 / (1024.0 * 1024.0)
         );
         let mut output = vec![0u8; len];
+        let row_bytes = self.width as usize * 4;
+        let x_offsets: Vec<usize> = (0..target_width)
+            .map(|x| {
+                ((x as u64 * self.width as u64 / target_width as u64).min((self.width - 1) as u64))
+                    as usize
+                    * 4
+            })
+            .collect();
         let mut cached_y = None;
-        let mut cached_row = Vec::new();
+        let mut cached_row = vec![0u8; row_bytes];
         let mut file = File::open(self.path.as_path())
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         for dy in 0..target_height {
             let source_y =
                 start + ((dy as u64 * rows as u64 / target_height as u64) as u32).min(rows - 1);
             if cached_y != Some(source_y) {
-                cached_row.clear();
-                file.seek(SeekFrom::Start(source_y as u64 * self.width as u64 * 4))
+                file.seek(SeekFrom::Start(source_y as u64 * row_bytes as u64))
                     .context("failed to seek disk image")?;
-                cached_row.resize(self.width as usize * 4, 0);
                 file.read_exact(&mut cached_row)
                     .context("failed to read disk image")?;
                 cached_y = Some(source_y);
             }
             let dst_start = dy as usize * target_width as usize * 4;
-            for x in 0..target_width {
-                let source_x = ((x as u64 * self.width as u64 / target_width as u64)
-                    .min((self.width - 1) as u64)) as usize
-                    * 4;
-                let dst = dst_start + x as usize * 4;
+            for (x, &source_x) in x_offsets.iter().enumerate() {
+                let dst = dst_start + x * 4;
                 output[dst..dst + 4].copy_from_slice(&cached_row[source_x..source_x + 4]);
             }
         }
@@ -307,41 +325,53 @@ impl DiskImage {
         let height = ((self.height as f64 * scale).round() as u32).max(1);
         let mut output = vec![0u8; width as usize * height as usize * 4];
         let mut sums = vec![[0u64; 4]; width as usize];
-        let mut counts = vec![0u64; width as usize];
-        let mut row = vec![0u8; self.width as usize * 4];
-        let mut file = File::open(self.path.as_path())
+        let row_bytes = self.width as usize * 4;
+        let mut row = vec![0u8; row_bytes];
+        let x_ranges: Vec<(usize, usize)> = (0..width)
+            .map(|x| {
+                let x0 = (x as u64 * self.width as u64 / width as u64) as usize;
+                let x1 = (((x as u64 + 1) * self.width as u64 / width as u64) as usize)
+                    .max(x0 + 1)
+                    .min(self.width as usize);
+                (x0, x1)
+            })
+            .collect();
+        let file = File::open(self.path.as_path())
             .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let mut reader = BufReader::with_capacity(IO_CHUNK_BYTES, file);
+        let mut next_row = 0u32;
         for dy in 0..height {
             sums.fill([0; 4]);
-            counts.fill(0);
             let source_y0 = (dy as u64 * self.height as u64 / height as u64) as u32;
             let source_y1 = (((dy as u64 + 1) * self.height as u64 / height as u64) as u32)
                 .max(source_y0 + 1)
                 .min(self.height);
-            for source_y in source_y0..source_y1 {
-                file.seek(SeekFrom::Start(source_y as u64 * self.width as u64 * 4))
+            if source_y0 != next_row {
+                reader
+                    .seek(SeekFrom::Start(source_y0 as u64 * row_bytes as u64))
                     .context("failed to seek disk image")?;
-                file.read_exact(&mut row)
+                next_row = source_y0;
+            }
+            for _source_y in source_y0..source_y1 {
+                reader
+                    .read_exact(&mut row)
                     .context("failed to read disk image")?;
-                for x in 0..width as usize {
-                    let source_x0 = (x as u64 * self.width as u64 / width as u64) as usize;
-                    let source_x1 = (((x as u64 + 1) * self.width as u64 / width as u64) as usize)
-                        .max(source_x0 + 1)
-                        .min(self.width as usize);
-                    counts[x] += (source_x1 - source_x0) as u64;
+                next_row += 1;
+                for (sum, &(source_x0, source_x1)) in sums.iter_mut().zip(&x_ranges) {
                     for source_x in source_x0..source_x1 {
                         let src = source_x * 4;
                         for channel in 0..4 {
-                            sums[x][channel] += row[src + channel] as u64;
+                            sum[channel] += row[src + channel] as u64;
                         }
                     }
                 }
             }
-            for x in 0..width as usize {
-                let count = counts[x] * (source_y1 - source_y0) as u64;
+            let row_count = (source_y1 - source_y0) as u64;
+            for (x, (&sum, &(source_x0, source_x1))) in sums.iter().zip(&x_ranges).enumerate() {
+                let count = (source_x1 - source_x0) as u64 * row_count;
                 let dst = (dy as usize * width as usize + x) * 4;
                 for channel in 0..4 {
-                    output[dst + channel] = (sums[x][channel] / count) as u8;
+                    output[dst + channel] = (sum[channel] / count) as u8;
                 }
             }
         }
@@ -356,16 +386,26 @@ impl DiskImage {
             let mut writer = encoder
                 .write_header()
                 .context("failed to write PNG header")?;
+            let mut stream = writer
+                .stream_writer_with_size(IO_CHUNK_BYTES)
+                .context("failed to create PNG stream")?;
+            let mut file = File::open(self.path.as_path())
+                .with_context(|| format!("failed to open {}", self.path.display()))?;
             let rows_per_chunk = self.rows_for_bytes(IO_CHUNK_BYTES);
+            let row_bytes = self.width as usize * 4;
+            let mut buffer = vec![0u8; rows_per_chunk as usize * row_bytes];
             let mut y = 0;
             while y < self.height {
                 let rows = rows_per_chunk.min(self.height - y);
-                let image = self.read_rows(y, rows)?;
-                writer
-                    .write_image_data(image.as_raw())
+                let len = rows as usize * row_bytes;
+                file.read_exact(&mut buffer[..len])
+                    .context("failed to read disk image")?;
+                stream
+                    .write_all(&buffer[..len])
                     .context("failed to write PNG pixels")?;
                 y += rows;
             }
+            stream.finish().context("failed to finish PNG stream")?;
             writer.finish().context("failed to finish PNG")?;
             Ok(())
         })
@@ -477,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn disk_image_streams_png_across_multiple_chunks() {
+        let source = RgbaImage::from_fn(512, 4097, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, 255])
+        });
+        let disk = DiskImage::from_image(&source).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.png");
+        disk.encode_png(&path).unwrap();
+        let decoded = image::open(&path).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (512, 4097));
+        assert_eq!(decoded, source);
+    }
+
+    #[test]
+    fn disk_image_streams_png_beyond_the_former_scroll_height_limit() {
+        let source = RgbaImage::from_fn(64, 30_047, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, 255])
+        });
+        let disk = DiskImage::from_image(&source).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unbounded-scroll.png");
+
+        disk.encode_png(&path).unwrap();
+
+        let streamed = DiskImage::from_png(&path).unwrap();
+        assert_eq!(streamed.dimensions(), (64, 30_047));
+        assert_eq!(streamed.read_rows(0, 30_047).unwrap(), source);
+    }
+
+    #[test]
     fn disk_image_rejects_oversized_reads_before_allocating() {
         let disk = DiskImage::create(4096, 5000).unwrap();
         let error = disk.read_rows(0, 5000).unwrap_err();
@@ -490,6 +560,21 @@ mod tests {
         let thumbnail = disk.thumbnail(2, 2).unwrap();
         assert_eq!(thumbnail.dimensions(), (1, 2));
         assert!(thumbnail.pixels().all(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn disk_image_thumbnail_preserves_opaque_pixel_values() {
+        let source = RgbaImage::from_pixel(8, 12, image::Rgba([40, 42, 48, 255]));
+        let disk = DiskImage::from_image(&source).unwrap();
+
+        let thumbnail = disk.thumbnail(2, 2).unwrap();
+
+        assert_eq!(thumbnail.dimensions(), (1, 2));
+        assert!(
+            thumbnail
+                .pixels()
+                .all(|pixel| *pixel == image::Rgba([40, 42, 48, 255]))
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::stitch::ScrollDirection;
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::LPARAM;
+use windows::Win32::Foundation::{LPARAM, LRESULT};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollSpeed {
@@ -35,11 +35,210 @@ impl ScrollSpeed {
     }
 
     /// `(pulses_per_step, mac_pixels_per_pulse, win_notches_per_pulse, settle_duration)`.
+    #[allow(dead_code)]
     pub(crate) fn profile(self) -> (u32, i32, i32, Duration) {
         match self {
             Self::Slow => (3, 45, 3, Duration::from_millis(260)),
             Self::Medium => (3, 75, 5, Duration::from_millis(180)),
             Self::Fast => (3, 110, 8, Duration::from_millis(120)),
+        }
+    }
+
+    pub(crate) fn target_viewports_per_sec(self) -> f32 {
+        match self {
+            Self::Slow => 1.2,
+            Self::Medium => 2.6,
+            Self::Fast => 4.8,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn target_fraction(self) -> f32 {
+        match self {
+            Self::Slow => 0.25,
+            Self::Medium => 0.38,
+            Self::Fast => 0.52,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn plan_step(
+        self,
+        active_h_px: u32,
+        scale: f32,
+        gain: f32,
+        rewind: bool,
+    ) -> StepPlan {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let active_pt = (active_h_px as f32 / scale).max(64.0);
+        let gain = gain.clamp(0.10, 2.5);
+        let target_frac = if rewind { 0.32 } else { self.target_fraction() };
+        let settle = if rewind {
+            Duration::from_millis(180)
+        } else {
+            match self {
+                Self::Slow => Duration::from_millis(240),
+                Self::Medium => Duration::from_millis(170),
+                Self::Fast => Duration::from_millis(120),
+            }
+        };
+
+        let desired_pt = (active_pt * target_frac * gain).clamp(24.0, active_pt * 0.58);
+        let mac_pulses = if desired_pt >= 120.0 {
+            4
+        } else if desired_pt >= 60.0 {
+            3
+        } else {
+            2
+        };
+        let mac_px_per_pulse = (desired_pt / mac_pulses as f32).round().max(12.0) as i32;
+
+        let desired_notches = ((active_pt * target_frac / 48.0) * gain)
+            .round()
+            .clamp(1.0, 12.0) as u32;
+        let win_notches_per_pulse = (desired_notches / 4).max(1) as i32;
+        let win_pulses = (desired_notches / win_notches_per_pulse as u32).clamp(1, 4);
+
+        StepPlan {
+            mac_pulses,
+            mac_px_per_pulse,
+            win_pulses,
+            win_notches_per_pulse,
+            settle,
+        }
+    }
+
+    pub(crate) fn plan_continuous(
+        self,
+        active_h_px: u32,
+        scale: f32,
+        gain: f32,
+        rewind: bool,
+    ) -> ContinuousStep {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let active_pt = (active_h_px as f32 / scale).max(64.0);
+        let gain = gain.clamp(0.10, 3.0);
+        let vps = if rewind {
+            1.8
+        } else {
+            self.target_viewports_per_sec()
+        };
+        let eval_window = if rewind {
+            Duration::from_millis(160)
+        } else {
+            match self {
+                Self::Slow => Duration::from_millis(260),
+                Self::Medium => Duration::from_millis(200),
+                Self::Fast => Duration::from_millis(160),
+            }
+        };
+
+        let mac_base_ms = if rewind {
+            24.0_f32
+        } else {
+            match self {
+                Self::Slow => 32.0,
+                Self::Medium => 20.0,
+                Self::Fast => 16.0,
+            }
+        };
+        let raw_px = active_pt * vps * gain * (mac_base_ms / 1000.0);
+        let max_px = (active_pt * 0.35).max(8.0);
+        let (mac_px, mac_interval) = if raw_px < 8.0 {
+            let ms = (mac_base_ms * (8.0 / raw_px.max(1.0)))
+                .round()
+                .clamp(mac_base_ms, 160.0) as u64;
+            (8, Duration::from_millis(ms))
+        } else {
+            (
+                raw_px.round().clamp(8.0, max_px) as i32,
+                Duration::from_millis(mac_base_ms as u64),
+            )
+        };
+
+        let win_base_ms = if rewind {
+            45.0_f32
+        } else {
+            match self {
+                Self::Slow => 72.0,
+                Self::Medium => 42.0,
+                Self::Fast => 28.0,
+            }
+        };
+        let raw_notches = (active_pt * vps / 60.0) * gain * (win_base_ms / 1000.0);
+        let max_notches = ((active_pt * 0.35) / 60.0).ceil().clamp(1.0, 4.0) as i32;
+        let (win_notches, win_interval) = if raw_notches < 1.0 {
+            let ms = (win_base_ms / raw_notches.max(0.15))
+                .round()
+                .clamp(win_base_ms, 240.0) as u64;
+            (1, Duration::from_millis(ms))
+        } else {
+            (
+                (raw_notches.round() as i32).clamp(1, max_notches),
+                Duration::from_millis(win_base_ms as u64),
+            )
+        };
+
+        ContinuousStep {
+            mac_px,
+            mac_interval,
+            win_notches,
+            win_interval,
+            eval_window,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepPlan {
+    pub mac_pulses: u32,
+    pub mac_px_per_pulse: i32,
+    pub win_pulses: u32,
+    pub win_notches_per_pulse: i32,
+    pub settle: Duration,
+}
+
+impl StepPlan {
+    #[allow(dead_code)]
+    pub(crate) fn platform_pulses(self) -> u32 {
+        #[cfg(target_os = "windows")]
+        {
+            self.win_pulses
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.mac_pulses
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContinuousStep {
+    pub mac_px: i32,
+    pub mac_interval: Duration,
+    pub win_notches: i32,
+    pub win_interval: Duration,
+    pub eval_window: Duration,
+}
+
+impl ContinuousStep {
+    pub(crate) fn platform_interval(self) -> Duration {
+        #[cfg(target_os = "windows")]
+        {
+            self.win_interval
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.mac_interval
         }
     }
 }
@@ -120,6 +319,31 @@ mod tests {
         assert_eq!(signed_scroll_pixels(ScrollDirection::Up, 24), 24);
         assert_eq!(signed_scroll_pixels(ScrollDirection::Down, 24), -24);
     }
+
+    #[test]
+    fn continuous_short_viewport_caps_mac_px_and_stretches_windows_interval() {
+        let step = ScrollSpeed::Fast.plan_continuous(200, 1.0, 1.0, false);
+        assert!(step.mac_px <= (200.0_f32 * 0.35).round() as i32);
+        assert_eq!(step.win_notches, 1);
+        assert!(step.win_interval > Duration::from_millis(28));
+    }
+
+    #[test]
+    fn continuous_tall_viewport_scales_with_speed_and_gain() {
+        let slow = ScrollSpeed::Slow.plan_continuous(1600, 2.0, 1.0, false);
+        let medium = ScrollSpeed::Medium.plan_continuous(1600, 2.0, 1.0, false);
+        let fast = ScrollSpeed::Fast.plan_continuous(1600, 2.0, 1.0, false);
+        let mac_rate = |s: ContinuousStep| s.mac_px as f32 / s.mac_interval.as_secs_f32();
+        let win_rate = |s: ContinuousStep| s.win_notches as f32 / s.win_interval.as_secs_f32();
+        assert!(mac_rate(slow) < mac_rate(medium));
+        assert!(mac_rate(medium) < mac_rate(fast));
+        assert!(win_rate(slow) < win_rate(medium));
+        assert!(win_rate(medium) < win_rate(fast));
+
+        let damped = ScrollSpeed::Medium.plan_continuous(1600, 2.0, 0.25, false);
+        assert!(mac_rate(damped) < mac_rate(medium));
+        assert!(win_rate(damped) < win_rate(medium));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -182,6 +406,13 @@ mod windows_tests {
             (65_526 << 16) | 40_000
         );
     }
+
+    #[test]
+    fn normal_zero_wheel_result_is_not_a_send_failure() {
+        assert!(wheel_result_succeeded(LRESULT(0), 0));
+        assert!(!wheel_result_succeeded(LRESULT(0), 5));
+        assert!(!wheel_result_succeeded(LRESULT(1), 0));
+    }
 }
 
 pub(crate) struct ScrollInputGuard {
@@ -225,12 +456,20 @@ impl Drop for ScrollInputGuard {
 /// anchor, pressed any mouse button, or pressed a non-modifier key.
 pub fn user_intervened(anchor: (f32, f32)) -> bool {
     if imp::any_button_down() || imp::keyboard_active() {
+        log::debug!("scroll auto-scroll intervention: mouse button or key active");
         return true;
     }
     let Some((x, y)) = imp::cursor_position() else {
         return false;
     };
-    (x - anchor.0).abs() > 20.0 || (y - anchor.1).abs() > 20.0
+    if (x - anchor.0).abs() > 20.0 || (y - anchor.1).abs() > 20.0 {
+        log::debug!(
+            "scroll auto-scroll intervention: cursor={x},{y} anchor={:?}",
+            anchor
+        );
+        return true;
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -338,9 +577,9 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{ScrollDirection, wheel_lparam, wheel_wparam};
+    use super::{ScrollDirection, wheel_lparam, wheel_result_succeeded, wheel_wparam};
     use windows::Win32::{
-        Foundation::{HWND, LRESULT, POINT, WPARAM},
+        Foundation::{GetLastError, HWND, POINT, SetLastError, WIN32_ERROR, WPARAM},
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_LMENU, VK_MBUTTON, VK_RBUTTON,
@@ -407,7 +646,8 @@ mod imp {
             return false;
         };
         unsafe {
-            SendMessageTimeoutW(
+            SetLastError(WIN32_ERROR(0));
+            let result = SendMessageTimeoutW(
                 hwnd,
                 WM_MOUSEWHEEL,
                 WPARAM(wheel_wparam(direction, notches)),
@@ -415,7 +655,8 @@ mod imp {
                 SMTO_ABORTIFHUNG,
                 120,
                 None,
-            ) != LRESULT(0)
+            );
+            wheel_result_succeeded(result, GetLastError().0)
         }
     }
 
@@ -440,6 +681,11 @@ mod imp {
                 || (GetAsyncKeyState(i32::from(VK_MBUTTON.0)) as u16 & 0x8000) != 0
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn wheel_result_succeeded(result: LRESULT, last_error: u32) -> bool {
+    result.0 == 0 && last_error == 0
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

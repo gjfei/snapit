@@ -4,15 +4,22 @@ use anyhow::{Context as _, Result, ensure};
 use snapit_capture::DiskImage;
 
 const SEGMENT_ROWS: u32 = 512;
+const HOT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_BYTES: usize = 32 * 1024 * 1024;
 const CACHE_ROWS: u32 = 256;
+
+#[derive(Clone)]
+enum SegmentData {
+    Memory(Vec<u8>),
+    Disk(DiskImage),
+}
 
 #[derive(Clone)]
 struct Segment {
     id: u64,
     start: i64,
     rows: u32,
-    image: DiskImage,
+    data: SegmentData,
 }
 
 #[derive(Clone)]
@@ -28,6 +35,7 @@ pub struct PagedRows {
     segments: Vec<Segment>,
     top: i64,
     rows: u32,
+    memory_bytes: usize,
     cache: VecDeque<CachedRows>,
     cache_bytes: usize,
     next_id: u64,
@@ -40,6 +48,7 @@ impl PagedRows {
             segments: Vec::new(),
             top: 0,
             rows: 0,
+            memory_bytes: 0,
             cache: VecDeque::new(),
             cache_bytes: 0,
             next_id: 1,
@@ -97,28 +106,29 @@ impl PagedRows {
         let mut index = self.segment_index(start)?;
         let mut done = 0u32;
         while done < rows {
-            let (id, image, segment_start, segment_rows) = {
+            let (id, segment_start, segment_rows) = {
                 let segment = &self.segments[index];
-                (
-                    segment.id,
-                    segment.image.clone(),
-                    segment.start,
-                    segment.rows,
-                )
+                (segment.id, segment.start, segment.rows)
             };
             let local = (i64::from(start) + i64::from(done) - segment_start) as u32;
             let take = (rows - done).min(segment_rows - local);
             let offset = done as usize * stride;
-            let source = image::RgbaImage::from_raw(
-                self.width,
-                take,
-                pixels[offset..offset + take as usize * stride].to_vec(),
-            )
-            .unwrap();
-            image
-                .write_rows_at(local, &source)
-                .context("failed to overwrite stitched rows")?;
-            self.invalidate_range(id, local, take);
+            let chunk = &pixels[offset..offset + take as usize * stride];
+            let disk = match &mut self.segments[index].data {
+                SegmentData::Memory(buf) => {
+                    let dst_start = local as usize * stride;
+                    buf[dst_start..dst_start + chunk.len()].copy_from_slice(chunk);
+                    None
+                }
+                SegmentData::Disk(image) => Some(image.clone()),
+            };
+            if let Some(image) = disk {
+                let source = image::RgbaImage::from_raw(self.width, take, chunk.to_vec()).unwrap();
+                image
+                    .write_rows_at(local, &source)
+                    .context("failed to overwrite stitched rows")?;
+                self.invalidate_range(id, local, take);
+            }
             done += take;
             if local + take == segment_rows {
                 index += 1;
@@ -163,68 +173,158 @@ impl PagedRows {
                 );
             }
         }
-        let mut made = Vec::new();
         let segment_rows = (8 * 1024 * 1024 / stride).clamp(1, SEGMENT_ROWS as usize) as u32;
-        for (chunk, bytes) in pixels.chunks(stride * segment_rows as usize).enumerate() {
-            let rows = (bytes.len() / stride) as u32;
-            let local_start = chunk as u32 * segment_rows;
-            let start = expected_top + i64::from(local_start);
-            let image = DiskImage::create(self.width, rows)?;
-            let full = image::RgbaImage::from_raw(self.width, rows, bytes.to_vec()).unwrap();
-            image
-                .write_rows_at(0, &full)
-                .context("failed to write stitched rows")?;
-            made.push(Segment {
-                id: self.next_id,
-                start,
-                rows,
-                image,
-            });
-            self.next_id += 1;
-        }
-        if self.is_empty() || prepend {
-            self.top = expected_top;
-        }
-        self.rows += count;
         if prepend {
-            let mut segments = made;
-            segments.append(&mut self.segments);
-            self.segments = segments;
+            let mut made = Vec::new();
+            for (chunk, bytes) in pixels.chunks(stride * segment_rows as usize).enumerate() {
+                let rows = (bytes.len() / stride) as u32;
+                let local_start = chunk as u32 * segment_rows;
+                let start = expected_top + i64::from(local_start);
+                made.push(Segment {
+                    id: self.next_id,
+                    start,
+                    rows,
+                    data: SegmentData::Memory(bytes.to_vec()),
+                });
+                self.next_id += 1;
+                self.memory_bytes += bytes.len();
+            }
+            self.top = expected_top;
+            self.rows += count;
+            made.append(&mut self.segments);
+            self.segments = made;
         } else {
-            self.segments.extend(made);
+            if self.is_empty() {
+                self.top = expected_top;
+            }
+            let mut remaining = pixels;
+            if let Some(last) = self.segments.last_mut()
+                && let SegmentData::Memory(buf) = &mut last.data
+                && last.rows < segment_rows
+            {
+                let room_rows = (segment_rows - last.rows) as usize;
+                let take_rows = room_rows.min(remaining.len() / stride);
+                if take_rows > 0 {
+                    let take_bytes = take_rows * stride;
+                    buf.extend_from_slice(&remaining[..take_bytes]);
+                    last.rows += take_rows as u32;
+                    self.memory_bytes += take_bytes;
+                    self.rows += take_rows as u32;
+                    remaining = &remaining[take_bytes..];
+                }
+            }
+            for bytes in remaining.chunks(stride * segment_rows as usize) {
+                let rows = (bytes.len() / stride) as u32;
+                let start = self.top + i64::from(self.rows);
+                self.segments.push(Segment {
+                    id: self.next_id,
+                    start,
+                    rows,
+                    data: SegmentData::Memory(bytes.to_vec()),
+                });
+                self.next_id += 1;
+                self.memory_bytes += bytes.len();
+                self.rows += rows;
+            }
+        }
+        self.spill_cold_segments(prepend)
+    }
+
+    fn spill_cold_segments(&mut self, prefer_keep_front: bool) -> Result<()> {
+        while self.memory_bytes > HOT_MEMORY_BYTES {
+            let len = self.segments.len();
+            let idx = if prefer_keep_front {
+                (1..len)
+                    .rev()
+                    .find(|&i| matches!(self.segments[i].data, SegmentData::Memory(_)))
+                    .or_else(|| {
+                        self.segments
+                            .iter()
+                            .rposition(|s| matches!(s.data, SegmentData::Memory(_)))
+                    })
+            } else {
+                (0..len.saturating_sub(1))
+                    .find(|&i| matches!(self.segments[i].data, SegmentData::Memory(_)))
+                    .or_else(|| {
+                        self.segments
+                            .iter()
+                            .position(|s| matches!(s.data, SegmentData::Memory(_)))
+                    })
+            };
+            let Some(idx) = idx else {
+                break;
+            };
+            let rows = self.segments[idx].rows;
+            let disk = DiskImage::create(self.width, rows)?;
+            let SegmentData::Memory(buf) = &mut self.segments[idx].data else {
+                unreachable!();
+            };
+            let taken = std::mem::take(buf);
+            let taken_len = taken.len();
+            let image = image::RgbaImage::from_raw(self.width, rows, taken)
+                .context("invalid memory segment buffer")?;
+            if let Err(err) = disk.write_rows_at(0, &image) {
+                *buf = image.into_raw();
+                return Err(err).context("failed to spill stitched segment to disk");
+            }
+            self.memory_bytes -= taken_len;
+            self.segments[idx].data = SegmentData::Disk(disk);
+        }
+        while self.cache_bytes + self.memory_bytes > CACHE_BYTES {
+            let Some(old) = self.cache.pop_front() else {
+                break;
+            };
+            self.cache_bytes -= old.bytes.len();
         }
         Ok(())
     }
 
     pub fn trim_top(&mut self, count: u32) -> Result<()> {
         let count = count.min(self.rows);
+        let stride = self.width as usize * 4;
         let mut left = count;
         let mut replacements = Vec::with_capacity(self.segments.len());
         let mut invalidated = Vec::new();
-        for segment in &self.segments {
+        for segment in std::mem::take(&mut self.segments) {
             if left == 0 {
-                replacements.push(segment.clone());
+                replacements.push(segment);
                 continue;
             }
             let take = left.min(segment.rows);
             if take == segment.rows {
-                invalidated.push(segment.id);
+                match segment.data {
+                    SegmentData::Memory(buf) => self.memory_bytes -= buf.len(),
+                    SegmentData::Disk(_) => invalidated.push(segment.id),
+                }
             } else {
-                let replacement = DiskImage::create(self.width, segment.rows - take)?;
-                let rows = segment
-                    .image
-                    .read_rows(take, segment.rows - take)?
-                    .into_raw();
-                let image =
-                    image::RgbaImage::from_raw(self.width, segment.rows - take, rows).unwrap();
-                replacement.write_rows_at(0, &image)?;
-                invalidated.push(segment.id);
-                replacements.push(Segment {
-                    id: segment.id,
-                    start: segment.start + i64::from(take),
-                    rows: segment.rows - take,
-                    image: replacement,
-                });
+                match segment.data {
+                    SegmentData::Memory(mut buf) => {
+                        let drop_bytes = take as usize * stride;
+                        buf.drain(..drop_bytes);
+                        self.memory_bytes -= drop_bytes;
+                        replacements.push(Segment {
+                            id: segment.id,
+                            start: segment.start + i64::from(take),
+                            rows: segment.rows - take,
+                            data: SegmentData::Memory(buf),
+                        });
+                    }
+                    SegmentData::Disk(disk) => {
+                        let replacement = DiskImage::create(self.width, segment.rows - take)?;
+                        let rows = disk.read_rows(take, segment.rows - take)?.into_raw();
+                        let image =
+                            image::RgbaImage::from_raw(self.width, segment.rows - take, rows)
+                                .unwrap();
+                        replacement.write_rows_at(0, &image)?;
+                        invalidated.push(segment.id);
+                        replacements.push(Segment {
+                            id: segment.id,
+                            start: segment.start + i64::from(take),
+                            rows: segment.rows - take,
+                            data: SegmentData::Disk(replacement),
+                        });
+                    }
+                }
             }
             left -= take;
         }
@@ -260,30 +360,52 @@ impl PagedRows {
 
     pub fn trim_bottom(&mut self, count: u32) -> Result<()> {
         let count = count.min(self.rows);
+        let stride = self.width as usize * 4;
         let mut left = count;
         let mut replacements = Vec::with_capacity(self.segments.len());
         let mut invalidated = Vec::new();
-        for segment in self.segments.iter().rev() {
+        for segment in std::mem::take(&mut self.segments).into_iter().rev() {
             if left == 0 {
-                replacements.push(segment.clone());
+                replacements.push(segment);
                 continue;
             }
             let take = left.min(segment.rows);
             if take == segment.rows {
-                invalidated.push(segment.id);
+                match segment.data {
+                    SegmentData::Memory(buf) => self.memory_bytes -= buf.len(),
+                    SegmentData::Disk(_) => invalidated.push(segment.id),
+                }
             } else {
-                let replacement = DiskImage::create(self.width, segment.rows - take)?;
-                let rows = segment.image.read_rows(0, segment.rows - take)?.into_raw();
-                let image =
-                    image::RgbaImage::from_raw(self.width, segment.rows - take, rows).unwrap();
-                replacement.write_rows_at(0, &image)?;
-                invalidated.push(segment.id);
-                replacements.push(Segment {
-                    id: segment.id,
-                    start: segment.start,
-                    rows: segment.rows - take,
-                    image: replacement,
-                });
+                match segment.data {
+                    SegmentData::Memory(mut buf) => {
+                        let keep_rows = segment.rows - take;
+                        let keep_bytes = keep_rows as usize * stride;
+                        let drop_bytes = buf.len() - keep_bytes;
+                        buf.truncate(keep_bytes);
+                        self.memory_bytes -= drop_bytes;
+                        replacements.push(Segment {
+                            id: segment.id,
+                            start: segment.start,
+                            rows: keep_rows,
+                            data: SegmentData::Memory(buf),
+                        });
+                    }
+                    SegmentData::Disk(disk) => {
+                        let replacement = DiskImage::create(self.width, segment.rows - take)?;
+                        let rows = disk.read_rows(0, segment.rows - take)?.into_raw();
+                        let image =
+                            image::RgbaImage::from_raw(self.width, segment.rows - take, rows)
+                                .unwrap();
+                        replacement.write_rows_at(0, &image)?;
+                        invalidated.push(segment.id);
+                        replacements.push(Segment {
+                            id: segment.id,
+                            start: segment.start,
+                            rows: segment.rows - take,
+                            data: SegmentData::Disk(replacement),
+                        });
+                    }
+                }
             }
             left -= take;
         }
@@ -310,23 +432,32 @@ impl PagedRows {
         let mut done = 0u32;
         let mut segment_index = index;
         while done < rows {
-            let (id, image, segment_start, segment_rows) = {
+            let (id, segment_start, segment_rows) = {
                 let segment = &self.segments[segment_index];
-                (
-                    segment.id,
-                    segment.image.clone(),
-                    segment.start,
-                    segment.rows,
-                )
+                (segment.id, segment.start, segment.rows)
             };
             let local = (i64::from(start) + i64::from(done) - segment_start).max(0) as u32;
-            let cache_left = CACHE_ROWS - local % CACHE_ROWS;
-            let take = (rows - done).min(segment_rows - local).min(cache_left);
-            let cached = self.cached(id, &image, local)?;
-            let src =
-                &cached.bytes[(local - cached.start) as usize * stride..][..take as usize * stride];
-            let dst = done as usize * stride..(done + take) as usize * stride;
-            output[dst].copy_from_slice(src);
+            let take = match &self.segments[segment_index].data {
+                SegmentData::Memory(buf) => {
+                    let take = (rows - done).min(segment_rows - local);
+                    let src_start = local as usize * stride;
+                    let src = &buf[src_start..src_start + take as usize * stride];
+                    let dst = done as usize * stride..(done + take) as usize * stride;
+                    output[dst].copy_from_slice(src);
+                    take
+                }
+                SegmentData::Disk(image) => {
+                    let image = image.clone();
+                    let cache_left = CACHE_ROWS - local % CACHE_ROWS;
+                    let take = (rows - done).min(segment_rows - local).min(cache_left);
+                    let cached = self.cached(id, &image, local)?;
+                    let src = &cached.bytes[(local - cached.start) as usize * stride..]
+                        [..take as usize * stride];
+                    let dst = done as usize * stride..(done + take) as usize * stride;
+                    output[dst].copy_from_slice(src);
+                    take
+                }
+            };
             done += take;
             if local + take == segment_rows {
                 segment_index += 1;
@@ -346,33 +477,24 @@ impl PagedRows {
         let mut start = self.top;
         for offset in (0..self.rows).step_by(rows_per_batch as usize) {
             let rows = rows_per_batch.min(self.rows - offset);
-            self.copy_to(
-                start as i32,
-                rows,
-                &mut buffer[..rows as usize * self.width as usize * 4],
-            )?;
-            let source = image::RgbaImage::from_raw(
-                self.width,
-                rows,
-                buffer[..rows as usize * self.width as usize * 4].to_vec(),
-            )
-            .unwrap();
-            image.write_rows_at(offset, &source)?;
+            let len = rows as usize * self.width as usize * 4;
+            self.copy_to(start as i32, rows, &mut buffer[..len])?;
+            image.write_raw_rows_at(offset, rows, &buffer[..len])?;
             start += i64::from(rows);
         }
         Ok(Some(image))
     }
 
     pub fn cached_bytes(&self) -> usize {
-        self.cache_bytes
+        self.cache_bytes + self.memory_bytes
     }
 
     fn segment_index(&self, y: i32) -> Result<usize> {
         let y = i64::from(y);
         let index = self
             .segments
-            .iter()
-            .rposition(|segment| segment.start <= y)
+            .partition_point(|segment| segment.start <= y)
+            .checked_sub(1)
             .context("missing canvas segment")?;
         let segment = self.segments.get(index).context("missing canvas segment")?;
         ensure!(
@@ -408,7 +530,7 @@ impl PagedRows {
             bytes: Arc::new(bytes),
         };
         self.cache.push_back(entry.clone());
-        while self.cache_bytes > CACHE_BYTES {
+        while self.cache_bytes + self.memory_bytes > CACHE_BYTES && self.cache.len() > 1 {
             let old = self.cache.pop_front().unwrap();
             self.cache_bytes -= old.bytes.len();
         }
@@ -528,6 +650,69 @@ mod tests {
         for y in (0..2048).rev() {
             rows.read_row(y).unwrap();
         }
+        assert!(rows.cached_bytes() <= CACHE_BYTES);
+    }
+
+    #[test]
+    fn small_downward_appends_coalesce_and_spill_cold_segments_to_disk() {
+        let width = 1024u32;
+        let stride = width as usize * 4;
+        let mut rows = PagedRows::new(width);
+        // 160 * 30 = 4800 rows * 4096 bytes ~= 19.6 MiB > HOT_MEMORY_BYTES (16 MiB).
+        for step in 0..30u32 {
+            let mut batch = Vec::with_capacity(160 * stride);
+            for local_y in 0..160u32 {
+                let y = step * 160 + local_y;
+                for _ in 0..width {
+                    batch.extend_from_slice(&[(y & 0xff) as u8, ((y >> 8) & 0xff) as u8, 77, 255]);
+                }
+            }
+            rows.append_down((step * 160) as i32, &batch).unwrap();
+            assert!(rows.cached_bytes() <= CACHE_BYTES);
+        }
+        assert!(rows.memory_bytes <= HOT_MEMORY_BYTES);
+        assert!(
+            rows.segments
+                .iter()
+                .any(|seg| matches!(seg.data, SegmentData::Disk(_)))
+        );
+        assert!(matches!(
+            rows.segments.last().unwrap().data,
+            SegmentData::Memory(_)
+        ));
+        for y in [0i32, 511, 512, 2400, 4799] {
+            let got = rows.read_row(y).unwrap();
+            assert_eq!(got[0], (y as u32 & 0xff) as u8);
+            assert_eq!(got[1], ((y as u32 >> 8) & 0xff) as u8);
+        }
+    }
+
+    #[test]
+    fn overwrite_and_read_across_spilled_disk_and_hot_memory_segments() {
+        let width = 1024u32;
+        let stride = width as usize * 4;
+        let mut rows = PagedRows::new(width);
+        for step in 0..25u32 {
+            let batch = vec![(step % 200) as u8; 200 * stride];
+            rows.append_down((step * 200) as i32, &batch).unwrap();
+        }
+        assert!(matches!(rows.segments[0].data, SegmentData::Disk(_)));
+        assert!(matches!(
+            rows.segments.last().unwrap().data,
+            SegmentData::Memory(_)
+        ));
+        // Warm disk cache around row 500, then overwrite across disk + memory boundary.
+        let _ = rows.read_row(500).unwrap();
+        let disk_end = rows
+            .segments
+            .iter()
+            .take_while(|seg| matches!(seg.data, SegmentData::Disk(_)))
+            .map(|seg| seg.rows)
+            .sum::<u32>() as i32;
+        let replacement = vec![222u8; 40 * stride];
+        rows.write_rows(disk_end - 20, 40, &replacement).unwrap();
+        assert_eq!(rows.read_row(disk_end - 20).unwrap()[0], 222);
+        assert_eq!(rows.read_row(disk_end + 19).unwrap()[0], 222);
         assert!(rows.cached_bytes() <= CACHE_BYTES);
     }
 }
