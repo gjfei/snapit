@@ -1,6 +1,10 @@
 //! A frozen-screen selection session shared by every overlay window.
 
-use std::{ops::Range, sync::Arc, time::Instant};
+use std::{
+    ops::Range,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use gpui_kit::{
@@ -341,6 +345,19 @@ fn bounds_close(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> bool {
         && close(a.origin.y.as_f32(), b.origin.y.as_f32())
         && close(a.size.width.as_f32(), b.size.width.as_f32())
         && close(a.size.height.as_f32(), b.size.height.as_f32())
+}
+
+const HOVER_WHEEL_INTERVAL: Duration = Duration::from_millis(120);
+
+fn wheel_step_allowed(
+    previous: Option<f32>,
+    delta: f32,
+    last_step: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let reversed = previous.is_some_and(|previous| previous.signum() != delta.signum());
+    reversed
+        || last_step.is_none_or(|last_step| now.duration_since(last_step) >= HOVER_WHEEL_INTERVAL)
 }
 
 /// Wheel dial: the first tick widens; a reversal toggles the direction and
@@ -684,6 +701,9 @@ pub struct CaptureSession {
     /// Sign of the last wheel scroll, paired with `hover_outward` to detect a
     /// reversal. The first scroll in either direction widens the preview.
     hover_scroll: Option<f32>,
+    /// Last accepted wheel level change. Trackpad momentum otherwise advances
+    /// several semantic levels from one gesture.
+    hover_wheel_at: Option<Instant>,
     /// The dial's current direction: true widens toward the parent, false
     /// narrows toward the child. A reversal flips it, and it then stays put
     /// until the wheel reverses again, so scrolling one way keeps narrowing.
@@ -875,6 +895,7 @@ impl CaptureSession {
             element_snap,
             hover: None,
             hover_scroll: None,
+            hover_wheel_at: None,
             hover_outward: true,
             element_cache: None,
             pending_hover: None,
@@ -1221,6 +1242,7 @@ impl CaptureSession {
             });
         self.hover = None;
         self.hover_scroll = None;
+        self.hover_wheel_at = None;
         self.hover_outward = true;
         self.element_cache = None;
         self.pending_hover = None;
@@ -1483,6 +1505,7 @@ impl CaptureSession {
             cx.notify();
         }
         self.hover_scroll = None;
+        self.hover_wheel_at = None;
         self.hover_outward = true;
     }
 
@@ -1617,6 +1640,7 @@ impl CaptureSession {
             .is_some_and(|hover| hover.window_id == window_id)
         {
             self.hover_scroll = None;
+            self.hover_wheel_at = None;
             self.hover_outward = true;
         }
         let level = if same_chain {
@@ -1650,10 +1674,9 @@ impl CaptureSession {
 
     /// Step the hover preview with the wheel. The wheel acts like a dial: the
     /// first scroll in either direction widens the preview to its parent, and
-    /// reversing it narrows back toward the smaller element. The chosen
-    /// direction persists across same-direction scrolls, so once reversed the
-    /// wheel keeps narrowing instead of flipping back outward every other
-    /// tick. Returns true when the hover handled the scroll.
+    /// reversing it narrows back toward the smaller element. Same-direction
+    /// level changes are paced so trackpad momentum cannot skip the chain;
+    /// reversals stay immediate. Returns true when the hover handled the scroll.
     pub fn cycle_hover(&mut self, frame_ix: usize, delta: f32, cx: &mut Context<Self>) -> bool {
         if !self
             .hover
@@ -1662,8 +1685,13 @@ impl CaptureSession {
         {
             return false;
         }
+        let now = Instant::now();
+        if !wheel_step_allowed(self.hover_scroll, delta, self.hover_wheel_at, now) {
+            return true;
+        }
         self.hover_outward = wheel_dial(self.hover_scroll, self.hover_outward, delta);
         self.hover_scroll = Some(delta);
+        self.hover_wheel_at = Some(now);
         let Some(hover) = self.hover.as_mut() else {
             return false;
         };
@@ -1944,6 +1972,61 @@ impl CaptureSession {
         Some(CropKey::new(Some(selection.frame_ix), selection.bounds()))
     }
 
+    /// Physical pixel `(width, height)` and maximum physical scale that
+    /// [`Self::crop_selections`] produces, without copying pixels.
+    pub fn selection_pixel_dimensions(&self) -> Option<(u32, u32, f32)> {
+        if let Some(composed) = &self.composed {
+            let (width, height) = composed.image.dimensions();
+            return Some((width, height, composed.scale));
+        }
+        let regions = self.frames_of(&self.committed_selections());
+        let (first_frame, first_bounds) = *regions.first()?;
+        if regions.len() == 1 {
+            let (width, height) = first_frame
+                .frame
+                .shot
+                .crop_dimensions(first_frame.to_region(first_bounds))?;
+            return Some((width, height, first_frame.physical_scale()));
+        }
+        if regions
+            .iter()
+            .all(|(frame, _)| frame.monitor_id() == first_frame.monitor_id())
+        {
+            let scale = first_frame.physical_scale();
+            let scale_safe = if scale > 0.0 { scale } else { 1.0 };
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_w = 0_u32;
+            let mut max_h = 0_u32;
+            for &(_, bounds) in &regions {
+                min_x = min_x.min(bounds.origin.x.as_f32());
+                min_y = min_y.min(bounds.origin.y.as_f32());
+            }
+            for (frame, bounds) in regions {
+                let (w, h) = frame.frame.shot.crop_dimensions(frame.to_region(bounds))?;
+                let ox = ((bounds.origin.x.as_f32() - min_x) * scale_safe)
+                    .round()
+                    .max(0.0) as u32;
+                let oy = ((bounds.origin.y.as_f32() - min_y) * scale_safe)
+                    .round()
+                    .max(0.0) as u32;
+                max_w = max_w.max(ox + w);
+                max_h = max_h.max(oy + h);
+            }
+            return Some((max_w.max(1), max_h.max(1), scale));
+        }
+        let mut max_w = 0_u32;
+        let mut total_h = 0_u32;
+        let mut scale = 0.1_f32;
+        for (frame, bounds) in regions {
+            let (w, h) = frame.frame.shot.crop_dimensions(frame.to_region(bounds))?;
+            max_w = max_w.max(w);
+            total_h = total_h.saturating_add(h);
+            scale = scale.max(frame.physical_scale());
+        }
+        Some((max_w.max(1), total_h.max(1), scale))
+    }
+
     /// Crop every committed region onto one image. Regions on the same display
     /// keep their on-screen positions over a transparent canvas; regions on
     /// different displays cannot share a coordinate space and are stitched
@@ -2084,11 +2167,13 @@ fn local_point(bounds: Bounds<Pixels>, position: Point<Pixels>) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::{
-        Hover, HoverElement, ResizeHandle, compose_at_positions, is_snappable, preferred_level,
-        preserved_level, region_bounds, resized_bounds, rgba_to_bgra, sample_block,
-        snap_window_region, stitch_vertical, swap_rgba_bgra_chunk, wheel_dial, window_index_at,
-        with_fullscreen_level,
+        HOVER_WHEEL_INTERVAL, Hover, HoverElement, ResizeHandle, compose_at_positions,
+        is_snappable, preferred_level, preserved_level, region_bounds, resized_bounds,
+        rgba_to_bgra, sample_block, snap_window_region, stitch_vertical, swap_rgba_bgra_chunk,
+        wheel_dial, wheel_step_allowed, window_index_at, with_fullscreen_level,
     };
     use gpui_kit::{Bounds, Pixels, point, px, size};
     use snapit_capture::{ElementRole, Region, RgbaImage, WindowInfo};
@@ -2120,6 +2205,30 @@ mod tests {
         // Reversing again widens.
         outward = wheel_dial(last, outward, -1.);
         assert!(outward);
+    }
+
+    #[test]
+    fn wheel_steps_are_paced_but_reversals_are_immediate() {
+        let now = Instant::now();
+        assert!(wheel_step_allowed(None, -1.0, None, now));
+        assert!(!wheel_step_allowed(
+            Some(-1.0),
+            -1.0,
+            Some(now),
+            now + HOVER_WHEEL_INTERVAL / 2
+        ));
+        assert!(wheel_step_allowed(
+            Some(-1.0),
+            -1.0,
+            Some(now),
+            now + HOVER_WHEEL_INTERVAL
+        ));
+        assert!(wheel_step_allowed(
+            Some(-1.0),
+            1.0,
+            Some(now),
+            now + HOVER_WHEEL_INTERVAL / 2
+        ));
     }
 
     #[test]

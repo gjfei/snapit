@@ -155,6 +155,16 @@ impl Screenshot {
         crop_pixels(&self.image, region.scaled(self.pixels_per_unit()))
     }
 
+    /// Physical pixel `(width, height)` that [`Self::crop`] would return for `region`.
+    pub fn crop_dimensions(&self, region: Region) -> Option<(u32, u32)> {
+        let (_, _, width, height) = pixel_rect(
+            region.scaled(self.pixels_per_unit()),
+            self.image.width(),
+            self.image.height(),
+        )?;
+        Some((width, height))
+    }
+
     /// Crop `region` (in monitor units) out of the HDR frame.
     pub fn crop_hdr(&self, region: Region) -> Option<HdrImage> {
         let hdr = self.hdr.as_ref()?;

@@ -17,6 +17,7 @@ mod annotate;
 mod appearance;
 mod assets;
 mod autostart;
+mod capture_toolbar;
 mod clipboard;
 mod controller;
 mod events;

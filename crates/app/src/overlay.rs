@@ -1,7 +1,7 @@
 //! Fullscreen, borderless, topmost window showing one monitor's frozen frame.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ops::Range,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -9,25 +9,24 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
-    h_flex,
-    slider::{Slider, SliderEvent, SliderState, SliderValue},
+    ActiveTheme as _,
+    color_picker::{ColorPickerEvent, ColorPickerState},
+    slider::{SliderEvent, SliderState, SliderValue},
     toolbar::Toolbar,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, AsyncApp, Bounds, BoxShadow, ClickEvent, ClipboardItem,
-    Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla,
+    AnyElement, App, AppContext as _, AsyncApp, Bounds, BoxShadow, ClipboardItem, Context,
+    CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point,
-    Render, RenderImage, Rgba, ScrollDelta, ScrollEvent, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, UTF16Selection,
-    WeakEntity, Window, actions, canvas, div, fill, img, point, prelude::FluentBuilder as _, px,
-    rgb, size,
+    Render, RenderImage, ScrollDelta, ScrollEvent, SharedString, Size, Styled as _,
+    StyledImage as _, Subscription, UTF16Selection, WeakEntity, Window, actions, canvas, div, fill,
+    img, point, prelude::FluentBuilder as _, px, rgb, size,
 };
 
-use crate::annotate::{self, Tool};
+use crate::annotate::{self, Layer};
+use crate::capture_toolbar;
+use crate::controller::Controller;
 use crate::session::{
     AnnotationPick, CaptureIntent, CaptureSession, CropKey, ResizeHandle, SessionCommand,
 };
@@ -149,10 +148,8 @@ pub struct OverlayView {
     size_shown: [f32; 7],
     /// Invalidates queued debounced writes when a newer edit arrives.
     persist_generation: u64,
-    /// The item the floating style panel is attached to: a picked shape on the
-    /// canvas, or the tool button whose defaults are being edited. Overlays
-    /// share one session across monitors, so the frame that opened it matters.
-    style_anchor: Option<StyleAnchor>,
+    /// Whether the inline annotation style bar below the toolbar is expanded.
+    style_open: bool,
     /// Resize handle under the idle cursor, used for the window cursor style.
     hover_handle: Option<ResizeHandle>,
     /// An annotation is under the idle cursor: a press would pick it.
@@ -172,11 +169,16 @@ pub struct OverlayView {
     /// The overlay has become the recording indicator: only this outline is
     /// drawn, everything else (frozen frame, mask, toolbar) stays off screen.
     recording: Option<Bounds<Pixels>>,
+    scroll_annotation: Option<WeakEntity<Controller>>,
+    scroll_pause_render: Option<(u64, Arc<RenderImage>)>,
+    _scroll_subscription: Option<Subscription>,
     /// Colors the live recording/scroll outline in warning color when active.
     live_warning: bool,
     /// Toolbar top-left after the user dragged it; `None` keeps the automatic
     /// placement below/above/beside the selection.
     toolbar_position: Option<Point<Pixels>>,
+    /// Exact rendered toolbar bounds, used for zero-jump drag start and clamping.
+    toolbar_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// In-progress toolbar drag.
     toolbar_drag: Option<ToolbarDrag>,
     _subscription: Subscription,
@@ -184,13 +186,12 @@ pub struct OverlayView {
     _size_subscriptions: Vec<Subscription>,
 }
 
-const TOOLBAR_HEIGHT: f32 = 34.;
+const TOOLBAR_HEIGHT: f32 = 36.;
+const STYLE_ROW_HEIGHT: f32 = 38.;
 /// Estimate of the one-row toolbar (seven annotation tools, scroll capture, two
-/// record buttons and the capture actions), used to right-align it and to keep
-/// the style panel off it.
-const TOOLBAR_WIDTH: f32 = 556.;
-const STYLE_PANEL_WIDTH: f32 = 300.;
-const STYLE_PANEL_HEIGHT: f32 = 82.;
+/// record buttons and the capture actions), used to right-align it and keep it
+/// inside the viewport.
+const TOOLBAR_WIDTH: f32 = 509.;
 const TOOLBAR_GAP: f32 = 8.;
 
 /// The frozen region's pixels and the block colours sampled from them, kept
@@ -217,25 +218,20 @@ struct ToolbarDrag {
     active: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct StyleAnchor {
-    frame_ix: usize,
-    bounds: Bounds<Pixels>,
-    /// Anchored to a picked shape (recomputed every render) instead of a
-    /// tool button, whose bounds are fixed until the panel closes.
-    shape: bool,
-}
-
 /// Top-left corner of the annotation toolbar for a committed selection.
-fn toolbar_origin(selection: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Point<Pixels> {
+fn toolbar_origin(
+    selection: Bounds<Pixels>,
+    viewport: Bounds<Pixels>,
+    toolbar_height: f32,
+) -> Point<Pixels> {
     let bottom = selection.origin.y + selection.size.height;
     let right = selection.origin.x + selection.size.width;
-    let top = if bottom + px(TOOLBAR_HEIGHT + TOOLBAR_GAP) <= viewport.size.height {
+    let top = if bottom + px(toolbar_height + TOOLBAR_GAP) <= viewport.size.height {
         bottom + px(TOOLBAR_GAP)
-    } else if selection.origin.y >= px(TOOLBAR_HEIGHT + TOOLBAR_GAP) {
-        selection.origin.y - px(TOOLBAR_HEIGHT + TOOLBAR_GAP)
+    } else if selection.origin.y >= px(toolbar_height + TOOLBAR_GAP) {
+        selection.origin.y - px(toolbar_height + TOOLBAR_GAP)
     } else {
-        bottom - px(TOOLBAR_HEIGHT + TOOLBAR_GAP)
+        (bottom - px(toolbar_height + TOOLBAR_GAP)).max(px(0.))
     };
     let left = if right >= px(TOOLBAR_WIDTH) {
         right - px(TOOLBAR_WIDTH)
@@ -245,73 +241,32 @@ fn toolbar_origin(selection: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Point<
     point(left, top)
 }
 
-/// Keep a dragged toolbar inside the overlay.
-fn clamp_toolbar_origin(origin: Point<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
-    let max_x = (viewport.width - px(TOOLBAR_WIDTH)).max(px(0.));
-    let max_y = (viewport.height - px(TOOLBAR_HEIGHT)).max(px(0.));
+/// Keep a dragged toolbar inside the overlay using its measured size.
+fn clamp_toolbar_origin_with_size(
+    origin: Point<Pixels>,
+    viewport: Size<Pixels>,
+    toolbar_size: Size<Pixels>,
+) -> Point<Pixels> {
+    let max_x = (viewport.width - toolbar_size.width).max(px(0.));
+    let max_y = (viewport.height - toolbar_size.height).max(px(0.));
     point(
         origin.x.max(px(0.)).min(max_x),
         origin.y.max(px(0.)).min(max_y),
     )
 }
 
-/// Place the style panel directly above the item being edited, or below it
-/// when there is no room (or when above would cover the toolbar). The panel
-/// stays centered on the item and clamped inside the overlay's viewport.
-fn style_panel_origin(
-    anchor: Bounds<Pixels>,
-    viewport: Bounds<Pixels>,
-    toolbar: Option<Bounds<Pixels>>,
+/// Keep a dragged toolbar inside the overlay.
+#[cfg_attr(not(test), allow(dead_code))]
+fn clamp_toolbar_origin(
+    origin: Point<Pixels>,
+    viewport: Size<Pixels>,
+    toolbar_height: f32,
 ) -> Point<Pixels> {
-    const GAP: f32 = 8.0;
-    const EDGE: f32 = 4.0;
-
-    let vw = viewport.size.width.as_f32();
-    let vh = viewport.size.height.as_f32();
-    let ax = anchor.origin.x.as_f32();
-    let ay = anchor.origin.y.as_f32();
-    let aw = anchor.size.width.as_f32();
-    let ah = anchor.size.height.as_f32();
-    let max_left = (vw - STYLE_PANEL_WIDTH - EDGE).max(EDGE);
-    let mut left = (ax + aw / 2.0 - STYLE_PANEL_WIDTH / 2.0).clamp(EDGE, max_left);
-    let max_top = (vh - STYLE_PANEL_HEIGHT - EDGE).max(EDGE);
-    let ideal_above = ay - STYLE_PANEL_HEIGHT - GAP;
-    let ideal_below = ay + ah + GAP;
-    let above = ideal_above.clamp(EDGE, max_top);
-    let below = ideal_below.clamp(EDGE, max_top);
-
-    let hits_toolbar = |left: f32, top: f32| {
-        toolbar.is_some_and(|bar| {
-            Bounds::new(
-                point(px(left), px(top)),
-                size(px(STYLE_PANEL_WIDTH), px(STYLE_PANEL_HEIGHT)),
-            )
-            .intersects(&bar)
-        })
-    };
-    // When the toolbar sits both above and below the item (a selection close
-    // to a screen edge), slide the panel sideways instead of covering it.
-    if hits_toolbar(left, above) && hits_toolbar(left, below) {
-        for candidate in [EDGE, max_left] {
-            if !hits_toolbar(candidate, above) || !hits_toolbar(candidate, below) {
-                left = candidate;
-                break;
-            }
-        }
-    }
-    let preferred_above = ideal_above >= EDGE || ideal_below + STYLE_PANEL_HEIGHT > vh - EDGE;
-    let top = if preferred_above {
-        if hits_toolbar(left, above) && !hits_toolbar(left, below) {
-            below
-        } else {
-            above
-        }
-    } else if hits_toolbar(left, below) && !hits_toolbar(left, above) {
-        above
-    } else {
-        below
-    };
-    point(px(left), px(top))
+    clamp_toolbar_origin_with_size(
+        origin,
+        viewport,
+        size(px(TOOLBAR_WIDTH), px(toolbar_height)),
+    )
 }
 
 impl OverlayView {
@@ -336,9 +291,15 @@ impl OverlayView {
                 let ColorPickerEvent::Change(Some(color)) = event else {
                     return;
                 };
-                let color = color_to_rgb(*color);
-                this.session
-                    .update(cx, |session, cx| session.set_annotation_color(color, cx));
+                let color = capture_toolbar::color_to_rgb(*color);
+                if let Some(controller) = this.scroll_controller() {
+                    controller.update(cx, |controller, cx| {
+                        controller.set_scroll_annotation_color(color, cx)
+                    });
+                } else {
+                    this.session
+                        .update(cx, |session, cx| session.set_annotation_color(color, cx));
+                }
                 this.schedule_style_persist(cx);
             });
         let mut size_sliders = Vec::new();
@@ -363,16 +324,26 @@ impl OverlayView {
                         _ => return,
                     };
                     let active = this
-                        .session
-                        .read(cx)
-                        .annotations()
-                        .active_tool()
-                        .style_index();
+                        .scroll_layer(cx)
+                        .map(|layer| layer.active_tool().style_index())
+                        .unwrap_or_else(|| {
+                            this.session
+                                .read(cx)
+                                .annotations()
+                                .active_tool()
+                                .style_index()
+                        });
                     if active != ix {
                         return;
                     }
-                    this.session
-                        .update(cx, |session, cx| session.set_annotation_size(value, cx));
+                    if let Some(controller) = this.scroll_controller() {
+                        controller.update(cx, |controller, cx| {
+                            controller.set_scroll_annotation_size(value, cx)
+                        });
+                    } else {
+                        this.session
+                            .update(cx, |session, cx| session.set_annotation_size(value, cx));
+                    }
                     if release {
                         this.flush_style_persist(cx);
                     } else {
@@ -393,7 +364,7 @@ impl OverlayView {
             color_shown: style_color,
             size_shown,
             persist_generation: 0,
-            style_anchor: None,
+            style_open: false,
             hover_handle: None,
             hover_shape: false,
             pointer: None,
@@ -401,8 +372,12 @@ impl OverlayView {
             watermark_preview: RefCell::new(None),
             toast: None,
             recording: None,
+            scroll_annotation: None,
+            scroll_pause_render: None,
+            _scroll_subscription: None,
             live_warning: false,
             toolbar_position: None,
+            toolbar_bounds: Rc::new(Cell::new(None)),
             toolbar_drag: None,
             _subscription: subscription,
             _color_subscription: color_subscription,
@@ -415,7 +390,10 @@ impl OverlayView {
     fn schedule_style_persist(&mut self, cx: &mut Context<Self>) {
         self.persist_generation = self.persist_generation.wrapping_add(1);
         // Restyling a picked shape changes no defaults: skip the disk write.
-        if self.session.read(cx).annotations().selected().is_some() {
+        if self
+            .scroll_layer(cx)
+            .is_some_and(|layer| layer.selected().is_some())
+        {
             return;
         }
         let generation = self.persist_generation;
@@ -435,15 +413,23 @@ impl OverlayView {
         // Always flush on release/exit: a default edited just before a shape
         // was picked may still be waiting in its debounce window.
         self.persist_generation = self.persist_generation.wrapping_add(1);
-        self.session
-            .update(cx, |session, cx| session.persist_annotation_defaults(cx));
+        if let Some(controller) = self.scroll_controller() {
+            controller.update(cx, |controller, cx| {
+                controller.persist_scroll_annotation_defaults(cx)
+            });
+        } else {
+            self.session
+                .update(cx, |session, cx| session.persist_annotation_defaults(cx));
+        }
     }
 
     /// Keep the palette chip and the active tool's slider in sync with the
     /// shape the toolbar is currently editing. `set_value` preserves the
     /// slider's drag state, so this is safe during a drag.
     fn sync_style_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (style, active_tool) = {
+        let (style, active_tool) = if let Some(layer) = self.scroll_layer(cx) {
+            (layer.style(), layer.active_tool())
+        } else {
             let annotations = self.session.read(cx).annotations();
             (annotations.style(), annotations.active_tool())
         };
@@ -498,17 +484,59 @@ impl OverlayView {
     ) {
         self.recording = Some(selection);
         self.live_warning = false;
-        self.style_anchor = None;
+        self.style_open = false;
         self.toast = None;
         self.hover_handle = None;
         self.hover_shape = false;
         self.pointer = None;
+        self.toolbar_bounds.set(None);
         // The window root paints the theme background behind this view; with
         // the frozen frame gone it would cover the whole live screen.
         gpui_kit::base::Root::update(window, cx, |root, _, cx| {
             root.style().background = Some(gpui_kit::transparent_black().into());
             cx.notify();
         });
+        crate::recording_bar::make_recording_window(window);
+        cx.notify();
+    }
+
+    pub fn enter_scroll_annotation(
+        &mut self,
+        controller: Entity<Controller>,
+        selection: Bounds<Pixels>,
+        toolbar_origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.recording = Some(selection);
+        self.live_warning = false;
+        self.style_open = false;
+        self.toast = None;
+        self.hover_handle = None;
+        self.hover_shape = false;
+        self.pointer = None;
+        self.toolbar_bounds.set(None);
+        self.toolbar_position = toolbar_origin;
+        self.toolbar_drag = None;
+        self._scroll_subscription = Some(cx.observe(&controller, |_, _, cx| cx.notify()));
+        self.scroll_annotation = Some(controller.downgrade());
+        crate::recording_bar::make_interactive_window(window);
+        self.focus_handle.focus(window, cx);
+        window.activate_window();
+        cx.notify();
+    }
+
+    pub fn exit_scroll_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._scroll_subscription = None;
+        self.scroll_annotation = None;
+        self.scroll_pause_render = None;
+        self.style_open = false;
+        self.color_picker
+            .update(cx, |state, cx| state.set_open(false, cx));
+        self.toolbar_position = None;
+        self.toolbar_bounds.set(None);
+        self.toolbar_drag = None;
+        self.focus_handle.focus(window, cx);
         crate::recording_bar::make_recording_window(window);
         cx.notify();
     }
@@ -527,14 +555,43 @@ impl OverlayView {
             return;
         }
         // Exiting the capture must not lose a style edit still in its debounce.
-        self.style_anchor = None;
+        self.style_open = false;
         self.flush_style_persist(cx);
         self.session
             .update(cx, |session, cx| session.request(command, cx));
     }
 
+    fn scroll_controller(&self) -> Option<Entity<Controller>> {
+        self.scroll_annotation.as_ref()?.upgrade()
+    }
+
+    fn scroll_layer(&self, cx: &App) -> Option<Layer> {
+        self.scroll_controller()?
+            .read(cx)
+            .scroll_annotations()
+            .cloned()
+    }
+
+    fn scroll_local(&self, position: Point<Pixels>, cx: &App) -> Option<[f32; 2]> {
+        let selection = self.recording?;
+        if !selection.contains(&position) {
+            return None;
+        }
+        let controller = self.scroll_controller()?;
+        let (origin_y, scale, _, _) = controller.read(cx).scroll_annotation_state()?;
+        Some([
+            ((position.x - selection.origin.x).as_f32()).clamp(0.0, selection.size.width.as_f32()),
+            ((position.y - selection.origin.y).as_f32() + origin_y as f32 / scale).clamp(
+                0.0,
+                selection.size.height.as_f32() + origin_y as f32 / scale,
+            ),
+        ])
+    }
+
     fn typing(&self, cx: &App) -> bool {
-        self.session.read(cx).annotations().is_typing()
+        self.scroll_layer(cx)
+            .map(|layer| layer.is_typing())
+            .unwrap_or_else(|| self.session.read(cx).annotations().is_typing())
     }
 
     /// A committed region ends the pre-selection helpers: the color loupe and
@@ -599,51 +656,6 @@ impl OverlayView {
         .detach();
     }
 
-    /// Window-space bounds of the picked annotation, so its style panel can
-    /// sit right next to the shape instead of at a fixed corner.
-    fn shape_style_anchor(&self, cx: &App) -> Option<Bounds<Pixels>> {
-        let session = self.session.read(cx);
-        let origin = session
-            .committed_selection()
-            .filter(|selection| selection.frame_ix() == self.frame_ix)?
-            .bounds()
-            .origin;
-        let (x, y, w, h) = session.annotations().selected_bounds()?;
-        Some(Bounds::new(
-            point(origin.x + px(x), origin.y + px(y)),
-            size(px(w), px(h)),
-        ))
-    }
-
-    /// Overlays on every monitor share one session, so an anchor may go stale
-    /// when another window changes the selection or clears the pick. Only a
-    /// still-live anchor belonging to this frame may render a panel.
-    fn live_style_anchor(&self, cx: &App) -> Option<Bounds<Pixels>> {
-        let anchor = self.style_anchor?;
-        if anchor.frame_ix != self.frame_ix {
-            return None;
-        }
-        {
-            let session = self.session.read(cx);
-            if !session
-                .committed_selection()
-                .is_some_and(|selection| selection.frame_ix() == self.frame_ix)
-            {
-                return None;
-            }
-            let annotations = session.annotations();
-            if anchor.shape && annotations.selected().is_none() {
-                return None;
-            }
-        }
-        if anchor.shape {
-            // Recompute so the panel follows the shape as its size changes.
-            self.shape_style_anchor(cx)
-        } else {
-            Some(anchor.bounds)
-        }
-    }
-
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -653,14 +665,27 @@ impl OverlayView {
         self.focus_handle.focus(window, cx);
         self.pointer = Some(event.position);
         cx.notify();
+        if self.scroll_annotation.is_some() {
+            if let Some(local) = self.scroll_local(event.position, cx)
+                && let Some(controller) = self.scroll_controller()
+            {
+                controller.update(cx, |controller, cx| {
+                    controller.begin_scroll_annotation(
+                        local[0],
+                        local[1],
+                        event.click_count >= 2,
+                        cx,
+                    )
+                });
+            }
+            return;
+        }
         let frame_ix = self.frame_ix;
-        // Any click outside the style panel dismisses it; picking a shape
-        // re-opens it attached to that shape.
-        self.style_anchor = None;
         if self.session.read(cx).collecting() {
             // Shift-click toggles regions instead of switching to resize or
             // annotation; a drag still adds one more rectangle.
             self.hover_handle = None;
+            self.style_open = false;
             if self.session.update(cx, |session, cx| {
                 session.remove_selection_at(frame_ix, event.position, cx)
             }) {
@@ -688,17 +713,12 @@ impl OverlayView {
             match picked {
                 AnnotationPick::Shape | AnnotationPick::Handle => {
                     self.hover_handle = None;
-                    self.style_anchor = self.shape_style_anchor(cx).map(|bounds| StyleAnchor {
-                        frame_ix,
-                        bounds,
-                        shape: true,
-                    });
                     return;
                 }
-                // The text box and caret replace the style panel while typing.
+                // The text box and caret replace the style row while typing.
                 AnnotationPick::Text => {
                     self.hover_handle = None;
-                    self.style_anchor = None;
+                    self.style_open = false;
                     return;
                 }
                 AnnotationPick::None => {}
@@ -754,6 +774,8 @@ impl OverlayView {
         // A new region gets the toolbar back at its automatic spot; a dragged
         // position only sticks for the region it was chosen for.
         self.toolbar_position = None;
+        self.toolbar_bounds.set(None);
+        self.style_open = false;
         self.session.update(cx, |session, cx| {
             session.begin_selection(frame_ix, event.position, add, cx)
         });
@@ -783,6 +805,65 @@ impl OverlayView {
         }
     }
 
+    fn handle_toolbar_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut drag) = self.toolbar_drag else {
+            return false;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.toolbar_drag = None;
+            cx.notify();
+            return true;
+        }
+        if !drag.active {
+            // A press without movement stays a button click.
+            let dx = (event.position.x - drag.press.x).as_f32().abs();
+            let dy = (event.position.y - drag.press.y).as_f32().abs();
+            if dx < 2.0 && dy < 2.0 {
+                return true;
+            }
+            drag.active = true;
+            self.style_open = false;
+        }
+        let bar_size = if self.scroll_annotation.is_some() {
+            size(
+                px(crate::scroll_bar::SCROLL_BAR_SIZE.0),
+                px(crate::scroll_bar::SCROLL_BAR_SIZE.1 + STYLE_ROW_HEIGHT),
+            )
+        } else {
+            let height = if self.session.read(cx).annotations().selected().is_some()
+                && !self.session.read(cx).multi_selection()
+            {
+                TOOLBAR_HEIGHT + STYLE_ROW_HEIGHT
+            } else {
+                TOOLBAR_HEIGHT
+            };
+            let width = self
+                .toolbar_bounds
+                .get()
+                .map_or(px(TOOLBAR_WIDTH), |bounds| bounds.size.width);
+            size(width, px(height))
+        };
+        let pos = clamp_toolbar_origin_with_size(
+            event.position - drag.grab,
+            window.viewport_size(),
+            bar_size,
+        );
+        self.toolbar_position = Some(pos);
+        if let Some(controller) = self.scroll_controller() {
+            controller.update(cx, |controller, _| {
+                controller.set_scroll_bar_local_origin(pos)
+            });
+        }
+        self.toolbar_drag = Some(drag);
+        cx.notify();
+        true
+    }
+
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -791,28 +872,18 @@ impl OverlayView {
     ) {
         // The magnifier follows every move, even while a range is being dragged.
         self.pointer = Some(event.position);
-        if let Some(mut drag) = self.toolbar_drag {
-            if event.pressed_button != Some(MouseButton::Left) {
-                self.toolbar_drag = None;
-                cx.notify();
-                return;
+        if self.handle_toolbar_drag_move(event, window, cx) {
+            return;
+        }
+        if self.scroll_annotation.is_some() {
+            if event.pressed_button == Some(MouseButton::Left)
+                && let Some(local) = self.scroll_local(event.position, cx)
+                && let Some(controller) = self.scroll_controller()
+            {
+                controller.update(cx, |controller, cx| {
+                    controller.move_scroll_annotation(local[0], local[1], cx)
+                });
             }
-            if !drag.active {
-                // A press without movement stays a button click.
-                let dx = (event.position.x - drag.press.x).as_f32().abs();
-                let dy = (event.position.y - drag.press.y).as_f32().abs();
-                if dx < 2.0 && dy < 2.0 {
-                    return;
-                }
-                drag.active = true;
-                self.style_anchor = None;
-            }
-            self.toolbar_position = Some(clamp_toolbar_origin(
-                event.position - drag.grab,
-                window.viewport_size(),
-            ));
-            self.toolbar_drag = Some(drag);
-            cx.notify();
             return;
         }
         // Only the pre-selection loupe and the Shift-collect preview put the
@@ -859,6 +930,12 @@ impl OverlayView {
         if self.toolbar_drag.take().is_some() {
             return;
         }
+        if self.scroll_annotation.is_some() {
+            if let Some(controller) = self.scroll_controller() {
+                controller.update(cx, |controller, cx| controller.end_scroll_annotation(cx));
+            }
+            return;
+        }
         if self.session.read(cx).is_resizing() {
             self.session
                 .update(cx, |session, cx| session.end_resize(cx));
@@ -888,6 +965,10 @@ impl OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scroll_annotation.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         #[cfg(target_os = "macos")]
         if control_key_held() && !event.modifiers.control {
             // GPUI rewrites ctrl+left down into a right down and clears the
@@ -902,7 +983,7 @@ impl OverlayView {
             return;
         }
         self.hover_handle = None;
-        self.style_anchor = None;
+        self.style_open = false;
         if self.session.read(cx).selection().is_some() {
             self.session
                 .update(cx, |session, cx| session.clear_selection(cx));
@@ -930,7 +1011,20 @@ impl OverlayView {
     /// The wheel widens the preview step by step, ending at the whole display.
     /// It works in either direction: the first scroll picks the direction and
     /// reversing it picks the smaller element again.
-    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_annotation.is_some() {
+            cx.stop_propagation();
+            let delta = event.delta.pixel_delta(window.line_height()).y.as_f32();
+            if delta != 0.0
+                && let Some(controller) = self.scroll_controller()
+            {
+                let scale = controller.read(cx).scroll_annotation_scale().unwrap_or(1.0);
+                controller.update(cx, |controller, cx| {
+                    controller.shift_scroll_annotation_origin(-(delta * scale) as i64, cx);
+                });
+            }
+            return;
+        }
         let delta = match event.delta {
             ScrollDelta::Pixels(delta) => delta.y.as_f32(),
             ScrollDelta::Lines(delta) => delta.y,
@@ -948,6 +1042,69 @@ impl OverlayView {
     }
 
     fn on_annotation_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_annotation.is_some() {
+            let Some(controller) = self.scroll_controller() else {
+                return;
+            };
+            let typing = controller
+                .read(cx)
+                .scroll_annotations()
+                .is_some_and(Layer::is_typing);
+            let stroke = &event.keystroke;
+            if stroke.modifiers.control || stroke.modifiers.platform {
+                if stroke.key.as_str() == "z" {
+                    controller.update(cx, |controller, cx| controller.undo_scroll_annotation(cx));
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            if !typing {
+                if !stroke.modifiers.function
+                    && !stroke.modifiers.alt
+                    && !stroke.modifiers.shift
+                    && matches!(stroke.key.as_str(), "backspace" | "delete")
+                {
+                    controller.update(cx, |controller, cx| controller.delete_scroll_annotation(cx));
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            let handled = match stroke.key.as_str() {
+                "backspace" | "delete" => {
+                    controller.update(cx, |controller, cx| {
+                        controller.backspace_scroll_annotation(cx)
+                    });
+                    true
+                }
+                "enter" => {
+                    controller.update(cx, |controller, cx| controller.commit_scroll_annotation(cx));
+                    true
+                }
+                "escape" => {
+                    controller.update(cx, |controller, cx| {
+                        controller.cancel_scroll_annotation_draft(cx)
+                    });
+                    true
+                }
+                _ => {
+                    if let Some(text) = stroke.key_char.as_deref()
+                        && !text.is_empty()
+                        && text.chars().all(|ch| !ch.is_control())
+                    {
+                        controller.update(cx, |controller, cx| {
+                            controller.insert_scroll_annotation_text(text, cx)
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if handled {
+                cx.stop_propagation();
+            }
+            return;
+        }
         let stroke = &event.keystroke;
         let plain = !stroke.modifiers.control
             && !stroke.modifiers.platform
@@ -960,7 +1117,7 @@ impl OverlayView {
                 && matches!(stroke.key.as_str(), "backspace" | "delete")
                 && self.session.read(cx).annotations().selected().is_some()
             {
-                self.style_anchor = None;
+                self.style_open = false;
                 self.session
                     .update(cx, |session, cx| session.delete_selected_annotation(cx));
                 cx.stop_propagation();
@@ -1131,169 +1288,17 @@ impl OverlayView {
             .collect()
     }
 
-    fn tool_button(
-        &self,
-        id: &'static str,
-        icon: LucideIcon,
-        label: String,
-        tool: Tool,
-        current: Tool,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        Button::new(id)
-            .ghost()
-            .icon(icon)
-            .tooltip(label.clone())
-            .accessibility_label(label)
-            .selected(current == tool)
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                // Clicking a tool edits that tool's defaults: the last drawn
-                // shape stays picked for style tweaks only while the panel
-                // stays where it was opened.
-                this.session.update(cx, |session, cx| {
-                    session.deselect_annotation(cx);
-                    session.set_annotation_tool(tool, cx);
-                });
-                // The clicked tool *is* the style trigger: no extra toolbar
-                // icon. The panel opens right above or below the button.
-                this.style_anchor = Some({
-                    let at = event.position();
-                    StyleAnchor {
-                        frame_ix: this.frame_ix,
-                        bounds: Bounds::new(
-                            point(at.x - px(14.), at.y - px(14.)),
-                            size(px(28.), px(28.)),
-                        ),
-                        shape: false,
-                    }
-                });
-                cx.notify();
-            }))
-    }
-
-    /// Style controls live in a panel anchored to the item being edited:
-    /// a picked shape on the canvas, or the tool button that was clicked.
-    /// Nothing is added to the toolbar row, so editing a style never widens it.
-    fn render_style_panel(
-        &self,
-        anchor: Bounds<Pixels>,
-        viewport: Bounds<Pixels>,
-        toolbar: Option<Bounds<Pixels>>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let annotations = self.session.read(cx).annotations();
-        let active = annotations.active_tool();
-        let style = annotations.style();
-        let picked = annotations.selected().is_some();
-        let slider_ix = active.style_index();
-        let uses_color = active.uses_color();
-        let size_label = t!("overlay.size_value", value = style.size.round() as u32).to_string();
-        let border = cx.theme().border;
-        let primary = cx.theme().primary;
-        let muted = cx.theme().muted_foreground;
-        let radius = cx.theme().radius;
-        let background = cx.theme().popover;
-        let foreground = cx.theme().popover_foreground;
-
-        let origin = style_panel_origin(anchor, viewport, toolbar);
-
-        let swatches = annotate::COLORS.into_iter().map(|color| {
-            let selected = (style.color & 0x00FF_FFFF) == color;
-            div()
-                .id(SharedString::from(format!("style-color-{color}")))
-                .size(px(18.))
-                .rounded(px(4.))
-                .bg(rgb(color))
-                .when(selected, |this| this.border_2().border_color(primary))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.session
-                        .update(cx, |session, cx| session.set_annotation_color(color, cx));
-                    this.schedule_style_persist(cx);
-                }))
-        });
-        let picker = ColorPicker::new(&self.color_picker)
-            .with_size(px(14.))
-            .accessibility_label(t!("overlay.style").to_string())
-            .featured_colors(
-                annotate::COLORS
-                    .into_iter()
-                    .map(|color| Hsla::from(rgb(color)))
-                    .collect(),
-            );
-        let slider = Slider::new(&self.size_sliders[slider_ix]).w(px(160.));
-        let size_caption = t!("overlay.size").to_string();
-
-        div()
-            .id("annotation-style-panel")
-            .absolute()
-            .left(origin.x)
-            .top(origin.y)
-            .w(px(STYLE_PANEL_WIDTH))
-            // Fixed height keeps the placement math (and toolbar avoidance)
-            // honest regardless of theme font sizes.
-            .h(px(STYLE_PANEL_HEIGHT))
-            .occlude()
-            .cursor_default()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .bg(background)
-            .text_color(foreground)
-            .border_1()
-            .border_color(border)
-            .rounded(radius)
-            .shadow_md()
-            .p_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .when(uses_color, |this| this.children(swatches).child(picker))
-                    .when(!uses_color, |this| {
-                        // Mosaic has no color; show a heading instead of a
-                        // second "Size" caption.
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(t!("overlay.style").to_string()),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .mt_2()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_xs().text_color(muted).child(size_caption))
-                    .child(slider)
-                    .child(div().text_xs().text_color(muted).child(size_label))
-                    .when(picked, |this| {
-                        this.child(
-                            Button::new("style-delete-annotation")
-                                .ghost()
-                                .small()
-                                .compact()
-                                .icon(LucideIcon::Trash)
-                                .tooltip(t!("overlay.delete").to_string())
-                                .accessibility_label(t!("overlay.delete").to_string())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.style_anchor = None;
-                                    this.session.update(cx, |session, cx| {
-                                        session.delete_selected_annotation(cx)
-                                    });
-                                })),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// The toolbar keeps the position the user dragged it to; otherwise it
     /// follows the selection.
-    fn toolbar_place(&self, selection: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Point<Pixels> {
+    fn toolbar_place(
+        &self,
+        selection: Bounds<Pixels>,
+        viewport: Bounds<Pixels>,
+        toolbar_size: Size<Pixels>,
+    ) -> Point<Pixels> {
         self.toolbar_position
-            .unwrap_or_else(|| toolbar_origin(selection, viewport))
+            .map(|pos| clamp_toolbar_origin_with_size(pos, viewport.size, toolbar_size))
+            .unwrap_or_else(|| toolbar_origin(selection, viewport, toolbar_size.height.as_f32()))
     }
 
     fn render_toolbar(
@@ -1302,22 +1307,44 @@ impl OverlayView {
         viewport: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // One row: annotation tools, then capture actions. Clicking a tool
-        // opens its style panel above the button, so no style icon is needed.
+        // Primary row: annotation tools, capture modes, then export actions.
+        // Clicking an annotation tool toggles or switches the attached inline
+        // style bar below; picking an existing annotation also reveals it.
         let session = self.session.read(cx);
-        let current = session.annotations().tool();
-        let can_undo = session.annotations().can_undo();
+        let annotations = session.annotations();
+        let current = annotations.tool();
+        let active_tool = annotations.active_tool();
+        let style_size = annotations.style().size;
+        let picked = annotations.selected().is_some();
+        let can_undo = annotations.can_undo();
         let multi = session.multi_selection();
         let composed = session.is_composed();
         let count = session.selection_count();
-        let origin = self.toolbar_place(selection, viewport);
+        let show_style = !multi && (self.style_open || picked);
+        let toolbar_height = if show_style {
+            TOOLBAR_HEIGHT + STYLE_ROW_HEIGHT
+        } else {
+            TOOLBAR_HEIGHT
+        };
+        let toolbar_width = self
+            .toolbar_bounds
+            .get()
+            .map_or(px(TOOLBAR_WIDTH), |bounds| bounds.size.width);
+        let origin =
+            self.toolbar_place(selection, viewport, size(toolbar_width, px(toolbar_height)));
         let right = selection.origin.x + selection.size.width;
         let anchored_right = right >= px(TOOLBAR_WIDTH);
         let moved = self.toolbar_position.is_some();
-        let border = cx.theme().border;
+        let theme = cx.theme().clone();
+        let overlay = cx.entity();
+        let toolbar_bounds = self.toolbar_bounds.clone();
 
         div()
             .id("selection-toolbar")
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(4.))
             .absolute()
             .map(|this| {
                 if moved {
@@ -1328,229 +1355,229 @@ impl OverlayView {
                     this.top(origin.y).left(selection.origin.x)
                 }
             })
-            .occlude()
-            // occlude 会截断 hover 命中，根节点的 crosshair 不再生效，工具栏自己声明。
-            .cursor_crosshair()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.toolbar_drag = Some(ToolbarDrag {
-                        grab: event.position - origin,
-                        press: event.position,
-                        active: false,
-                    });
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(cx.theme().radius)
-            .shadow_md()
             .child(
-                Toolbar::new("selection-actions")
-                    .when(multi, |this| {
-                        this.content(
-                            div()
-                                .px_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(t!("overlay.multi_selected", count = count).to_string()),
+                capture_toolbar::toolbar_card(&theme)
+                    .relative()
+                    .occlude()
+                    .cursor_default()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            let actual_origin = this
+                                .toolbar_bounds
+                                .get()
+                                .map_or(origin, |bounds| bounds.origin);
+                            this.toolbar_drag = Some(ToolbarDrag {
+                                grab: event.position - actual_origin,
+                                press: event.position,
+                                active: false,
+                            });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        if this.handle_toolbar_drag_move(event, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.toolbar_drag.take().is_some() {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        canvas(
+                            move |bounds, _, _| toolbar_bounds.set(Some(bounds)),
+                            |_, _, _, _| (),
                         )
-                        .content(div().w(px(1.)).h(px(16.)).bg(border).mx_1())
-                    })
-                    .when(!multi, |this| {
-                        this.child(self.tool_button(
-                            "tool-rect",
-                            LucideIcon::Square,
-                            t!("overlay.tool.rect").to_string(),
-                            Tool::Rect,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-arrow",
-                            LucideIcon::ArrowUpRight,
-                            t!("overlay.tool.arrow").to_string(),
-                            Tool::Arrow,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-line",
-                            LucideIcon::Minus,
-                            t!("overlay.tool.line").to_string(),
-                            Tool::Line,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-pen",
-                            LucideIcon::Pencil,
-                            t!("overlay.tool.pen").to_string(),
-                            Tool::Pen,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-mosaic",
-                            LucideIcon::Grid3x3,
-                            t!("overlay.tool.mosaic").to_string(),
-                            Tool::Mosaic,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-text",
-                            LucideIcon::Type,
-                            t!("overlay.tool.text").to_string(),
-                            Tool::Text,
-                            current,
-                            cx,
-                        ))
-                        .child(self.tool_button(
-                            "tool-step",
-                            LucideIcon::ListOrdered,
-                            t!("overlay.tool.step").to_string(),
-                            Tool::Step,
-                            current,
-                            cx,
-                        ))
-                        .content(div().w(px(1.)).h(px(16.)).bg(border).mx_1())
-                        .child(
-                            Button::new("undo-annotations")
-                                .ghost()
-                                .when(can_undo, |this| this.cursor_pointer())
-                                .icon(LucideIcon::Undo2)
-                                .tooltip(t!("overlay.undo").to_string())
-                                .accessibility_label(t!("overlay.undo").to_string())
-                                .disabled(!can_undo)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.style_anchor = None;
-                                    this.session
-                                        .update(cx, |session, cx| session.undo_annotations(cx));
-                                })),
-                        )
-                        .child(
-                            Button::new("clear-annotations")
-                                .ghost()
-                                .when(can_undo, |this| this.cursor_pointer())
-                                .icon(LucideIcon::Eraser)
-                                .tooltip(t!("overlay.clear").to_string())
-                                .accessibility_label(t!("overlay.clear").to_string())
-                                .disabled(!can_undo)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.style_anchor = None;
-                                    this.session
-                                        .update(cx, |session, cx| session.clear_annotations(cx));
-                                })),
-                        )
-                        .content(div().w(px(1.)).h(px(16.)).bg(border).mx_1())
-                    })
-                    .child(
-                        Button::new("scroll-capture")
-                            .ghost()
-                            .icon(LucideIcon::ScrollText)
-                            .tooltip(t!("overlay.scroll").to_string())
-                            .accessibility_label(t!("overlay.scroll").to_string())
-                            .disabled(multi || composed)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request(SessionCommand::Scroll, cx)
-                            })),
-                    )
-                    .child({
-                        let format = crate::controller::last_animation_format(cx);
-                        let label = t!(
-                            "overlay.record.animation_hint",
-                            format = crate::controller::format_label(format)
-                        )
-                        .to_string();
-                        Button::new("record-animation")
-                            .ghost()
-                            .icon(LucideIcon::Film)
-                            .tooltip(label.clone())
-                            .accessibility_label(label)
-                            .disabled(multi || composed)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.request(SessionCommand::Record(format), cx)
-                            }))
-                    })
-                    .child(
-                        Button::new("record-video")
-                            .ghost()
-                            .icon(LucideIcon::Video)
-                            .tooltip(t!("overlay.record.video").to_string())
-                            .accessibility_label(t!("overlay.record.video").to_string())
-                            .disabled(multi || composed)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request(SessionCommand::Record(RecordFormat::Mp4), cx)
-                            })),
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
                     )
                     .child(
-                        Button::new("recognize")
-                            .ghost()
-                            .icon(LucideIcon::ScanText)
-                            .tooltip(t!("overlay.ocr").to_string())
-                            .accessibility_label(t!("overlay.ocr").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request(SessionCommand::Recognize, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("pin")
-                            .ghost()
-                            .icon(LucideIcon::Pin)
-                            .tooltip(t!("overlay.pin").to_string())
-                            .accessibility_label(t!("overlay.pin").to_string())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.request(SessionCommand::Pin, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("save")
-                            .ghost()
-                            .icon(LucideIcon::Save)
-                            .tooltip(t!("overlay.save").to_string())
-                            .accessibility_label(t!("overlay.save").to_string())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.request(SessionCommand::Save, cx)
-                                }),
-                            ),
-                    )
-                    .child(
-                        Button::new("cancel")
-                            .ghost()
-                            .icon(IconName::Close)
-                            .tooltip(t!("overlay.cancel").to_string())
-                            .accessibility_label(t!("overlay.cancel").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request(SessionCommand::Cancel, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("copy")
-                            .primary()
-                            .icon(IconName::Copy)
-                            .tooltip(t!("overlay.copy").to_string())
-                            .accessibility_label(t!("overlay.copy").to_string())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.request(SessionCommand::Copy, cx)
-                                }),
-                            ),
+                        Toolbar::new("selection-actions")
+                            .when(multi, |this| {
+                                this.content(
+                                    div()
+                                        .px_2()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(
+                                            t!("overlay.multi_selected", count = count).to_string(),
+                                        ),
+                                )
+                                .content(capture_toolbar::toolbar_divider(&theme))
+                            })
+                            .when(!multi, |this| {
+                                let select_overlay = overlay.clone();
+                                let undo_overlay = overlay.clone();
+                                let clear_overlay = overlay.clone();
+                                let this = capture_toolbar::append_annotation_tools(
+                                    this,
+                                    "sel",
+                                    Some(current),
+                                    can_undo,
+                                    false,
+                                    &theme,
+                                    move |tool, _, _, cx| {
+                                        select_overlay.update(cx, |this, cx| {
+                                            let same = this.session.read(cx).annotations().tool()
+                                                == tool
+                                                && this
+                                                    .session
+                                                    .read(cx)
+                                                    .annotations()
+                                                    .selected()
+                                                    .is_none();
+                                            this.session.update(cx, |session, cx| {
+                                                session.deselect_annotation(cx);
+                                                session.set_annotation_tool(tool, cx);
+                                            });
+                                            this.style_open =
+                                                if same { !this.style_open } else { true };
+                                            cx.notify();
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        undo_overlay.update(cx, |this, cx| {
+                                            this.style_open = false;
+                                            this.session.update(cx, |session, cx| {
+                                                session.undo_annotations(cx)
+                                            });
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        clear_overlay.update(cx, |this, cx| {
+                                            this.style_open = false;
+                                            this.session.update(cx, |session, cx| {
+                                                session.clear_annotations(cx)
+                                            });
+                                        });
+                                    },
+                                );
+                                this.content(capture_toolbar::toolbar_divider(&theme))
+                            })
+                            .child(
+                                capture_toolbar::toolbar_button(
+                                    "scroll-capture",
+                                    LucideIcon::ScrollText,
+                                    t!("overlay.scroll").to_string(),
+                                    false,
+                                    multi || composed,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.request(SessionCommand::Scroll, cx),
+                                )),
+                            )
+                            .child({
+                                let format = crate::controller::last_animation_format(cx);
+                                let label = t!(
+                                    "overlay.record.animation_hint",
+                                    format = crate::controller::format_label(format)
+                                )
+                                .to_string();
+                                capture_toolbar::toolbar_button(
+                                    "record-animation",
+                                    LucideIcon::Film,
+                                    label,
+                                    false,
+                                    multi || composed,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.request(SessionCommand::Record(format), cx)
+                                    },
+                                ))
+                            })
+                            .child(
+                                capture_toolbar::toolbar_button(
+                                    "record-video",
+                                    LucideIcon::Video,
+                                    t!("overlay.record.video").to_string(),
+                                    false,
+                                    multi || composed,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.request(SessionCommand::Record(RecordFormat::Mp4), cx)
+                                    },
+                                )),
+                            )
+                            .content(capture_toolbar::toolbar_divider(&theme))
+                            .map(|toolbar| {
+                                let ocr_overlay = overlay.clone();
+                                let pin_overlay = overlay.clone();
+                                let save_overlay = overlay.clone();
+                                let cancel_overlay = overlay.clone();
+                                let copy_overlay = overlay.clone();
+                                capture_toolbar::append_export_actions(
+                                    toolbar,
+                                    "sel",
+                                    capture_toolbar::ExportActionLabels::overlay(),
+                                    false,
+                                    false,
+                                    move |_, _, cx| {
+                                        ocr_overlay.update(cx, |this, cx| {
+                                            this.request(SessionCommand::Recognize, cx)
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        pin_overlay.update(cx, |this, cx| {
+                                            this.request(SessionCommand::Pin, cx)
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        save_overlay.update(cx, |this, cx| {
+                                            this.request(SessionCommand::Save, cx)
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        cancel_overlay.update(cx, |this, cx| {
+                                            this.request(SessionCommand::Cancel, cx)
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        copy_overlay.update(cx, |this, cx| {
+                                            this.request(SessionCommand::Copy, cx)
+                                        });
+                                    },
+                                )
+                            }),
                     ),
             )
+            .when(show_style, |this| {
+                let delete_overlay = overlay.clone();
+                let on_delete = picked.then(|| -> capture_toolbar::DeleteHandler {
+                    Box::new(move |_, _, cx| {
+                        delete_overlay.update(cx, |this, cx| {
+                            this.style_open = false;
+                            this.session
+                                .update(cx, |session, cx| session.delete_selected_annotation(cx));
+                        });
+                    })
+                });
+                this.child(
+                    capture_toolbar::toolbar_card(&theme)
+                        .occlude()
+                        .cursor_default()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .child(capture_toolbar::render_annotation_style_bar(
+                            "sel-style",
+                            active_tool,
+                            style_size,
+                            &self.color_picker,
+                            &self.size_sliders[active_tool.style_index()],
+                            on_delete,
+                            &theme,
+                        )),
+                )
+            })
     }
-}
-
-/// `ColorPicker` 用 HSLA，标注颜色按不透明 RGB 存储。
-fn color_to_rgb(color: Hsla) -> u32 {
-    let rgba = Rgba::from(color);
-    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
-    (channel(rgba.r) << 16) | (channel(rgba.g) << 8) | channel(rgba.b)
 }
 
 /// Dim-mask color from the configured opacity (0-100). A plain black with the
@@ -1865,6 +1892,14 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(controller) = self.scroll_controller() {
+            let (text, range) = controller
+                .read(cx)
+                .scroll_annotations()?
+                .text_for_range(range_utf16)?;
+            *actual_range = Some(range);
+            return Some(text);
+        }
         let (text, range) = self
             .session
             .read(cx)
@@ -1880,6 +1915,16 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(controller) = self.scroll_controller() {
+            let end = controller
+                .read(cx)
+                .scroll_annotations()?
+                .text_length_utf16()?;
+            return Some(UTF16Selection {
+                range: end..end,
+                reversed: false,
+            });
+        }
         let end = self.session.read(cx).annotations().text_length_utf16()?;
         Some(UTF16Selection {
             range: end..end,
@@ -1888,12 +1933,24 @@ impl EntityInputHandler for OverlayView {
     }
 
     fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        if let Some(controller) = self.scroll_controller() {
+            return controller
+                .read(cx)
+                .scroll_annotations()?
+                .marked_text_range();
+        }
         self.session.read(cx).annotations().marked_text_range()
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.session
-            .update(cx, |session, cx| session.annotation_unmark_text(cx));
+        if let Some(controller) = self.scroll_controller() {
+            controller.update(cx, |controller, cx| {
+                controller.unmark_scroll_annotation_text(cx)
+            });
+        } else {
+            self.session
+                .update(cx, |session, cx| session.annotation_unmark_text(cx));
+        }
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -1905,9 +1962,15 @@ impl EntityInputHandler for OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.session.update(cx, |session, cx| {
-            session.annotation_replace_text(range_utf16, text, cx)
-        });
+        if let Some(controller) = self.scroll_controller() {
+            controller.update(cx, |controller, cx| {
+                controller.replace_scroll_annotation_text(range_utf16, text, cx)
+            });
+        } else {
+            self.session.update(cx, |session, cx| {
+                session.annotation_replace_text(range_utf16, text, cx)
+            });
+        }
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -1920,9 +1983,15 @@ impl EntityInputHandler for OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.session.update(cx, |session, cx| {
-            session.annotation_replace_and_mark_text(range_utf16, new_text, cx)
-        });
+        if let Some(controller) = self.scroll_controller() {
+            controller.update(cx, |controller, cx| {
+                controller.replace_and_mark_scroll_annotation_text(range_utf16, new_text, cx)
+            });
+        } else {
+            self.session.update(cx, |session, cx| {
+                session.annotation_replace_and_mark_text(range_utf16, new_text, cx)
+            });
+        }
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -1934,6 +2003,17 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(controller) = self.scroll_controller() {
+            let (origin_y, scale, _, _) = controller.read(cx).scroll_annotation_state()?;
+            let annotations = controller.read(cx).scroll_annotations()?;
+            let at = annotations.draft_origin()?;
+            let font_size = annotations.draft_style().map_or(16.0, |style| style.size);
+            let origin = point(
+                element_bounds.origin.x + px(at[0]),
+                element_bounds.origin.y + px(at[1] - origin_y as f32 / scale),
+            );
+            return Some(Bounds::new(origin, size(px(1.), px(font_size))));
+        }
         let annotations = self.session.read(cx).annotations();
         let at = annotations.draft_origin()?;
         let font_size = annotations.draft_style().map_or(16.0, |style| style.size);
@@ -1961,31 +2041,28 @@ impl OverlayView {
         composed: bool,
         cx: &App,
     ) -> Option<Arc<RenderImage>> {
-        let config = AppSettings::get(cx).watermark.clone();
-        if !config.enabled
-            || !config.target_enabled(WatermarkTarget::Screenshot)
-            || (multi && !composed)
-        {
+        let config = &AppSettings::get(cx).watermark;
+        if !config.target_enabled(WatermarkTarget::Screenshot) || (multi && !composed) {
             self.watermark_preview.borrow_mut().take();
             return None;
         }
-        let Some(preset) = config.preset(WatermarkTarget::Screenshot).cloned() else {
+        let Some(preset) = config.preset(WatermarkTarget::Screenshot) else {
             self.watermark_preview.borrow_mut().take();
             return None;
         };
         let session = self.session.read(cx);
         let key = session.crop_key()?;
         if let Some(cached) = self.watermark_preview.borrow().as_ref()
-            && cached.key == (key, preset.clone())
+            && cached.key.0 == key
+            && cached.key.1 == *preset
         {
             return cached.result.clone().ok().flatten();
         }
+        let preset = preset.clone();
         let result = (|| -> std::result::Result<Option<Arc<RenderImage>>, String> {
-            let (crop, _, scale) = session
-                .crop_selections()
+            let (width, height, scale) = session
+                .selection_pixel_dimensions()
                 .ok_or_else(|| "selection pixels are unavailable".to_string())?;
-            let (width, height) = crop.dimensions();
-            drop(crop);
             let spec = crate::export::watermark_spec(&preset, AppSettings::watermark_dir(cx))
                 .map_err(|err| err.to_string())?;
             let layer = spec
@@ -2010,9 +2087,317 @@ impl OverlayView {
     }
 }
 
+impl OverlayView {
+    fn render_scroll_annotation(
+        &mut self,
+        selection: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(controller) = self.scroll_controller() else {
+            return recording_frame(
+                selection,
+                Bounds::new(Default::default(), window.viewport_size()),
+                window.scale_factor(),
+                false,
+                cx,
+            );
+        };
+        self.sync_style_controls(window, cx);
+        let Some((origin_y, scale, paused, revision)) =
+            controller.read(cx).scroll_annotation_state()
+        else {
+            return recording_frame(
+                selection,
+                Bounds::new(Default::default(), window.viewport_size()),
+                window.scale_factor(),
+                false,
+                cx,
+            );
+        };
+        let Some(layer) = controller.read(cx).scroll_annotations().cloned() else {
+            return div().into_any_element();
+        };
+        let Some(snap) = controller.read(cx).scroll_snapshot() else {
+            return div().into_any_element();
+        };
+        let preview_visible = controller.read(cx).is_scroll_preview_visible();
+        let finishing = controller.read(cx).is_finishing_scroll();
+        let can_act = !finishing;
+        let can_export = snap.started && !finishing;
+        let viewport = Bounds::new(Default::default(), window.viewport_size());
+        let theme = cx.theme().clone();
+        let current = layer.tool();
+        let can_undo = layer.can_undo();
+        let style = layer.style();
+        let active = layer.active_tool();
+        let picked = layer.selected().is_some();
+        let bar_size = size(
+            px(crate::scroll_bar::SCROLL_BAR_SIZE.0),
+            px(crate::scroll_bar::SCROLL_BAR_SIZE.1 + STYLE_ROW_HEIGHT),
+        );
+        let fallback_origin = controller
+            .read(cx)
+            .scroll_bar_local_origin()
+            .unwrap_or_else(|| toolbar_origin(selection, viewport, bar_size.height.as_f32()));
+        let bar_origin = clamp_toolbar_origin_with_size(
+            self.toolbar_position.unwrap_or(fallback_origin),
+            viewport.size,
+            bar_size,
+        );
+        let render_image = match &self.scroll_pause_render {
+            Some((cached_rev, cached_img)) if *cached_rev == revision => cached_img.clone(),
+            _ => {
+                let image = crate::session::render_image(&paused);
+                self.scroll_pause_render = Some((revision, image.clone()));
+                image
+            }
+        };
+        let paint_cache = self.paint_cache.clone();
+        let overlay = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+        let canvas_layer = layer.clone();
+        let canvas_origin_y = origin_y;
+        let canvas_scale = scale;
+        let canvas_paused = paused.clone();
+        let canvas_revision = revision;
+        let width = paused.width() as f32 / scale;
+        let height = paused.height() as f32 / scale;
+
+        let select_controller = controller.clone();
+        let drag_overlay = overlay.clone();
+        let on_delete = picked.then(|| -> capture_toolbar::DeleteHandler {
+            let controller = controller.clone();
+            Box::new(move |_, _, cx| {
+                controller.update(cx, |controller, cx| controller.delete_scroll_annotation(cx));
+            })
+        });
+        let style_card = capture_toolbar::toolbar_card(&theme)
+            .occlude()
+            .cursor_default()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(capture_toolbar::render_annotation_style_bar(
+                "scroll-ann-style",
+                active,
+                style.size,
+                &self.color_picker,
+                &self.size_sliders[active.style_index()],
+                on_delete,
+                &theme,
+            ));
+        let bar_card = crate::scroll_bar::render_scroll_bar_card(
+            controller.clone(),
+            &snap,
+            Some(current),
+            preview_visible,
+            can_act,
+            can_export,
+            can_undo,
+            "scroll-ann-bar",
+            move |tool, _, _, cx| {
+                let should_finish = {
+                    let layer = select_controller.read(cx).scroll_annotations();
+                    layer.is_some_and(|l| l.tool() == tool && l.selected().is_none())
+                };
+                select_controller.update(cx, |controller, cx| {
+                    if should_finish {
+                        controller.finish_scroll_annotation(cx);
+                    } else {
+                        controller.set_scroll_annotation_tool(tool, cx);
+                    }
+                });
+            },
+            move |event, _, cx| {
+                drag_overlay.update(cx, |this, _| {
+                    this.toolbar_drag = Some(ToolbarDrag {
+                        grab: event.position - bar_origin,
+                        press: event.position,
+                        active: false,
+                    });
+                });
+                cx.stop_propagation();
+            },
+            None,
+            &theme,
+        )
+        .shadow_md()
+        .occlude()
+        .cursor_default()
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+            if this.handle_toolbar_drag_move(event, window, cx) {
+                cx.stop_propagation();
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.toolbar_drag.take().is_some() {
+                    cx.notify();
+                }
+            }),
+        );
+        let annotation_bar = div()
+            .id("scroll-annotation-bar")
+            .absolute()
+            .left(bar_origin.x)
+            .top(bar_origin.y)
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(4.))
+            .child(bar_card)
+            .child(style_card);
+
+        div()
+            .id("scroll-annotation-overlay")
+            .key_context(CONTEXT)
+            .track_focus(&self.focus_handle)
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .cursor_crosshair()
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| {
+                let Some(controller) = this.scroll_controller() else {
+                    return;
+                };
+                if controller
+                    .read(cx)
+                    .scroll_annotations()
+                    .is_some_and(Layer::is_typing)
+                {
+                    controller.update(cx, |controller, cx| {
+                        controller.cancel_scroll_annotation_draft(cx)
+                    });
+                } else {
+                    controller.update(cx, |controller, cx| controller.finish_scroll_annotation(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ConfirmSelection, _, cx| {
+                let Some(controller) = this.scroll_controller() else {
+                    return;
+                };
+                if controller
+                    .read(cx)
+                    .scroll_annotations()
+                    .is_some_and(Layer::is_typing)
+                {
+                    controller.update(cx, |controller, cx| controller.commit_scroll_annotation(cx));
+                } else {
+                    controller.update(cx, |controller, cx| controller.finish_scroll_annotation(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &UndoAnnotations, _, cx| {
+                if let Some(controller) = this.scroll_controller() {
+                    controller.update(cx, |controller, cx| controller.undo_scroll_annotation(cx));
+                }
+            }))
+            .on_key_down(cx.listener(Self::on_annotation_key))
+            .on_scroll(cx.listener(Self::on_scroll))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_right_mouse_up))
+            .child(recording_frame(selection, viewport, scale, false, cx))
+            .child(
+                div()
+                    .absolute()
+                    .left(selection.origin.x)
+                    .top(selection.origin.y)
+                    .w(selection.size.width)
+                    .h(selection.size.height)
+                    .overflow_hidden()
+                    .child(
+                        img(render_image)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(ObjectFit::Fill),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, cx| {
+                                let clip = [
+                                    0.0,
+                                    canvas_origin_y as f32 / canvas_scale,
+                                    width,
+                                    canvas_origin_y as f32 / canvas_scale + height,
+                                ];
+                                let source = canvas_layer.needs_source().then(|| {
+                                    annotate::MosaicSource::source_at_with_ratio(
+                                        &canvas_paused,
+                                        canvas_revision,
+                                        [0.0, canvas_origin_y as f32 / canvas_scale],
+                                        canvas_scale,
+                                    )
+                                });
+                                let mut cache = paint_cache.lock().ok();
+                                let mut fallback = annotate::MosaicCache::default();
+                                let mosaics = cache
+                                    .as_deref_mut()
+                                    .map_or(&mut fallback, |cache| &mut cache.mosaics);
+                                annotate::paint_layer_zoomed_clipped(
+                                    &canvas_layer,
+                                    bounds.origin
+                                        - point(px(0.), px(canvas_origin_y as f32 / canvas_scale)),
+                                    canvas_scale,
+                                    1.0,
+                                    clip,
+                                    source,
+                                    mosaics,
+                                    window,
+                                    cx,
+                                );
+                                if canvas_layer.is_typing() {
+                                    window.handle_input(
+                                        &focus_handle,
+                                        ElementInputHandler::new(bounds, overlay.clone()),
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    ),
+            )
+            .child(annotation_bar)
+            .when(self.toolbar_drag.is_some_and(|drag| drag.active), |this| {
+                this.child(
+                    div()
+                        .id("toolbar-drag-shield")
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .cursor_grabbing()
+                        .on_mouse_move(cx.listener(|this, event, window, cx| {
+                            this.handle_toolbar_drag_move(event, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.toolbar_drag = None;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(selection) = self.recording {
+            if self.scroll_annotation.is_some() {
+                return self.render_scroll_annotation(selection, window, cx);
+            }
             let viewport = Bounds::new(Default::default(), window.viewport_size());
             return recording_frame(
                 selection,
@@ -2023,10 +2408,6 @@ impl Render for OverlayView {
             );
         }
         self.sync_style_controls(window, cx);
-        let style_anchor = self.live_style_anchor(cx);
-        if style_anchor.is_none() {
-            self.style_anchor = None;
-        }
         let session = self.session.read(cx);
         let Some(frame) = session.frame(self.frame_ix) else {
             return div().into_any_element();
@@ -2135,7 +2516,7 @@ impl Render for OverlayView {
             .cursor(cursor)
             .on_action(cx.listener(|this, _: &Cancel, _, cx| {
                 if this.typing(cx) {
-                    this.style_anchor = None;
+                    this.style_open = false;
                     this.session
                         .update(cx, |session, cx| session.cancel_annotation_draft(cx));
                     return;
@@ -2146,7 +2527,7 @@ impl Render for OverlayView {
             }))
             .on_action(cx.listener(|this, _: &ConfirmSelection, _, cx| {
                 if this.typing(cx) {
-                    this.style_anchor = None;
+                    this.style_open = false;
                     this.session
                         .update(cx, |session, _| session.finish_annotations());
                     cx.notify();
@@ -2192,12 +2573,12 @@ impl Render for OverlayView {
                 this.request(SessionCommand::Record(RecordFormat::Mp4), cx)
             }))
             .on_action(cx.listener(|this, _: &UndoAnnotations, _, cx| {
-                this.style_anchor = None;
+                this.style_open = false;
                 this.session
                     .update(cx, |session, cx| session.undo_annotations(cx));
             }))
             .on_action(cx.listener(|this, _: &ClearAnnotations, _, cx| {
-                this.style_anchor = None;
+                this.style_open = false;
                 this.session
                     .update(cx, |session, cx| session.clear_annotations(cx));
             }))
@@ -2208,7 +2589,7 @@ impl Render for OverlayView {
                     return;
                 }
                 let frame_ix = this.frame_ix;
-                this.style_anchor = None;
+                this.style_open = false;
                 this.session
                     .update(cx, |session, cx| session.select_full(frame_ix, cx));
             }))
@@ -2410,18 +2791,6 @@ impl Render for OverlayView {
                 committed_bounds.filter(|_| intent == CaptureIntent::Choose && !collecting),
                 |this, bounds| this.child(self.render_toolbar(bounds, viewport, cx)),
             )
-            .when_some(
-                style_anchor.filter(|_| intent == CaptureIntent::Choose && !collecting && !multi),
-                |this, anchor| {
-                    let toolbar = committed_bounds.map(|selection| {
-                        Bounds::new(
-                            self.toolbar_place(selection, viewport),
-                            size(px(TOOLBAR_WIDTH), px(TOOLBAR_HEIGHT)),
-                        )
-                    });
-                    this.child(self.render_style_panel(anchor, viewport, toolbar, cx))
-                },
-            )
             .when_some(magnifier, |this, loupe| this.child(loupe))
             .when(collecting, |this| {
                 this.child(
@@ -2466,6 +2835,28 @@ impl Render for OverlayView {
                                 .text_sm()
                                 .shadow_md()
                                 .child(text),
+                        ),
+                )
+            })
+            .when(self.toolbar_drag.is_some_and(|drag| drag.active), |this| {
+                this.child(
+                    div()
+                        .id("toolbar-drag-shield")
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .cursor_grabbing()
+                        .on_mouse_move(cx.listener(|this, event, window, cx| {
+                            this.handle_toolbar_drag_move(event, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.toolbar_drag = None;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
                         ),
                 )
             })
@@ -2647,8 +3038,8 @@ mod macos_window {
 #[cfg(test)]
 mod tests {
     use super::{
-        STYLE_PANEL_HEIGHT, STYLE_PANEL_WIDTH, TOOLBAR_HEIGHT, TOOLBAR_WIDTH,
-        selection_outline_rects, shade_rects, style_panel_origin,
+        STYLE_ROW_HEIGHT, TOOLBAR_GAP, TOOLBAR_HEIGHT, TOOLBAR_WIDTH, clamp_toolbar_origin,
+        selection_outline_rects, shade_rects, toolbar_origin,
     };
     use gpui_kit::{Bounds, Pixels, point, px, size};
 
@@ -2743,69 +3134,44 @@ mod tests {
     }
 
     #[test]
-    fn style_panel_sits_above_and_centered_on_the_item() {
-        let origin = style_panel_origin(
-            bounds(300., 400., 60., 20.),
-            bounds(0., 0., 1000., 800.),
-            None,
+    fn toolbar_origin_places_below_selection_when_room_allows() {
+        let viewport = bounds(0., 0., 1200., 800.);
+        let selection = bounds(200., 100., 600., 300.);
+        let collapsed = toolbar_origin(selection, viewport, TOOLBAR_HEIGHT);
+        assert_eq!(
+            collapsed,
+            point(px(800. - TOOLBAR_WIDTH), px(400. + TOOLBAR_GAP))
         );
-        assert_eq!(origin.y, px(400. - STYLE_PANEL_HEIGHT - 8.));
-        assert_eq!(origin.x, px(300. + 30. - STYLE_PANEL_WIDTH / 2.));
+
+        let expanded = toolbar_origin(selection, viewport, TOOLBAR_HEIGHT + STYLE_ROW_HEIGHT);
+        assert_eq!(expanded, collapsed);
     }
 
     #[test]
-    fn style_panel_falls_below_and_stays_inside_the_viewport() {
-        let origin =
-            style_panel_origin(bounds(10., 2., 40., 20.), bounds(0., 0., 1000., 800.), None);
-        assert_eq!(origin.x, px(4.));
-        assert_eq!(origin.y, px(2. + 20. + 8.));
+    fn toolbar_origin_flips_above_when_expanded_style_bar_hits_bottom_edge() {
+        let viewport = bounds(0., 0., 1200., 800.);
+        // Collapsed height (36) fits below at y = 740 + 8 = 748 (748 + 36 = 784 <= 800),
+        // while expanded height (74) overflows (748 + 74 = 822 > 800) and moves above.
+        let selection = bounds(200., 440., 600., 300.);
+        let collapsed = toolbar_origin(selection, viewport, TOOLBAR_HEIGHT);
+        assert_eq!(collapsed.y, px(740. + TOOLBAR_GAP));
 
-        let tiny = style_panel_origin(
-            bounds(900., 30., 20., 20.),
-            bounds(0., 0., 320., 120.),
-            None,
+        let expanded = toolbar_origin(selection, viewport, TOOLBAR_HEIGHT + STYLE_ROW_HEIGHT);
+        assert_eq!(
+            expanded.y,
+            px(440. - TOOLBAR_HEIGHT - STYLE_ROW_HEIGHT - TOOLBAR_GAP)
         );
-        assert!(tiny.x >= px(4.));
-        assert!(tiny.x + px(STYLE_PANEL_WIDTH) <= px(320.));
-        assert!(tiny.y >= px(4.));
-        assert!(tiny.y + px(STYLE_PANEL_HEIGHT) <= px(120.));
     }
 
     #[test]
-    fn style_panel_avoids_covering_the_toolbar() {
-        let toolbar = bounds(300., 120., TOOLBAR_WIDTH, TOOLBAR_HEIGHT);
-        let origin = style_panel_origin(
-            bounds(300., 180., 40., 20.),
-            bounds(0., 0., 1000., 800.),
-            Some(toolbar),
-        );
-        // Above the item would overlap the toolbar, so the panel goes below.
-        assert!(origin.y > px(180.));
-        let panel = bounds(
-            origin.x.as_f32(),
-            origin.y.as_f32(),
-            STYLE_PANEL_WIDTH,
-            STYLE_PANEL_HEIGHT,
-        );
-        assert!(!panel.intersects(&toolbar));
-    }
+    fn clamp_toolbar_origin_keeps_expanded_toolbar_inside_viewport() {
+        let viewport = size(px(800.), px(600.));
+        let expanded_h = TOOLBAR_HEIGHT + STYLE_ROW_HEIGHT;
+        let clamped = clamp_toolbar_origin(point(px(700.), px(590.)), viewport, expanded_h);
+        assert_eq!(clamped.x, px(800. - TOOLBAR_WIDTH));
+        assert_eq!(clamped.y, px(600. - expanded_h));
 
-    #[test]
-    fn style_panel_slides_sideways_when_both_sides_are_blocked() {
-        // A tall occluder spanning both candidate positions: moving up/down
-        // cannot help, so the panel must slide horizontally instead.
-        let toolbar = bounds(300., 100., TOOLBAR_WIDTH, 200.);
-        let origin = style_panel_origin(
-            bounds(400., 200., 40., 20.),
-            bounds(0., 0., 1600., 800.),
-            Some(toolbar),
-        );
-        let panel = bounds(
-            origin.x.as_f32(),
-            origin.y.as_f32(),
-            STYLE_PANEL_WIDTH,
-            STYLE_PANEL_HEIGHT,
-        );
-        assert!(!panel.intersects(&toolbar));
+        let negative = clamp_toolbar_origin(point(px(-20.), px(-10.)), viewport, TOOLBAR_HEIGHT);
+        assert_eq!(negative, point(px(0.), px(0.)));
     }
 }

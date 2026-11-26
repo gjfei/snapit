@@ -652,14 +652,6 @@ impl Layer {
         self.selected.is_some()
     }
 
-    /// Selection-local bounds of the picked shape, used to anchor its style
-    /// panel right above or below it.
-    pub fn selected_bounds(&self) -> Option<(f32, f32, f32, f32)> {
-        self.selected
-            .and_then(|ix| self.shapes.get(ix))
-            .map(Shape::bounds)
-    }
-
     pub fn style(&self) -> Style {
         self.selected
             .and_then(|ix| self.shapes.get(ix))
@@ -1467,29 +1459,10 @@ pub fn bake_hdr(
         height,
     };
     let mut raw = image.into_bytes();
-    for shape in shapes {
-        if let Shape::Mosaic { from, to, style } = shape {
-            let (x, y, w, h) = scaled_aabb(*from, *to, scale);
-            let block = (style.size * scale).round().max(2.0) as u32;
-            pixelate_hdr(&mut raw, width, height, (x, y, w, h), block);
-            continue;
-        }
-        layer.fill(tiny_skia::Color::TRANSPARENT);
-        match shape {
-            Shape::Rect { from, to, style } => stroke_rect(&mut layer, *from, *to, scale, *style),
-            Shape::Arrow { from, to, style } => stroke_arrow(&mut layer, *from, *to, scale, *style),
-            Shape::Line { from, to, style } => stroke_pen(&mut layer, &[*from, *to], scale, *style),
-            Shape::Pen { points, style } => stroke_pen(&mut layer, points, scale, *style),
-            Shape::Text { at, text, style } => {
-                draw_text(&mut layer, *at, text, scale, style.size, rgba(style.color))
-            }
-            Shape::Step { at, number, style } => {
-                draw_step(&mut layer, *at, *number, scale, style.size, style.color)
-            }
-            Shape::Mosaic { .. } => continue,
-        }
+    let mut has_vector = false;
+    let flush_vector = |layer: &mut Pixmap, raw: &mut [u8]| {
         blend_hdr_srgb(
-            &mut raw,
+            raw,
             width,
             reference_white,
             sdr_white,
@@ -1513,6 +1486,36 @@ pub fn bake_hdr(
                 }
             }),
         );
+        layer.fill(tiny_skia::Color::TRANSPARENT);
+    };
+    for shape in shapes {
+        if let Shape::Mosaic { from, to, style } = shape {
+            if has_vector {
+                flush_vector(&mut layer, &mut raw);
+                has_vector = false;
+            }
+            let (x, y, w, h) = scaled_aabb(*from, *to, scale);
+            let block = (style.size * scale).round().max(2.0) as u32;
+            pixelate_hdr(&mut raw, width, height, (x, y, w, h), block);
+            continue;
+        }
+        has_vector = true;
+        match shape {
+            Shape::Rect { from, to, style } => stroke_rect(&mut layer, *from, *to, scale, *style),
+            Shape::Arrow { from, to, style } => stroke_arrow(&mut layer, *from, *to, scale, *style),
+            Shape::Line { from, to, style } => stroke_pen(&mut layer, &[*from, *to], scale, *style),
+            Shape::Pen { points, style } => stroke_pen(&mut layer, points, scale, *style),
+            Shape::Text { at, text, style } => {
+                draw_text(&mut layer, *at, text, scale, style.size, rgba(style.color))
+            }
+            Shape::Step { at, number, style } => {
+                draw_step(&mut layer, *at, *number, scale, style.size, style.color)
+            }
+            Shape::Mosaic { .. } => unreachable!(),
+        }
+    }
+    if has_vector {
+        flush_vector(&mut layer, &mut raw);
     }
     Ok(HdrImage::new(width, height, raw, reference_white).with_sdr_white(sdr_white))
 }
@@ -1903,20 +1906,19 @@ pub(crate) fn paint_layer_zoomed_clipped(
             Shape::Line { from, to, style } => paint_gpui_pen(
                 window,
                 origin,
-                &[z(*from), z(*to)],
+                &[*from, *to],
+                zoom,
                 px(style.size * zoom),
                 rgb(style.color),
             ),
-            Shape::Pen { points, style } => {
-                let pts: Vec<[f32; 2]> = points.iter().map(|p| z(*p)).collect();
-                paint_gpui_pen(
-                    window,
-                    origin,
-                    &pts,
-                    px(style.size * zoom),
-                    rgb(style.color),
-                )
-            }
+            Shape::Pen { points, style } => paint_gpui_pen(
+                window,
+                origin,
+                points,
+                zoom,
+                px(style.size * zoom),
+                rgb(style.color),
+            ),
             Shape::Mosaic { from, to, style } => {
                 if let Some(source) = source {
                     let (x, y, w, h) = aabb(*from, *to);
@@ -1927,9 +1929,11 @@ pub(crate) fn paint_layer_zoomed_clipped(
                     if right <= left || bottom <= top {
                         continue;
                     }
-                    let key = MosaicKey::new(ix, *from, *to, style.size, scale, clip, source);
-                    let blocks =
-                        mosaics.blocks(key, || mosaic_blocks(*from, *to, style.size, source, clip));
+                    let clip_band = quantize_mosaic_clip(clip);
+                    let key = MosaicKey::new(ix, *from, *to, style.size, scale, clip_band, source);
+                    let blocks = mosaics.blocks(key, || {
+                        mosaic_blocks(*from, *to, style.size, source, clip_band)
+                    });
                     paint_gpui_mosaic_zoomed(window, origin, &blocks, zoom);
                 }
             }
@@ -2053,18 +2057,35 @@ fn paint_gpui_arrow(
     }
 }
 
+fn quantize_mosaic_clip(clip: [f32; 4]) -> [f32; 4] {
+    const BAND: f32 = 256.0;
+    let top = if clip[1].is_finite() {
+        (clip[1] / BAND).floor() * BAND
+    } else {
+        clip[1]
+    };
+    let bottom = if clip[3].is_finite() {
+        (clip[3] / BAND).ceil() * BAND
+    } else {
+        clip[3]
+    };
+    [clip[0], top, clip[2], bottom]
+}
+
 fn paint_gpui_pen(
     window: &mut Window,
     origin: Point<Pixels>,
     points: &[[f32; 2]],
+    zoom: f32,
     stroke: Pixels,
     color: gpui_kit::Rgba,
 ) {
+    let scaled = |pt: [f32; 2]| [pt[0] * zoom, pt[1] * zoom];
     match points {
         [] => {}
         [only] => {
             let r = stroke / 2.;
-            let center = gpui_pt(origin, *only);
+            let center = gpui_pt(origin, scaled(*only));
             window.paint_quad(
                 fill(
                     Bounds::new(point(center.x - r, center.y - r), size(r * 2., r * 2.)),
@@ -2075,9 +2096,9 @@ fn paint_gpui_pen(
         }
         points => {
             let mut builder = PathBuilder::stroke(stroke);
-            builder.move_to(gpui_pt(origin, points[0]));
+            builder.move_to(gpui_pt(origin, scaled(points[0])));
             for point in &points[1..] {
-                builder.line_to(gpui_pt(origin, *point));
+                builder.line_to(gpui_pt(origin, scaled(*point)));
             }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, color);
@@ -2101,6 +2122,7 @@ fn mosaic_blocks(
     source: MosaicSource<'_>,
     clip: [f32; 4],
 ) -> Vec<MosaicBlock> {
+    const DISK_CHUNK_BYTES: usize = 4 * 1024 * 1024;
     let pixels_per_logical_unit = source.pixels_per_logical_unit;
     let source_height = match source.image {
         MosaicImage::Memory(image) => image.height(),
@@ -2120,6 +2142,9 @@ fn mosaic_blocks(
     }
     let block = block_size.max(2.0);
     let mut blocks: Vec<MosaicBlock> = Vec::new();
+    let vis_py_end = ((y + h).min(clip[3]) * pixels_per_logical_unit).round() as i32;
+    let vis_py_end = vis_py_end.clamp(0, source_height as i32);
+    let mut disk_chunk: Option<(i32, i32, RgbaImage)> = None;
     let mut row = y;
     while row < y + h {
         let bh = block.min(y + h - row);
@@ -2135,19 +2160,29 @@ fn mosaic_blocks(
             row += bh;
             continue;
         }
-        let loaded;
-        let image = match source.image {
-            MosaicImage::Memory(image) => image,
+        let (image, chunk_base_y) = match source.image {
+            MosaicImage::Memory(image) => (image, 0),
             MosaicImage::Source(image) => {
-                loaded = match image.read_rows(py_start as u32, (py_end - py_start) as u32) {
-                    Ok(image) => image,
-                    Err(error) => {
-                        log::warn!("mosaic preview read failed: {error:#}");
-                        row += bh;
-                        continue;
+                let need_load = !disk_chunk
+                    .as_ref()
+                    .is_some_and(|(s, e, _)| py_start >= *s && py_end <= *e);
+                if need_load {
+                    let row_bytes = (image.width() as usize * 4).max(1);
+                    let max_rows = (DISK_CHUNK_BYTES / row_bytes).max(1) as i32;
+                    let chunk_end = (py_start + max_rows).min(vis_py_end).max(py_end);
+                    match image.read_rows(py_start as u32, (chunk_end - py_start) as u32) {
+                        Ok(loaded) => {
+                            disk_chunk = Some((py_start, chunk_end, loaded));
+                        }
+                        Err(error) => {
+                            log::warn!("mosaic preview read failed: {error:#}");
+                            row += bh;
+                            continue;
+                        }
                     }
-                };
-                &loaded
+                }
+                let (chunk_start, _, loaded) = disk_chunk.as_ref().expect("disk chunk loaded");
+                (loaded, *chunk_start)
             }
         };
         let mut col = x;
@@ -2161,13 +2196,7 @@ fn mosaic_blocks(
             let py0 = (row * pixels_per_logical_unit).round() as i32;
             let px1 = ((col + bw) * pixels_per_logical_unit).round() as i32;
             let py1 = ((row + bh) * pixels_per_logical_unit).round() as i32;
-            let color = {
-                let (local_y0, local_y1) = match source.image {
-                    MosaicImage::Memory(_) => (py0, py1),
-                    MosaicImage::Source(_) => (py0 - py_start, py1 - py_start),
-                };
-                average_rgba(image, px0, local_y0, px1, local_y1)
-            };
+            let color = average_rgba(image, px0, py0 - chunk_base_y, px1, py1 - chunk_base_y);
             let joined = match blocks.last_mut() {
                 Some(last)
                     if last.color == color
@@ -2306,15 +2335,18 @@ fn paint_gpui_step(
     let line = window
         .text_system()
         .shape_line(label.into(), font_size, &[run], None);
-    let text_origin = point(center.x - r, center.y - font_size / 2. - px(1.));
-    let _ = line.paint(
-        text_origin,
-        r * 1.2,
-        TextAlign::Center,
-        Some(r * 2.),
-        window,
-        cx,
+    let line_height = line.ascent + line.descent;
+    let cap_height = line
+        .runs
+        .first()
+        .map(|run| window.text_system().cap_height(run.font_id, font_size))
+        .filter(|height| *height > px(0.))
+        .unwrap_or(font_size * 0.72);
+    let text_origin = point(
+        center.x - line.width() / 2.,
+        center.y + cap_height / 2. - line.ascent,
     );
+    let _ = line.paint(text_origin, line_height, TextAlign::Left, None, window, cx);
 }
 
 fn stroke_gpui_rect(
@@ -2532,18 +2564,55 @@ fn stamp_fontdue(
     color: [u8; 4],
     center: bool,
 ) {
-    let mut x = at[0];
-    let baseline = at[1];
-    if center {
-        let width: f32 = text
-            .chars()
-            .map(|ch| font.metrics(ch, size).advance_width)
-            .sum();
-        x -= width / 2.0;
+    if !center {
+        let mut x = at[0];
+        let baseline = at[1];
+        for ch in text.chars() {
+            let (metrics, bitmap) = font.rasterize(ch, size);
+            let gx = x + metrics.xmin as f32;
+            let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
+            stamp_coverage(
+                pixmap,
+                gx.round() as i32,
+                gy.round() as i32,
+                metrics.width as u32,
+                metrics.height as u32,
+                &bitmap,
+                color,
+            );
+            x += metrics.advance_width;
+        }
+        return;
     }
+
+    let mut glyphs = Vec::new();
+    let mut pen_x = 0.0_f32;
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, size);
-        let gx = x + metrics.xmin as f32;
+        if metrics.width > 0 && metrics.height > 0 {
+            let gx_min = pen_x + metrics.xmin as f32;
+            let gx_max = gx_min + metrics.width as f32;
+            let gy_min = -(metrics.height as f32 + metrics.ymin as f32);
+            let gy_max = -(metrics.ymin as f32);
+            min_x = min_x.min(gx_min);
+            max_x = max_x.max(gx_max);
+            min_y = min_y.min(gy_min);
+            max_y = max_y.max(gy_max);
+        }
+        glyphs.push((metrics, bitmap, pen_x));
+        pen_x += metrics.advance_width;
+    }
+    if glyphs.is_empty() || !min_x.is_finite() {
+        return;
+    }
+    let x_offset = at[0] - (min_x + max_x) / 2.0;
+    let baseline = at[1] - (min_y + max_y) / 2.0;
+    for (metrics, bitmap, glyph_x) in glyphs {
+        let gx = x_offset + glyph_x + metrics.xmin as f32;
         let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
         stamp_coverage(
             pixmap,
@@ -2554,7 +2623,6 @@ fn stamp_fontdue(
             &bitmap,
             color,
         );
-        x += metrics.advance_width;
     }
 }
 
@@ -2568,7 +2636,6 @@ fn stamp_digits(
     center: bool,
 ) {
     let cell = (size / 7.0).round().max(1.0) as i32;
-    let glyph_w = 6 * cell;
     let digits: Vec<u8> = text
         .bytes()
         .filter_map(|b| b.is_ascii_digit().then_some(b - b'0'))
@@ -2577,9 +2644,8 @@ fn stamp_digits(
         return;
     }
     if center {
-        x -= (digits.len() as i32 * glyph_w) as f32 / 2.0;
-        // `y` is baseline when centered on a step; lift to the glyph top.
-        let top = y - size * 0.5;
+        x -= ((digits.len() as i32 * 6 - 1) * cell) as f32 / 2.0;
+        let top = y - (7 * cell) as f32 / 2.0;
         stamp_digit_row(
             pixmap,
             x.round() as i32,
@@ -4219,5 +4285,43 @@ mod tests {
         assert_eq!(blocks[0].color, [0, 30, 0, 255]);
         assert_eq!(blocks[1].at, [0.0, 12.0]);
         assert_eq!(blocks[1].color, [0, 150, 0, 255]);
+    }
+
+    #[test]
+    fn baked_step_number_is_centered_in_its_circle() {
+        for number in [1, 12] {
+            let mut image = RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 0, 255]));
+            let shapes = [Shape::Step {
+                at: [64.0, 64.0],
+                number,
+                style: Style {
+                    color: 0xEF4444,
+                    size: 20.0,
+                },
+            }];
+            bake(&mut image, &shapes, 1.0);
+
+            let (mut min_x, mut max_x) = (u32::MAX, 0_u32);
+            let (mut min_y, mut max_y) = (u32::MAX, 0_u32);
+            for (x, y, px) in image.enumerate_pixels() {
+                // Digit glyphs blend toward white over the 0xEF4444 circle.
+                if px.0[1] > 140 && px.0[2] > 140 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+            assert!(
+                min_x <= max_x && min_y <= max_y,
+                "missing digits for {number}"
+            );
+            let cx = (min_x + max_x) as f32 / 2.0;
+            let cy = (min_y + max_y) as f32 / 2.0;
+            assert!(
+                (cx - 64.0).abs() <= 1.0 && (cy - 64.0).abs() <= 1.0,
+                "step {number} center drifted to ({cx}, {cy})"
+            );
+        }
     }
 }

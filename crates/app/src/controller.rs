@@ -23,7 +23,7 @@ use snapit_ocr::{OcrEngine, OcrOptions};
 use snapit_recorder::{ClickEffect, RecordFormat, RecordOptions, Recorder, RecorderStart};
 use snapit_scroll::{
     AutoScrollError, ScrollDirection, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollSpeed,
-    ScrollStart,
+    ScrollStart, ScrollStatus,
 };
 use snapit_store::{
     EntryKind, ImageFormat as SaveFormat, ScrollSpeed as ConfigScrollSpeed, WatermarkTarget,
@@ -42,14 +42,14 @@ use crate::permission_view::PermissionView;
 use crate::permissions::{self, Permission};
 use crate::pin;
 use crate::recording_bar::{BAR_SIZE, RecordingBar};
-use crate::scroll_bar::{SCROLL_BAR_SIZE, ScrollBar, ScrollPreview, scroll_preview_bounds};
+use crate::scroll_bar::{ScrollBar, ScrollPreview, scroll_bar_bounds, scroll_preview_bounds};
 use crate::session::{self, CaptureIntent, CaptureSession, SessionCommand, SessionSlot};
 use crate::settings::AppSettings;
 use crate::settings_view::{self, SettingsView};
 use crate::update_view::UpdateView;
 
 const RECORDING_TICK: Duration = Duration::from_millis(250);
-const SCROLL_TICK: Duration = Duration::from_millis(50);
+const SCROLL_TICK: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollFinishAction {
@@ -112,11 +112,20 @@ struct ActiveRecording {
     part: PathBuf,
 }
 
+struct ScrollAnnotationMode {
+    origin_y: i64,
+    resume_auto: bool,
+    was_paused: bool,
+    direction: ScrollDirection,
+    requested_origin: Option<i64>,
+}
+
 struct ActiveScroll {
     id: u64,
     session: Option<ScrollSession>,
     start: Option<ScrollStart>,
     bar: Option<AnyWindowHandle>,
+    saved_bar_bounds: Option<Bounds<Pixels>>,
     preview: Option<AnyWindowHandle>,
     frame: Option<OverlayWindow>,
     display_id: Option<gpui_kit::DisplayId>,
@@ -128,10 +137,25 @@ struct ActiveScroll {
     annotation_content_shift: u32,
     annotation_reset_pending: bool,
     annotation_auto_resume: bool,
+    auto_scroll_intent: Option<ScrollDirection>,
+    annotation_mode: Option<ScrollAnnotationMode>,
     preview_visible: bool,
     finishing: bool,
     pending_finish: Option<ScrollFinishAction>,
     last_warning: bool,
+}
+
+fn annotation_auto_direction(
+    snapshot: &ScrollSnapshot,
+    intent: Option<ScrollDirection>,
+) -> Option<ScrollDirection> {
+    if snapshot.paused || snapshot.status == ScrollStatus::ReachedEnd {
+        None
+    } else if snapshot.auto_scrolling {
+        Some(snapshot.auto_direction)
+    } else {
+        intent
+    }
 }
 
 /// A cropped selection with one frozen composition shared by every export.
@@ -459,7 +483,9 @@ impl Controller {
     }
 
     pub fn can_finish_scroll(&self) -> bool {
-        self.scroll.as_ref().is_some_and(|active| !active.finishing)
+        self.scroll.as_ref().is_some_and(|active| {
+            !active.finishing && active.snapshot.status != ScrollStatus::Failed
+        })
     }
 
     pub fn is_scroll_preview_visible(&self) -> bool {
@@ -472,18 +498,232 @@ impl Controller {
         self.scroll.as_ref().map(|active| active.snapshot.clone())
     }
 
-    pub fn set_scroll_preview_range(&mut self, start: u32, rows: u32) {
+    pub fn set_scroll_preview_range_with_follow(&mut self, start: u32, rows: u32, follow: bool) {
         if let Some(session) = self
             .scroll
             .as_ref()
             .and_then(|active| active.session.as_ref())
         {
-            session.set_preview_range(start, rows);
+            session.set_preview_range_with_follow(start, rows, follow);
         }
     }
 
     pub fn scroll_annotations(&self) -> Option<&Layer> {
         self.scroll.as_ref().map(|active| &active.annotations)
+    }
+
+    pub fn is_scroll_annotating(&self) -> bool {
+        self.scroll
+            .as_ref()
+            .is_some_and(|active| active.annotation_mode.is_some())
+    }
+
+    pub fn scroll_annotation_state(&self) -> Option<(i64, f32, Arc<RgbaImage>, u64)> {
+        let active = self.scroll.as_ref()?;
+        let mode = active.annotation_mode.as_ref()?;
+        Some((
+            mode.origin_y,
+            active.scale,
+            active.snapshot.pause_frame.clone()?,
+            active.snapshot.pause_revision,
+        ))
+    }
+
+    pub fn start_scroll_annotation_with_tool(
+        &mut self,
+        tool: crate::annotate::Tool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.finishing || !active.snapshot.started {
+            return;
+        }
+        active.annotations.deselect();
+        active.annotations.set_tool(tool);
+        self.start_scroll_annotation(cx);
+    }
+
+    pub fn start_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some((scroll_id, frame, selection)) = self
+            .scroll
+            .as_ref()
+            .map(|active| (active.id, active.frame.clone(), active.selection))
+        else {
+            return;
+        };
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if active.annotation_mode.is_some() || active.finishing || !active.snapshot.started {
+            return;
+        }
+        let direction = annotation_auto_direction(&active.snapshot, active.auto_scroll_intent);
+        if direction.is_none() {
+            active.auto_scroll_intent = None;
+        }
+        active.annotation_auto_resume = false;
+        active.annotation_mode = Some(ScrollAnnotationMode {
+            origin_y: active.snapshot.viewport_origin_y,
+            resume_auto: direction.is_some(),
+            was_paused: active.snapshot.paused,
+            direction: direction.unwrap_or(active.snapshot.auto_direction),
+            requested_origin: None,
+        });
+        active.annotations.commit();
+        if let Some(session) = active.session.as_ref() {
+            session.set_paused(true);
+        }
+        Arc::make_mut(&mut active.snapshot).paused = true;
+        Arc::make_mut(&mut active.snapshot).auto_scrolling = false;
+        let bar_handle = active.bar.take();
+        let controller = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(bar_handle) = bar_handle
+                && let Ok(bounds) = bar_handle.update(cx, |_, window, _| {
+                    let bounds = window.bounds();
+                    window.remove_window();
+                    bounds
+                })
+            {
+                controller.update(cx, |this, _| {
+                    if let Some(active) = this.scroll.as_mut()
+                        && active.id == scroll_id
+                    {
+                        active.saved_bar_bounds = Some(bounds);
+                    }
+                });
+            }
+            let bar_origin = {
+                let this = controller.read(cx);
+                let still_annotating = this.scroll.as_ref().is_some_and(|active| {
+                    active.id == scroll_id && active.annotation_mode.is_some()
+                });
+                if !still_annotating {
+                    return;
+                }
+                this.scroll_bar_local_origin()
+            };
+            if let Some(frame) = frame {
+                frame
+                    .window
+                    .update(cx, |_, window, cx| {
+                        frame.view.update(cx, |view, cx| {
+                            view.enter_scroll_annotation(
+                                controller.clone(),
+                                selection,
+                                bar_origin,
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                    .ok();
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn finish_scroll_annotation(&mut self, cx: &mut Context<Self>) {
+        self.leave_scroll_annotation(true, true, cx);
+    }
+
+    fn leave_scroll_annotation(&mut self, resume: bool, reopen_bar: bool, cx: &mut Context<Self>) {
+        let Some((id, frame, bar, mode)) = self.scroll.as_mut().and_then(|active| {
+            let mode = active.annotation_mode.take()?;
+            active.annotations.commit();
+            Some((active.id, active.frame.clone(), active.bar, mode))
+        }) else {
+            return;
+        };
+        let keep_paused = resume && !mode.resume_auto && mode.was_paused;
+        if !keep_paused && let Some(active) = self.scroll.as_mut() {
+            Arc::make_mut(&mut active.snapshot).paused = false;
+        }
+        let controller = cx.entity();
+        cx.defer(move |cx| {
+            controller.update(cx, |this, cx| {
+                let Some(active) = this.scroll.as_mut() else {
+                    return;
+                };
+                if active.id != id || active.annotation_mode.is_some() {
+                    return;
+                }
+                if let Some(frame) = frame {
+                    frame
+                        .window
+                        .update(cx, |_, window, cx| {
+                            frame
+                                .view
+                                .update(cx, |view, cx| view.exit_scroll_annotation(window, cx));
+                        })
+                        .ok();
+                }
+                let reopen_params = (reopen_bar && active.bar.is_none() && !active.finishing)
+                    .then_some((
+                        active.id,
+                        active.display_id,
+                        active.display_bounds,
+                        active.selection,
+                        active.saved_bar_bounds,
+                    ));
+                if let Some(bar) = bar {
+                    bar.update(cx, |_, window, _| window.activate_window()).ok();
+                }
+                let mut resume_auto_error = None;
+                if !keep_paused && let Some(session) = active.session.as_ref() {
+                    session.set_paused(false);
+                    if resume && mode.resume_auto {
+                        match session.set_auto_scroll_direction(true, mode.direction) {
+                            Ok(()) => {
+                                active.auto_scroll_intent = Some(mode.direction);
+                                let snap = Arc::make_mut(&mut active.snapshot);
+                                snap.auto_direction = mode.direction;
+                                snap.auto_scrolling = true;
+                            }
+                            Err(err) => {
+                                active.auto_scroll_intent = None;
+                                Arc::make_mut(&mut active.snapshot).auto_scrolling = false;
+                                resume_auto_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                if let Some((scroll_id, display_id, display_bounds, selection, saved_bar_bounds)) =
+                    reopen_params
+                {
+                    this.open_scroll_bar(
+                        scroll_id,
+                        display_id,
+                        display_bounds,
+                        selection,
+                        saved_bar_bounds,
+                        cx,
+                    );
+                }
+                match resume_auto_error {
+                    Some(AutoScrollError::NeedsAccessibility) => {
+                        log::warn!("auto-scroll resume requested without accessibility permission");
+                        permissions::request(Permission::Accessibility);
+                        this.open_panel(Panel::Permissions, cx);
+                        this.inform(t!("scroll.accessibility_needed").to_string(), cx);
+                    }
+                    Some(err) => {
+                        this.fail(format!("{err}"), cx);
+                    }
+                    None => {}
+                }
+                log::info!(
+                    "scroll annotation finished: resume_auto={} direction={:?} keep_paused={}",
+                    resume && mode.resume_auto,
+                    mode.direction,
+                    keep_paused
+                );
+                cx.notify();
+            });
+        });
+        cx.notify();
     }
 
     pub fn begin_scroll_annotation(
@@ -496,10 +736,15 @@ impl Controller {
         let Some(active) = self.scroll.as_mut() else {
             return;
         };
-        if active.finishing {
+        if active.finishing
+            || (active.annotation_mode.is_some() && active.snapshot.pause_frame.is_none())
+        {
             return;
         }
-        if active.snapshot.auto_scrolling && !active.annotation_auto_resume {
+        if active.annotation_mode.is_none()
+            && active.snapshot.auto_scrolling
+            && !active.annotation_auto_resume
+        {
             active.annotation_auto_resume = true;
             if let Some(session) = active.session.as_ref() {
                 let _ = session.set_auto_scroll(false);
@@ -522,10 +767,17 @@ impl Controller {
         let Some(active) = self.scroll.as_mut() else {
             return;
         };
-        let viewport = [
-            active.snapshot.width as f32 / active.scale,
-            active.snapshot.height as f32 / active.scale,
-        ];
+        let viewport = if let Some(mode) = active.annotation_mode.as_ref() {
+            [
+                active.snapshot.width as f32 / active.scale,
+                mode.origin_y as f32 / active.scale + active.selection.size.height.as_f32(),
+            ]
+        } else {
+            [
+                active.snapshot.width as f32 / active.scale,
+                active.snapshot.height as f32 / active.scale,
+            ]
+        };
         let changed = if active.annotations.is_editing() {
             active.annotations.drag_edit(x, y, viewport)
         } else if active.annotations.is_dragging() {
@@ -550,6 +802,34 @@ impl Controller {
         }
         if !active.annotations.is_typing() {
             Self::resume_scroll_annotation_auto(active);
+        }
+        cx.notify();
+    }
+
+    pub fn shift_scroll_annotation_origin(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        if delta == 0 {
+            return;
+        }
+        let Some(mode) = active.annotation_mode.as_mut() else {
+            return;
+        };
+        let Some(frame) = active.snapshot.pause_frame.as_ref() else {
+            return;
+        };
+        let max_origin = (active.snapshot.height as i64 - frame.height() as i64).max(0);
+        let base = mode
+            .requested_origin
+            .unwrap_or(active.snapshot.viewport_origin_y);
+        let origin = (base + delta).clamp(0, max_origin);
+        if origin == base {
+            return;
+        }
+        mode.requested_origin = Some(origin);
+        if let Some(session) = active.session.as_ref() {
+            session.set_annotation_origin(origin);
         }
         cx.notify();
     }
@@ -685,13 +965,14 @@ impl Controller {
     }
 
     fn resume_scroll_annotation_auto(active: &mut ActiveScroll) {
-        if !active.annotation_auto_resume {
+        if active.annotation_mode.is_some() || !active.annotation_auto_resume {
             return;
         }
         active.annotation_auto_resume = false;
         if let Some(session) = active.session.as_ref()
             && session.set_auto_scroll(true).is_ok()
         {
+            active.auto_scroll_intent = Some(active.snapshot.auto_direction);
             Arc::make_mut(&mut active.snapshot).auto_scrolling = true;
         }
     }
@@ -723,13 +1004,14 @@ impl Controller {
             }
             return;
         }
-        if shift > *content_shift {
+        let delta = i64::from(shift) - i64::from(*content_shift);
+        if delta != 0 {
             let scale = if scale.is_finite() && scale > 0.1 {
                 scale
             } else {
                 1.0
             };
-            annotations.translate(0.0, (shift - *content_shift) as f32 / scale);
+            annotations.translate(0.0, delta as f32 / scale);
             *content_shift = shift;
         }
     }
@@ -1253,7 +1535,7 @@ impl Controller {
         let watermark_config = AppSettings::get(cx).watermark.clone();
         let screenshot_target_enabled =
             watermark_config.target_enabled(WatermarkTarget::Screenshot);
-        let watermark = if wants_still && watermark_config.enabled && screenshot_target_enabled {
+        let watermark = if wants_still && screenshot_target_enabled {
             match watermark_config
                 .preset(WatermarkTarget::Screenshot)
                 .context("watermark template is unavailable")
@@ -1274,9 +1556,8 @@ impl Controller {
             }
         } else {
             log::info!(
-                "watermark: skipped for screenshot export (enabled={} target={})",
-                watermark_config.enabled,
-                screenshot_target_enabled
+                "watermark: skipped for screenshot export (template={:?})",
+                watermark_config.selected_template_id(WatermarkTarget::Screenshot)
             );
             WatermarkSpec::default()
         };
@@ -1477,7 +1758,10 @@ impl Controller {
                 .background_spawn(async move { pin::image_source(&composition) })
                 .await;
             this.update(cx, |this, cx| {
-                if controller.read(cx).workflow_serial != workflow {
+                // `controller` and `this` are the same entity, which is leased
+                // for this update. Reading it here panics with
+                // "cannot read Controller while it is already being updated".
+                if this.workflow_serial != workflow {
                     return;
                 }
                 match image {
@@ -1812,7 +2096,7 @@ impl Controller {
             RecordFormat::Mp4 => (WatermarkTarget::Video, "video"),
         };
         let watermark_target_enabled = watermark_config.target_enabled(watermark_target);
-        let watermark = if watermark_config.enabled && watermark_target_enabled {
+        let watermark = if watermark_target_enabled {
             match watermark_config
                 .preset(watermark_target)
                 .context("watermark template is unavailable")
@@ -1834,9 +2118,8 @@ impl Controller {
             }
         } else {
             log::info!(
-                "watermark: skipped for {watermark_target_name} recording (enabled={} target={})",
-                watermark_config.enabled,
-                watermark_target_enabled
+                "watermark: skipped for {watermark_target_name} recording (template={:?})",
+                watermark_config.selected_template_id(watermark_target)
             );
             WatermarkSpec::default()
         };
@@ -2474,7 +2757,6 @@ impl Controller {
             ConfigScrollSpeed::Fast => ScrollSpeed::Fast,
         };
         let options = ScrollOptions::default()
-            .with_max_height(scroll_cfg.max_height)
             .with_auto_scroll_speed(speed)
             .with_scale(scale);
         let Some(overlay) = self.take_recording_overlay(display_id, cx) else {
@@ -2501,6 +2783,7 @@ impl Controller {
             session: None,
             start: Some(ScrollStart::default()),
             bar: None,
+            saved_bar_bounds: None,
             preview: None,
             frame: Some(overlay),
             display_id,
@@ -2512,12 +2795,14 @@ impl Controller {
             annotation_content_shift: 0,
             annotation_reset_pending: false,
             annotation_auto_resume: false,
+            auto_scroll_intent: None,
+            annotation_mode: None,
             preview_visible: show_preview,
             finishing: false,
             pending_finish: None,
             last_warning: false,
         });
-        self.open_scroll_bar(scroll_id, display_id, display_bounds, selection, cx);
+        self.open_scroll_bar(scroll_id, display_id, display_bounds, selection, None, cx);
         if show_preview {
             self.open_scroll_preview(scroll_id, display_id, display_bounds, selection, cx);
         }
@@ -2634,11 +2919,27 @@ impl Controller {
                             || snap.auto_direction != active.snapshot.auto_direction
                             || snap.paused != active.snapshot.paused
                             || snap.height != active.snapshot.height
+                            || snap.frame_height != active.snapshot.frame_height
+                            || snap.preview_range != active.snapshot.preview_range
                             || snap.content_shift != active.snapshot.content_shift
+                            || snap.viewport_origin_y != active.snapshot.viewport_origin_y
+                            || snap.pause_revision != active.snapshot.pause_revision
+                            || snap.pause_frame.is_some() != active.snapshot.pause_frame.is_some()
                             || snap.started != active.snapshot.started;
                         let warn_changed = warn_now != active.last_warning;
                         active.last_warning = warn_now;
+                        if snap.auto_scrolling {
+                            active.auto_scroll_intent = Some(snap.auto_direction);
+                        } else if snap.status == ScrollStatus::ReachedEnd {
+                            active.auto_scroll_intent = None;
+                        }
                         active.snapshot = snap.clone();
+                        if let Some(mode) = active.annotation_mode.as_mut()
+                            && snap.paused
+                            && snap.pause_frame.is_some()
+                        {
+                            mode.origin_y = snap.viewport_origin_y;
+                        }
                         let frame = active.frame.clone();
                         (changed, warn_changed, warn_now, frame, snap)
                     };
@@ -2654,6 +2955,19 @@ impl Controller {
                     }
                     if changed {
                         cx.notify();
+                    }
+                    if snap.status == ScrollStatus::Failed {
+                        let error = snap
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "scroll capture failed".to_string());
+                        this.cancel_scroll(cx);
+                        this.fail(
+                            t!("controller.scroll_failed", error = error).to_string(),
+                            cx,
+                        );
+                        this.retire_log_operation();
+                        return false;
                     }
                     true
                 });
@@ -2671,30 +2985,25 @@ impl Controller {
         display_id: Option<gpui_kit::DisplayId>,
         display_bounds: Bounds<Pixels>,
         selection: Bounds<Pixels>,
+        override_bounds: Option<Bounds<Pixels>>,
         cx: &mut Context<Self>,
     ) {
-        let bar = size(px(SCROLL_BAR_SIZE.0), px(SCROLL_BAR_SIZE.1));
-        let gap = px(8.);
-        let display_size = display_bounds.size;
-        let bottom = selection.origin.y + selection.size.height;
-        let right = selection.origin.x + selection.size.width;
-        let aligned_x = if right >= bar.width {
-            right - bar.width
-        } else {
-            selection.origin.x
+        let mut bar = scroll_bar_bounds(display_bounds, selection);
+        if let Some(saved) = override_bounds {
+            let min_x = display_bounds.origin.x;
+            let max_x =
+                (display_bounds.origin.x + display_bounds.size.width - bar.size.width).max(min_x);
+            let min_y = display_bounds.origin.y;
+            let max_y = (display_bounds.origin.y + display_bounds.size.height
+                - px(crate::scroll_bar::SCROLL_BAR_EXPANDED_HEIGHT))
+            .max(min_y);
+            bar.origin = gpui_kit::point(
+                saved.origin.x.max(min_x).min(max_x),
+                saved.origin.y.max(min_y).min(max_y),
+            );
         }
-        .max(px(0.))
-        .min((display_size.width - bar.width).max(px(0.)));
-        let (x, y) = if bottom + gap + bar.height <= display_size.height {
-            (aligned_x, bottom + gap)
-        } else if selection.origin.y >= bar.height + gap {
-            (aligned_x, selection.origin.y - gap - bar.height)
-        } else {
-            (aligned_x, (bottom - gap - bar.height).max(px(0.)))
-        };
-        let origin = display_bounds.origin + point(x, y);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, bar))),
+            window_bounds: Some(WindowBounds::Windowed(bar)),
             titlebar: None,
             focus: true,
             show: true,
@@ -2728,7 +3037,7 @@ impl Controller {
                 return;
             };
             let orphaned = controller.update(cx, |this, _| match this.scroll.as_mut() {
-                Some(active) if active.id == scroll_id => {
+                Some(active) if active.id == scroll_id && active.annotation_mode.is_none() => {
                     active.bar = Some(handle);
                     false
                 }
@@ -2750,22 +3059,38 @@ impl Controller {
         selection: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let bounds = scroll_preview_bounds(display_bounds, selection);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
-            focus: false,
-            show: true,
-            kind: WindowKind::PopUp,
-            is_movable: true,
-            is_resizable: false,
-            is_minimizable: false,
-            display_id,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
         let controller = cx.entity();
         cx.defer(move |cx| {
+            let (bar_handle, saved_bar_bounds) = {
+                let this = controller.read(cx);
+                let Some(active) = this
+                    .scroll
+                    .as_ref()
+                    .filter(|active| active.id == scroll_id && active.preview_visible)
+                else {
+                    return;
+                };
+                (active.bar, active.saved_bar_bounds)
+            };
+            let live_bar_bounds = bar_handle
+                .and_then(|handle| handle.update(cx, |_, window, _| window.bounds()).ok());
+            let bar_bounds = live_bar_bounds
+                .or(saved_bar_bounds)
+                .unwrap_or_else(|| scroll_bar_bounds(display_bounds, selection));
+            let bounds = scroll_preview_bounds(display_bounds, selection, bar_bounds);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                focus: false,
+                show: true,
+                kind: WindowKind::PopUp,
+                is_movable: true,
+                is_resizable: false,
+                is_minimizable: false,
+                display_id,
+                window_background: WindowBackgroundAppearance::Transparent,
+                ..Default::default()
+            };
             let view_controller = controller.clone();
             let opened = cx
                 .open_window(options, |window, cx| {
@@ -2792,6 +3117,9 @@ impl Controller {
     }
 
     pub fn toggle_scroll_auto(&mut self, cx: &mut Context<Self>) {
+        if self.is_scroll_annotating() {
+            return;
+        }
         let Some(active) = self.scroll.as_mut() else {
             return;
         };
@@ -2801,6 +3129,7 @@ impl Controller {
         let next = !active.snapshot.auto_scrolling;
         match session.set_auto_scroll(next) {
             Ok(()) => {
+                active.auto_scroll_intent = next.then_some(active.snapshot.auto_direction);
                 active.snapshot = session.snapshot();
                 cx.notify();
             }
@@ -2821,6 +3150,14 @@ impl Controller {
         direction: ScrollDirection,
         cx: &mut Context<Self>,
     ) {
+        if let Some(active) = self.scroll.as_mut()
+            && let Some(mode) = active.annotation_mode.as_mut()
+        {
+            mode.resume_auto = true;
+            mode.direction = direction;
+            self.leave_scroll_annotation(true, true, cx);
+            return;
+        }
         let Some(active) = self.scroll.as_mut() else {
             return;
         };
@@ -2831,6 +3168,7 @@ impl Controller {
             !active.snapshot.auto_scrolling || active.snapshot.auto_direction != direction;
         match session.set_auto_scroll_direction(enabled, direction) {
             Ok(()) => {
+                active.auto_scroll_intent = enabled.then_some(direction);
                 active.snapshot = session.snapshot();
                 cx.notify();
             }
@@ -2844,6 +3182,27 @@ impl Controller {
                 self.fail(format!("{err}"), cx);
             }
         }
+    }
+
+    pub fn scroll_bar_local_origin(&self) -> Option<gpui_kit::Point<Pixels>> {
+        let active = self.scroll.as_ref()?;
+        let bounds = active
+            .saved_bar_bounds
+            .unwrap_or_else(|| scroll_bar_bounds(active.display_bounds, active.selection));
+        Some(bounds.origin - active.display_bounds.origin)
+    }
+
+    pub fn set_scroll_bar_local_origin(&mut self, local: gpui_kit::Point<Pixels>) {
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
+        active.saved_bar_bounds = Some(Bounds::new(
+            active.display_bounds.origin + local,
+            gpui_kit::size(
+                px(crate::scroll_bar::SCROLL_BAR_SIZE.0),
+                px(crate::scroll_bar::SCROLL_BAR_SIZE.1),
+            ),
+        ));
     }
 
     pub fn toggle_scroll_preview(&mut self, cx: &mut Context<Self>) {
@@ -2870,6 +3229,7 @@ impl Controller {
     }
 
     pub fn reset_scroll(&mut self, cx: &mut Context<Self>) {
+        self.leave_scroll_annotation(false, true, cx);
         let Some(active) = self.scroll.as_mut() else {
             return;
         };
@@ -2879,6 +3239,7 @@ impl Controller {
             active.annotation_content_shift = 0;
             active.annotation_reset_pending = true;
             active.annotation_auto_resume = false;
+            active.auto_scroll_intent = None;
             active.snapshot = session.snapshot();
             cx.notify();
         }
@@ -2911,6 +3272,10 @@ impl Controller {
         if active.finishing {
             return;
         }
+        self.leave_scroll_annotation(false, false, cx);
+        let Some(active) = self.scroll.as_mut() else {
+            return;
+        };
         if active.session.is_none() {
             if active.start.is_some() {
                 active.pending_finish = Some(action);
@@ -2926,9 +3291,7 @@ impl Controller {
         );
         let watermark = if needs_watermark {
             let watermark_config = AppSettings::get(cx).watermark.clone();
-            if watermark_config.enabled
-                && watermark_config.target_enabled(WatermarkTarget::Screenshot)
-            {
+            if watermark_config.target_enabled(WatermarkTarget::Screenshot) {
                 let resolved = watermark_config
                     .preset(WatermarkTarget::Screenshot)
                     .ok_or_else(|| anyhow::anyhow!("watermark template is unavailable"))
@@ -3056,6 +3419,7 @@ impl Controller {
     }
 
     fn finish_scroll_ui(&mut self, cx: &mut Context<Self>) {
+        self.leave_scroll_annotation(false, false, cx);
         let windows = self
             .scroll
             .take()
@@ -3517,6 +3881,60 @@ mod tests {
     }
 
     #[test]
+    fn annotation_resumes_auto_scroll_stopped_by_control_interaction() {
+        for direction in [ScrollDirection::Up, ScrollDirection::Down] {
+            let snapshot = ScrollSnapshot {
+                status: ScrollStatus::StoppedByUser,
+                auto_direction: direction,
+                ..ScrollSnapshot::default()
+            };
+            assert_eq!(
+                annotation_auto_direction(&snapshot, Some(direction)),
+                Some(direction)
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_does_not_revive_cleared_paused_or_finished_auto_scroll() {
+        let snapshot = ScrollSnapshot::default();
+        assert_eq!(annotation_auto_direction(&snapshot, None), None);
+        assert_eq!(
+            annotation_auto_direction(
+                &ScrollSnapshot {
+                    paused: true,
+                    ..ScrollSnapshot::default()
+                },
+                Some(ScrollDirection::Down),
+            ),
+            None
+        );
+        assert_eq!(
+            annotation_auto_direction(
+                &ScrollSnapshot {
+                    status: ScrollStatus::ReachedEnd,
+                    ..ScrollSnapshot::default()
+                },
+                Some(ScrollDirection::Down),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn annotation_uses_the_live_auto_scroll_direction() {
+        let snapshot = ScrollSnapshot {
+            auto_scrolling: true,
+            auto_direction: ScrollDirection::Up,
+            ..ScrollSnapshot::default()
+        };
+        assert_eq!(
+            annotation_auto_direction(&snapshot, Some(ScrollDirection::Down)),
+            Some(ScrollDirection::Up)
+        );
+    }
+
+    #[test]
     fn upward_stitching_moves_annotations_in_logical_coordinates_once() {
         let mut annotations = Layer::default();
         annotations.set_tool(crate::annotate::Tool::Line);
@@ -3556,6 +3974,18 @@ mod tests {
         assert_eq!(
             annotations.committed()[0].extents(),
             (10.0, 140.0, 20.0, 0.0)
+        );
+
+        Controller::sync_scroll_annotation_shapes(
+            &mut annotations,
+            &mut content_shift,
+            &mut reset_pending,
+            2.0,
+            200,
+        );
+        assert_eq!(
+            annotations.committed()[0].extents(),
+            (10.0, 110.0, 20.0, 0.0)
         );
     }
 

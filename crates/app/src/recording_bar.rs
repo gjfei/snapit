@@ -197,6 +197,64 @@ fn make_click_through(window: &mut Window) {
     let _ = window;
 }
 
+pub(crate) fn make_interactive_window(window: &mut Window) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyObject, Bool};
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Ok(handle) = HasWindowHandle::window_handle(&*window) else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+        unsafe {
+            let view = handle.ns_view.as_ptr().cast::<AnyObject>();
+            let native_window: *mut AnyObject = msg_send![view, window];
+            if !native_window.is_null() {
+                let _: () = msg_send![native_window, setIgnoresMouseEvents: Bool::NO];
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+        };
+
+        let Ok(handle) = HasWindowHandle::window_handle(&*window) else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = handle.hwnd.get() as *mut std::ffi::c_void;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                style & !(WS_EX_TRANSPARENT as isize | WS_EX_NOACTIVATE as isize),
+            );
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = window;
+}
+
 /// Prepare a window that covers the recorded display: keep it out of the
 /// capture and let pointer events reach the app being recorded.
 pub(crate) fn make_recording_window(window: &mut Window) {

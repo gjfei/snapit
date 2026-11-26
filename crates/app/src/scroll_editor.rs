@@ -14,12 +14,12 @@ use std::{
 use anyhow::Context as _;
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
+    color_picker::{ColorPickerEvent, ColorPickerState},
     h_flex,
     scroll::ScrollableElement as _,
-    slider::{Slider, SliderEvent, SliderState, SliderValue},
+    slider::{SliderEvent, SliderState, SliderValue},
     toolbar::Toolbar,
     v_flex,
 };
@@ -27,16 +27,17 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context, CursorStyle, DisplayId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla, InteractiveElement as _,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, Rgba,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
 };
 use snapit_capture::{ImageSource, WatermarkSpec};
 use snapit_store::{AnnotationTool, WatermarkTarget};
 
-use crate::annotate::{self, Layer, Shape, Tool};
+use crate::annotate::{self, Layer, Shape};
 use crate::appearance;
+use crate::capture_toolbar;
 use crate::controller::{Captured, Controller};
 use crate::session;
 use crate::settings::AppSettings;
@@ -265,9 +266,7 @@ fn crop_and_shift_shapes(
         ImageSource::Memory(image) => ImageSource::Memory(Arc::new(
             image::imageops::crop_imm(image.as_ref(), 0, top, width, bottom - top).to_image(),
         )),
-        ImageSource::Disk(image) => {
-            ImageSource::Disk(Arc::new(image.crop_vertical(top, bottom - top)?))
-        }
+        ImageSource::Disk(image) => ImageSource::Disk(Arc::new(image.crop_vertical(top, bottom)?)),
     };
     let shifted = if shapes.is_empty() {
         None
@@ -347,7 +346,7 @@ impl ScrollEditorView {
                 let ColorPickerEvent::Change(Some(color)) = event else {
                     return;
                 };
-                let rgb_color = color_to_rgb(*color);
+                let rgb_color = capture_toolbar::color_to_rgb(*color);
                 this.annotations.set_color(rgb_color);
                 this.persist_defaults(cx);
                 cx.notify();
@@ -626,17 +625,16 @@ impl ScrollEditorView {
     fn export_captured(&mut self, cx: &mut Context<Self>) -> anyhow::Result<Captured> {
         self.annotations.commit();
         let watermark_cfg = AppSettings::get(cx).watermark.clone();
-        let watermark =
-            if watermark_cfg.enabled && watermark_cfg.target_enabled(WatermarkTarget::Screenshot) {
-                watermark_cfg
-                    .preset(WatermarkTarget::Screenshot)
-                    .ok_or_else(|| anyhow::anyhow!("watermark template is unavailable"))
-                    .and_then(|preset| {
-                        crate::export::watermark_spec(preset, AppSettings::watermark_dir(cx))
-                    })?
-            } else {
-                WatermarkSpec::default()
-            };
+        let watermark = if watermark_cfg.target_enabled(WatermarkTarget::Screenshot) {
+            watermark_cfg
+                .preset(WatermarkTarget::Screenshot)
+                .ok_or_else(|| anyhow::anyhow!("watermark template is unavailable"))
+                .and_then(|preset| {
+                    crate::export::watermark_spec(preset, AppSettings::watermark_dir(cx))
+                })?
+        } else {
+            WatermarkSpec::default()
+        };
         let (cropped, shapes) = crop_and_shift_shapes(
             &self.image,
             self.annotations.committed(),
@@ -841,120 +839,6 @@ impl ScrollEditorView {
             cx.stop_propagation();
         }
     }
-
-    fn tool_button(
-        &self,
-        id: &'static str,
-        icon: LucideIcon,
-        label: String,
-        tool: Tool,
-        current: Tool,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        Button::new(id)
-            .ghost()
-            .small()
-            .icon(icon)
-            .tooltip(label.clone())
-            .accessibility_label(label)
-            .selected(current == tool)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let same = this.annotations.tool() == tool && this.annotations.selected().is_none();
-                this.annotations.deselect();
-                this.annotations.set_tool(tool);
-                this.style_open = if same { !this.style_open } else { true };
-                cx.notify();
-            }))
-    }
-
-    fn render_style_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let active = self.annotations.active_tool();
-        let style = self.annotations.style();
-        let picked = self.annotations.selected().is_some();
-        let slider_ix = active.style_index();
-        let uses_color = active.uses_color();
-        let size_label = t!("overlay.size_value", value = style.size.round() as u32).to_string();
-
-        let swatches = annotate::COLORS.into_iter().map(|color| {
-            let selected = (style.color & 0x00FF_FFFF) == color;
-            div()
-                .id(SharedString::from(format!("editor-color-{color}")))
-                .size(px(16.))
-                .rounded(px(4.))
-                .bg(rgb(color))
-                .when(selected, |this| this.border_2().border_color(theme.primary))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.annotations.set_color(color);
-                    this.persist_defaults(cx);
-                    cx.notify();
-                }))
-        });
-
-        let picker = ColorPicker::new(&self.color_picker)
-            .with_size(px(16.))
-            .accessibility_label(t!("overlay.style").to_string())
-            .featured_colors(
-                annotate::COLORS
-                    .into_iter()
-                    .map(|color| Hsla::from(rgb(color)))
-                    .collect(),
-            );
-
-        h_flex()
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .gap_3()
-            .items_center()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.group_box)
-            .when(uses_color, |this| {
-                this.child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .children(swatches)
-                        .child(picker),
-                )
-            })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(t!("overlay.size").to_string()),
-                    )
-                    .child(Slider::new(&self.size_sliders[slider_ix]).w(px(140.)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(size_label),
-                    ),
-            )
-            .when(picked, |this| {
-                this.child(
-                    Button::new("editor-delete-annotation")
-                        .ghost()
-                        .small()
-                        .icon(LucideIcon::Trash)
-                        .tooltip(t!("overlay.delete").to_string())
-                        .accessibility_label(t!("overlay.delete").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.annotations.delete_selected() {
-                                this.style_open = false;
-                                cx.notify();
-                            }
-                        })),
-                )
-            })
-    }
 }
 
 impl EntityInputHandler for ScrollEditorView {
@@ -1146,123 +1030,70 @@ impl Render for ScrollEditorView {
                     .border_b_1()
                     .border_color(theme.border)
                     .bg(theme.popover)
-                    .child(
-                        Toolbar::new("scroll-editor-tools")
-                            .child(self.tool_button(
-                                "ed-rect",
-                                LucideIcon::Square,
-                                t!("overlay.tool.rect").to_string(),
-                                Tool::Rect,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-arrow",
-                                LucideIcon::ArrowUpRight,
-                                t!("overlay.tool.arrow").to_string(),
-                                Tool::Arrow,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-line",
-                                LucideIcon::Minus,
-                                t!("overlay.tool.line").to_string(),
-                                Tool::Line,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-pen",
-                                LucideIcon::Pencil,
-                                t!("overlay.tool.pen").to_string(),
-                                Tool::Pen,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-mosaic",
-                                LucideIcon::Grid3x3,
-                                t!("overlay.tool.mosaic").to_string(),
-                                Tool::Mosaic,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-text",
-                                LucideIcon::Type,
-                                t!("overlay.tool.text").to_string(),
-                                Tool::Text,
-                                current,
-                                cx,
-                            ))
-                            .child(self.tool_button(
-                                "ed-step",
-                                LucideIcon::ListOrdered,
-                                t!("overlay.tool.step").to_string(),
-                                Tool::Step,
-                                current,
-                                cx,
-                            ))
-                            .content(div().w(px(1.)).h(px(16.)).bg(theme.border).mx_1())
-                            .child(
-                                Button::new("ed-undo")
+                    .child({
+                        let select_view = view_entity.clone();
+                        let undo_view = view_entity.clone();
+                        let clear_view = view_entity.clone();
+                        capture_toolbar::append_annotation_tools(
+                            Toolbar::new("scroll-editor-tools"),
+                            "ed",
+                            Some(current),
+                            can_undo,
+                            false,
+                            &theme,
+                            move |tool, _, _, cx| {
+                                select_view.update(cx, |this, cx| {
+                                    let same = this.annotations.tool() == tool
+                                        && this.annotations.selected().is_none();
+                                    this.annotations.deselect();
+                                    this.annotations.set_tool(tool);
+                                    this.style_open = if same { !this.style_open } else { true };
+                                    cx.notify();
+                                });
+                            },
+                            move |_, _, cx| {
+                                undo_view.update(cx, |this, cx| {
+                                    this.annotations.undo();
+                                    cx.notify();
+                                });
+                            },
+                            move |_, _, cx| {
+                                clear_view.update(cx, |this, cx| {
+                                    this.annotations.clear();
+                                    cx.notify();
+                                });
+                            },
+                        )
+                        .content(capture_toolbar::toolbar_divider(&theme))
+                        .child(
+                            Button::new("ed-trim")
+                                .ghost()
+                                .small()
+                                .selected(self.trim_mode)
+                                .icon(LucideIcon::Scissors)
+                                .tooltip(t!("scroll_editor.trim_hint").to_string())
+                                .accessibility_label(t!("scroll_editor.trim").to_string())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.trim_mode = !this.trim_mode;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(trimmed, |this| {
+                            this.child(
+                                Button::new("ed-trim-reset")
                                     .ghost()
                                     .small()
-                                    .icon(LucideIcon::Undo2)
-                                    .tooltip(t!("overlay.undo").to_string())
-                                    .accessibility_label(t!("overlay.undo").to_string())
-                                    .disabled(!can_undo)
+                                    .icon(LucideIcon::RotateCcw)
+                                    .tooltip(t!("scroll_editor.trim_reset").to_string())
+                                    .accessibility_label(t!("scroll_editor.trim_reset").to_string())
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.annotations.undo();
+                                        this.trim_top = 0;
+                                        this.trim_bottom = this.image.height();
                                         cx.notify();
                                     })),
                             )
-                            .child(
-                                Button::new("ed-clear")
-                                    .ghost()
-                                    .small()
-                                    .icon(LucideIcon::Eraser)
-                                    .tooltip(t!("overlay.clear").to_string())
-                                    .accessibility_label(t!("overlay.clear").to_string())
-                                    .disabled(!can_undo)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.annotations.clear();
-                                        cx.notify();
-                                    })),
-                            )
-                            .content(div().w(px(1.)).h(px(16.)).bg(theme.border).mx_1())
-                            .child(
-                                Button::new("ed-trim")
-                                    .ghost()
-                                    .small()
-                                    .selected(self.trim_mode)
-                                    .icon(LucideIcon::Scissors)
-                                    .tooltip(t!("scroll_editor.trim_hint").to_string())
-                                    .accessibility_label(t!("scroll_editor.trim").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.trim_mode = !this.trim_mode;
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(trimmed, |this| {
-                                this.child(
-                                    Button::new("ed-trim-reset")
-                                        .ghost()
-                                        .small()
-                                        .icon(LucideIcon::RotateCcw)
-                                        .tooltip(t!("scroll_editor.trim_reset").to_string())
-                                        .accessibility_label(
-                                            t!("scroll_editor.trim_reset").to_string(),
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.trim_top = 0;
-                                            this.trim_bottom = this.image.height();
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    )
+                        })
+                    })
                     .child(
                         h_flex()
                             .gap_1()
@@ -1352,7 +1183,38 @@ impl Render for ScrollEditorView {
             )
             .when(
                 self.style_open || self.annotations.selected().is_some(),
-                |this| this.child(self.render_style_strip(cx)),
+                |this| {
+                    let active = self.annotations.active_tool();
+                    let style = self.annotations.style();
+                    let picked = self.annotations.selected().is_some();
+                    let delete_view = view_entity.clone();
+                    let on_delete = picked.then(|| -> capture_toolbar::DeleteHandler {
+                        Box::new(move |_, _, cx| {
+                            delete_view.update(cx, |this, cx| {
+                                if this.annotations.delete_selected() {
+                                    this.style_open = false;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                    });
+                    this.child(
+                        capture_toolbar::render_annotation_style_bar(
+                            "ed-style",
+                            active,
+                            style.size,
+                            &self.color_picker,
+                            &self.size_sliders[active.style_index()],
+                            on_delete,
+                            &theme,
+                        )
+                        .flex_none()
+                        .px_3()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .bg(theme.group_box),
+                    )
+                },
             )
             .child(
                 div()
@@ -1696,12 +1558,6 @@ impl Render for ScrollEditorView {
     }
 }
 
-fn color_to_rgb(color: Hsla) -> u32 {
-    let rgba = Rgba::from(color);
-    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
-    (channel(rgba.r) << 16) | (channel(rgba.g) << 8) | channel(rgba.b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,6 +1717,30 @@ mod tests {
                 assert_eq!(*to, [50.0, 150.0]);
             }
             _ => panic!("expected Rect"),
+        }
+    }
+
+    #[test]
+    fn cropping_disk_trim_uses_exclusive_bottom_row() {
+        let mut raw = vec![0u8; 4 * 100 * 4];
+        for y in 0..100u32 {
+            for x in 0..4u32 {
+                let at = ((y * 4 + x) * 4) as usize;
+                raw[at..at + 4].copy_from_slice(&[y as u8, 0, 0, 255]);
+            }
+        }
+        let img = snapit_capture::RgbaImage::from_raw(4, 100, raw).unwrap();
+        let disk = ImageSource::Disk(Arc::new(
+            snapit_capture::DiskImage::from_image(&img).unwrap(),
+        ));
+        let (cropped, _) = crop_and_shift_shapes(&disk, &[], 1.0, 30, 80).unwrap();
+        assert_eq!(cropped.dimensions(), (4, 50));
+        if let ImageSource::Disk(cropped_disk) = cropped {
+            let rows = cropped_disk.read_rows(0, 50).unwrap();
+            assert_eq!(rows.get_pixel(0, 0).0[0], 30);
+            assert_eq!(rows.get_pixel(0, 49).0[0], 79);
+        } else {
+            panic!("expected disk image");
         }
     }
 }
