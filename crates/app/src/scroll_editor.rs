@@ -306,6 +306,7 @@ pub struct ScrollEditorView {
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus_handle: FocusHandle,
     toast: Option<(SharedString, Instant)>,
+    recorded_in_history: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -389,6 +390,16 @@ impl ScrollEditorView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_window, cx| {
+            weak.update(cx, |this, cx| this.remember_if_unrecorded(cx))
+                .ok();
+            true
+        });
+        subscriptions.push(cx.on_release(|this: &mut Self, cx: &mut App| {
+            this.remember_if_unrecorded(cx);
+        }));
+
         let mut view = Self {
             image: Arc::new(image),
             scale,
@@ -418,6 +429,7 @@ impl ScrollEditorView {
             canvas_bounds: Rc::new(Cell::new(None)),
             focus_handle,
             toast: None,
+            recorded_in_history: false,
             _subscriptions: subscriptions,
         };
         let initial_range = if view.tiles.is_empty() {
@@ -622,7 +634,7 @@ impl ScrollEditorView {
         self.trim_top > 0 || self.trim_bottom < self.image.height()
     }
 
-    fn export_captured(&mut self, cx: &mut Context<Self>) -> anyhow::Result<Captured> {
+    fn export_captured(&mut self, cx: &App) -> anyhow::Result<Captured> {
         self.annotations.commit();
         let watermark_cfg = AppSettings::get(cx).watermark.clone();
         let watermark = if watermark_cfg.target_enabled(WatermarkTarget::Screenshot) {
@@ -647,9 +659,53 @@ impl ScrollEditorView {
         ))
     }
 
+    fn export_captured_for_history(&mut self, cx: &App) -> anyhow::Result<Captured> {
+        match self.export_captured(cx) {
+            Ok(captured) => Ok(captured),
+            Err(err) => {
+                log::warn!("scroll editor watermark skipped for history save: {err:#}");
+                self.annotations.commit();
+                let (cropped, shapes) = crop_and_shift_shapes(
+                    &self.image,
+                    self.annotations.committed(),
+                    self.scale,
+                    self.trim_top,
+                    self.trim_bottom,
+                )?;
+                Ok(Captured::from_parts(
+                    cropped,
+                    None,
+                    self.scale,
+                    shapes,
+                    WatermarkSpec::default(),
+                ))
+            }
+        }
+    }
+
+    fn remember_if_unrecorded(&mut self, cx: &mut App) {
+        if self.recorded_in_history {
+            return;
+        }
+        match self.export_captured_for_history(cx) {
+            Ok(captured) => {
+                self.recorded_in_history = true;
+                cx.defer(move |cx| {
+                    Controller::global(cx).update(cx, |controller, cx| {
+                        controller.remember(&captured, cx);
+                    });
+                });
+            }
+            Err(err) => {
+                log::warn!("failed to record scroll editor image into history on close: {err:#}");
+            }
+        }
+    }
+
     fn copy_result(&mut self, cx: &mut Context<Self>) {
         match self.export_captured(cx) {
             Ok(captured) => {
+                self.recorded_in_history = true;
                 let (w, h) = captured.clean_sdr.dimensions();
                 Controller::global(cx).update(cx, |controller, cx| {
                     controller.remember_and_copy(captured, cx);
@@ -666,6 +722,7 @@ impl ScrollEditorView {
     fn save_result(&mut self, cx: &mut Context<Self>) {
         match self.export_captured(cx) {
             Ok(captured) => {
+                self.recorded_in_history = true;
                 Controller::global(cx).update(cx, |controller, cx| {
                     controller.remember_and_save(captured, cx);
                 });
@@ -677,6 +734,7 @@ impl ScrollEditorView {
     fn pin_result(&mut self, cx: &mut Context<Self>) {
         match self.export_captured(cx) {
             Ok(captured) => {
+                self.recorded_in_history = true;
                 Controller::global(cx).update(cx, |controller, cx| {
                     controller.remember_and_pin(captured, cx);
                 });
@@ -998,7 +1056,8 @@ impl Render for ScrollEditorView {
                     this.annotations.cancel_draft();
                     cx.notify();
                 } else {
-                    window.remove_window();
+                    this.remember_if_unrecorded(cx);
+                    crate::overlay::close_window(window);
                 }
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
@@ -1742,5 +1801,14 @@ mod tests {
         } else {
             panic!("expected disk image");
         }
+    }
+
+    #[test]
+    fn crop_and_shift_preserves_full_untrimmed_image_and_empty_shapes() {
+        let img = snapit_capture::RgbaImage::from_pixel(12, 40, image::Rgba([10, 20, 30, 255]));
+        let src = ImageSource::from(img);
+        let (cropped, shapes) = crop_and_shift_shapes(&src, &[], 2.0, 0, 40).unwrap();
+        assert_eq!(cropped.dimensions(), (12, 40));
+        assert!(shapes.is_none());
     }
 }

@@ -45,13 +45,13 @@ actions!(
     ]
 );
 
-pub const SCROLL_BAR_SIZE: (f32, f32) = (672., 36.);
+pub const SCROLL_BAR_SIZE: (f32, f32) = (586., 36.);
 const SCROLL_BAR_WARNING_HEIGHT: f32 = 28.;
 pub const SCROLL_BAR_EXPANDED_HEIGHT: f32 = SCROLL_BAR_SIZE.1 + SCROLL_BAR_WARNING_HEIGHT;
 pub const PREVIEW_WINDOW_WIDTH: f32 = 280.;
 const CONTEXT: &str = "ScrollBar";
 const PREVIEW_CONTENT_WIDTH: f32 = PREVIEW_WINDOW_WIDTH - 16.;
-const PREVIEW_CHROME_HEIGHT: f32 = 76.;
+const PREVIEW_CHROME_HEIGHT: f32 = 48.;
 const PREVIEW_AREA_PADDING: f32 = 16.;
 
 pub fn init(cx: &mut App) {
@@ -156,7 +156,6 @@ enum ScrollStatusTone {
 
 struct ScrollStatusInfo {
     label: String,
-    bar_label: String,
     tone: ScrollStatusTone,
     warning: Option<String>,
 }
@@ -173,7 +172,7 @@ fn scroll_status_info(snap: &ScrollSnapshot) -> ScrollStatusInfo {
     } else {
         ScrollStatusTone::Active
     };
-    let bar_label = if !snap.started {
+    let state_label = if !snap.started {
         t!("scroll.starting").to_string()
     } else {
         match snap.status {
@@ -192,10 +191,9 @@ fn scroll_status_info(snap: &ScrollSnapshot) -> ScrollStatusInfo {
             ScrollStatus::Failed => t!("scroll.failed").to_string(),
         }
     };
-    let label = warning.clone().unwrap_or_else(|| bar_label.clone());
+    let label = warning.clone().unwrap_or(state_label);
     ScrollStatusInfo {
         label,
-        bar_label,
         tone,
         warning,
     }
@@ -266,15 +264,14 @@ pub(crate) fn render_scroll_bar_card(
     theme: &Theme,
 ) -> Div {
     let info = scroll_status_info(snap);
-    let (dot_color, bar_label) = if active_tool.is_some() {
-        (theme.primary, t!("scroll.annotating").to_string())
+    let dot_color = if active_tool.is_some() {
+        theme.primary
     } else {
-        let dot = match info.tone {
+        match info.tone {
             ScrollStatusTone::Active => theme.primary,
             ScrollStatusTone::Success => theme.success,
             ScrollStatusTone::Warning => theme.warning,
-        };
-        (dot, info.bar_label)
+        }
     };
     let auto_up_hint = t!("scroll.auto_up_hint").to_string();
     let auto_down_hint = t!("scroll.auto_down_hint").to_string();
@@ -425,23 +422,13 @@ pub(crate) fn render_scroll_bar_card(
                 .on_mouse_down(MouseButton::Left, on_drag)
                 .child(
                     h_flex()
-                        .flex_1()
-                        .min_w_0()
+                        .flex_none()
                         .h_full()
                         .pl_1p5()
-                        .pr_1()
-                        .gap_1p5()
+                        .pr_1p5()
                         .items_center()
-                        .child(div().size_2().flex_none().rounded_full().bg(dot_color))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(bar_label),
-                        ),
+                        .justify_center()
+                        .child(div().size_2().flex_none().rounded_full().bg(dot_color)),
                 )
                 .child(
                     div()
@@ -860,15 +847,29 @@ impl Render for ScrollPreview {
         let dims = snap
             .as_ref()
             .filter(|snapshot| snapshot.started)
-            .map(|snapshot| format!("{} × {}", snapshot.width, snapshot.height))
-            .unwrap_or_else(|| t!("scroll.preview_title").to_string());
+            .map(|snapshot| format!("{} × {}", snapshot.width, snapshot.height));
+        let is_annotating = controller.is_scroll_annotating();
         let status_info = snap.as_ref().map(|snapshot| {
-            let info = scroll_status_info(snapshot);
+            let mut info = scroll_status_info(snapshot);
+            if is_annotating && info.warning.is_none() {
+                info.label = t!("scroll.annotating").to_string();
+                info.tone = ScrollStatusTone::Active;
+            }
             let highlight_warning =
                 info.warning.is_some() || snapshot.status == ScrollStatus::Failed;
             (info, highlight_warning)
         });
         let theme = cx.theme().clone();
+        let highlight_warning = status_info.as_ref().is_some_and(|(_, warning)| *warning);
+        let dot_color = status_info.as_ref().map(|(info, _)| match info.tone {
+            ScrollStatusTone::Active => theme.primary,
+            ScrollStatusTone::Success => theme.success,
+            ScrollStatusTone::Warning => theme.warning,
+        });
+        let prompt = status_info
+            .as_ref()
+            .map(|(info, _)| info.label.clone())
+            .unwrap_or_else(|| t!("scroll.preview_title").to_string());
         let image_width = snap.as_ref().map_or(1, |snapshot| snapshot.width.max(1));
         let image_height = snap.as_ref().map_or(1, |snapshot| snapshot.height.max(1));
         let tile = self.tile.clone();
@@ -896,22 +897,55 @@ impl Render for ScrollPreview {
                     .flex_none()
                     .px_2()
                     .py_1()
-                    .justify_between()
+                    .gap_1p5()
+                    .items_center()
                     .border_b_1()
-                    .border_color(theme.border)
+                    .when(highlight_warning, |this| {
+                        this.border_color(theme.warning.opacity(0.45))
+                            .bg(theme.warning.opacity(0.14))
+                    })
+                    .when(!highlight_warning, |this| {
+                        this.border_color(theme.border)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, _| this.drag(window)),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(dims),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .items_center()
+                            .when_some(dot_color, |this, color| {
+                                this.child(div().size_2().flex_none().rounded_full().bg(color))
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(if highlight_warning {
+                                        theme.foreground
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .truncate()
+                                    .child(prompt),
+                            )
+                            .when_some(dims, |this, dims| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(dims),
+                                )
+                            }),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new("close-scroll-preview")
@@ -928,43 +962,6 @@ impl Render for ScrollPreview {
                             ),
                     ),
             )
-            .when_some(status_info, |this, (info, highlight_warning)| {
-                let dot_color = match info.tone {
-                    ScrollStatusTone::Active => theme.primary,
-                    ScrollStatusTone::Success => theme.success,
-                    ScrollStatusTone::Warning => theme.warning,
-                };
-                this.child(
-                    h_flex()
-                        .flex_none()
-                        .px_2()
-                        .py_1p5()
-                        .gap_1p5()
-                        .items_center()
-                        .border_b_1()
-                        .when(highlight_warning, |this| {
-                            this.border_color(theme.warning.opacity(0.45))
-                                .bg(theme.warning.opacity(0.14))
-                        })
-                        .when(!highlight_warning, |this| {
-                            this.border_color(theme.border).bg(theme.group_box)
-                        })
-                        .child(div().size_2().flex_none().rounded_full().bg(dot_color))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(if highlight_warning {
-                                    theme.foreground
-                                } else {
-                                    theme.muted_foreground
-                                })
-                                .truncate()
-                                .child(info.label),
-                        ),
-                )
-            })
             .child(
                 div()
                     .flex_1()
@@ -1156,7 +1153,7 @@ mod tests {
         );
         assert_eq!(
             preview.size.height,
-            px(PREVIEW_CONTENT_WIDTH * 1080.0 / 1920.0 + PREVIEW_CHROME_HEIGHT)
+            px(PREVIEW_CONTENT_WIDTH * 1080.0 / 1920.0 + PREVIEW_CHROME_HEIGHT).max(px(220.))
         );
         assert!(!preview.intersects(&bar));
         assert!(preview.origin.y >= display.origin.y + px(16.));
@@ -1190,7 +1187,6 @@ mod tests {
         assert_eq!(too_fast.tone, ScrollStatusTone::Warning);
         assert!(too_fast.warning.is_some());
         assert_eq!(too_fast.label, too_fast.warning.clone().unwrap());
-        assert_eq!(too_fast.bar_label, capturing.bar_label);
 
         snap.warning = Some(ScrollWarning::LowTexture);
         let low_tex = scroll_status_info(&snap);
