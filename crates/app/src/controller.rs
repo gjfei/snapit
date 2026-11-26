@@ -296,6 +296,10 @@ pub struct Controller {
     /// Action pressed while a recording was stopping. Encoding keeps `busy`
     /// set for seconds, so it is started once the container is finalised.
     queued_capture: Option<CaptureIntent>,
+    /// macOS: PID of the other application that held focus before capture
+    /// began so closing the overlay returns focus instead of raising open
+    /// SnapIt windows in the background.
+    pending_restore_app: Option<i32>,
     /// The user chose to capture without element snapping for this run.
     element_permission_acknowledged: bool,
 }
@@ -331,6 +335,7 @@ impl Controller {
             last_display_id: None,
             pending_capture: None,
             queued_capture: None,
+            pending_restore_app: None,
             element_permission_acknowledged: false,
         });
         cx.set_global(GlobalController(controller.clone()));
@@ -583,7 +588,7 @@ impl Controller {
             if let Some(bar_handle) = bar_handle
                 && let Ok(bounds) = bar_handle.update(cx, |_, window, _| {
                     let bounds = window.bounds();
-                    window.remove_window();
+                    crate::overlay::close_window(window);
                     bounds
                 })
             {
@@ -1237,6 +1242,7 @@ impl Controller {
         if self.is_busy() {
             return;
         }
+        self.pending_restore_app = crate::overlay::frontmost_other_app();
         self.workflow_serial = self.workflow_serial.wrapping_add(1);
         self.log_operation = Some(crate::logging::begin_capture());
         log::info!("capture start: intent={intent:?}");
@@ -1337,6 +1343,12 @@ impl Controller {
         .detach();
     }
 
+    fn restore_previous_app(&mut self) {
+        if let Some(pid) = self.pending_restore_app.take() {
+            crate::overlay::restore_frontmost_app(pid);
+        }
+    }
+
     /// Drop a pre-placed capture session whose freeze failed.
     fn abort_capture(&mut self, session: Option<&Entity<CaptureSession>>, cx: &mut Context<Self>) {
         if self
@@ -1344,6 +1356,7 @@ impl Controller {
             .as_ref()
             .is_some_and(|active| Some(&active.session) == session)
         {
+            self.restore_previous_app();
             self.close_selection(cx);
             self.finish_pending_close(cx);
         }
@@ -1491,7 +1504,7 @@ impl Controller {
             if session.read(cx).frame(overlay.slot).is_none() {
                 overlay
                     .window
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
                 continue;
             }
@@ -1505,6 +1518,7 @@ impl Controller {
                 .ok();
             kept.push(overlay);
         }
+        #[cfg(not(target_os = "macos"))]
         cx.activate(true);
         if kept.is_empty() {
             self.close_selection(cx);
@@ -1614,6 +1628,15 @@ impl Controller {
             && image.is_some()
             && record_target.is_some();
         if !record_now && !scroll_now {
+            if matches!(
+                command,
+                SessionCommand::Cancel | SessionCommand::Copy | SessionCommand::Pin
+            ) || image.is_none()
+            {
+                self.restore_previous_app();
+            } else if matches!(command, SessionCommand::Recognize) {
+                self.pending_restore_app = None;
+            }
             self.close_selection(cx);
         } else {
             // Recording/scrolling set their own busy phase synchronously.
@@ -1700,7 +1723,7 @@ impl Controller {
                 #[cfg(not(target_os = "macos"))]
                 overlay
                     .window
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             }
         }
@@ -1712,13 +1735,13 @@ impl Controller {
     fn finish_pending_close(&mut self, cx: &mut Context<Self>) {
         for handle in self.pending_close.drain(..) {
             handle
-                .update(cx, |_, window, _| window.remove_window())
+                .update(cx, |_, window, _| crate::overlay::close_window(window))
                 .ok();
         }
     }
 
     /// Keep a capture for "pin last capture" and auto-save it to history.
-    fn remember(&mut self, captured: &Captured, cx: &mut Context<Self>) {
+    pub(crate) fn remember(&mut self, captured: &Captured, cx: &mut Context<Self>) {
         self.last_capture = Some(captured.clone());
         HistoryStore::global(cx).update(cx, |history, cx| {
             history.add_image(captured.composition.clone(), captured.scale, None, cx)
@@ -1929,6 +1952,9 @@ impl Controller {
         let capture = &AppSettings::get(cx).capture;
         let (format, quality) = (capture.image_format, capture.jpeg_quality);
         let name = format!("SnapIt {}.{}", timestamp(), format.extension());
+        #[cfg(target_os = "macos")]
+        crate::overlay::activate_app_single_window();
+        #[cfg(not(target_os = "macos"))]
         cx.activate(true);
         let path = cx.prompt_for_new_path(&save_dir(cx), Some(&name));
         cx.spawn(async move |this, cx| {
@@ -1936,6 +1962,7 @@ impl Controller {
                 // Save dialog dismissed: nothing will follow to flush the
                 // hidden overlays, so release them and the busy phase here.
                 this.update(cx, |this, cx| {
+                    this.restore_previous_app();
                     if this.finish_busy(busy) {
                         this.retire_log_operation();
                     }
@@ -1994,6 +2021,7 @@ impl Controller {
                         cx,
                     ),
                 }
+                this.restore_previous_app();
                 if this.finish_busy(busy) {
                     this.retire_log_operation();
                 }
@@ -2246,7 +2274,7 @@ impl Controller {
             } else {
                 overlay
                     .window
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             }
         }
@@ -2404,7 +2432,7 @@ impl Controller {
             });
             if orphaned {
                 handle
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             }
         });
@@ -2706,6 +2734,7 @@ impl Controller {
         // Defer the removals until the stack has unwound. The handles belong to
         // this closure, so a recording started in the meantime keeps its own
         // windows.
+        self.restore_previous_app();
         let windows = self
             .recording
             .take()
@@ -2716,7 +2745,7 @@ impl Controller {
                 for handle in [bar, frame].into_iter().flatten() {
                     let removing = Instant::now();
                     handle
-                        .update(cx, |_, window, _| window.remove_window())
+                        .update(cx, |_, window, _| crate::overlay::close_window(window))
                         .ok();
                     log::info!(
                         target: "timing",
@@ -2828,7 +2857,7 @@ impl Controller {
         });
         if entered.is_err() {
             self.busy = None;
-            self.finish_scroll_ui(cx);
+            self.finish_scroll_ui(true, cx);
             self.fail(
                 t!("controller.scroll_start_failed", error = "overlay").to_string(),
                 cx,
@@ -2879,7 +2908,7 @@ impl Controller {
                         }
                     }
                     Err(err) => {
-                        this.finish_scroll_ui(cx);
+                        this.finish_scroll_ui(true, cx);
                         this.fail(
                             t!("controller.scroll_start_failed", error = format!("{err:#}"))
                                 .to_string(),
@@ -3045,7 +3074,7 @@ impl Controller {
             });
             if orphaned {
                 handle
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             }
         });
@@ -3110,7 +3139,7 @@ impl Controller {
             });
             if orphaned {
                 handle
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             }
         });
@@ -3221,7 +3250,7 @@ impl Controller {
         } else if let Some(handle) = active.preview.take() {
             cx.defer(move |cx| {
                 handle
-                    .update(cx, |_, window, _| window.remove_window())
+                    .update(cx, |_, window, _| crate::overlay::close_window(window))
                     .ok();
             });
         }
@@ -3259,7 +3288,7 @@ impl Controller {
             discard_stale_scroll(session);
         }
         self.busy = None;
-        self.finish_scroll_ui(cx);
+        self.finish_scroll_ui(true, cx);
         log::info!("scroll capture discarded");
         self.retire_log_operation();
         self.resume_queued_capture(cx);
@@ -3304,7 +3333,7 @@ impl Controller {
                         if let Some(session) = active.session.take() {
                             discard_stale_scroll(session);
                         }
-                        self.finish_scroll_ui(cx);
+                        self.finish_scroll_ui(true, cx);
                         self.fail(
                             t!("controller.watermark_failed", error = format!("{err:#}"))
                                 .to_string(),
@@ -3364,7 +3393,9 @@ impl Controller {
                 Err(err) => Err(err.into()),
             };
             this.update(cx, |this, cx| {
-                this.finish_scroll_ui(cx);
+                let restore_app = !matches!(&image, Ok(Some(_)))
+                    || matches!(action, ScrollFinishAction::Copy | ScrollFinishAction::Pin);
+                this.finish_scroll_ui(restore_app, cx);
                 let hands_off_export = matches!(&image, Ok(Some(_)))
                     && matches!(action, ScrollFinishAction::Copy | ScrollFinishAction::Save);
                 match image {
@@ -3418,8 +3449,13 @@ impl Controller {
         .detach();
     }
 
-    fn finish_scroll_ui(&mut self, cx: &mut Context<Self>) {
+    fn finish_scroll_ui(&mut self, restore_app: bool, cx: &mut Context<Self>) {
         self.leave_scroll_annotation(false, false, cx);
+        if restore_app {
+            self.restore_previous_app();
+        } else {
+            self.pending_restore_app = None;
+        }
         let windows = self
             .scroll
             .take()
@@ -3428,7 +3464,7 @@ impl Controller {
             cx.defer(move |cx| {
                 for handle in [bar, preview, frame].into_iter().flatten() {
                     handle
-                        .update(cx, |_, window, _| window.remove_window())
+                        .update(cx, |_, window, _| crate::overlay::close_window(window))
                         .ok();
                 }
             });
@@ -3450,10 +3486,14 @@ impl Controller {
         // The editor does not read the controller while it is constructed, so
         // open it synchronously and handle failure before this update returns.
         // Deferring used to silently lose the long image after scroll teardown.
+        self.pending_restore_app = None;
         match crate::scroll_editor::open(image, scale, display_id, shapes, cx) {
             Ok(handle) => {
                 self.scroll_editors.push(handle);
                 self.sync_dock_visible(cx);
+                #[cfg(target_os = "macos")]
+                crate::overlay::activate_app_single_window();
+                #[cfg(not(target_os = "macos"))]
                 cx.activate(true);
             }
             Err(err) => {
@@ -3482,7 +3522,8 @@ impl Controller {
         let controller = cx.entity();
         cx.defer(move |cx| {
             if let Some(prev) = previous {
-                prev.update(cx, |_, window, _| window.remove_window()).ok();
+                prev.update(cx, |_, window, _| crate::overlay::close_window(window))
+                    .ok();
             }
             match crate::watermark_editor::open_window(
                 target,
@@ -3493,9 +3534,13 @@ impl Controller {
             ) {
                 Ok(handle) => {
                     controller.update(cx, |this, cx| {
+                        this.pending_restore_app = None;
                         this.watermark_editor = Some(handle);
                         this.sync_dock_visible(cx);
                     });
+                    #[cfg(target_os = "macos")]
+                    crate::overlay::activate_app_single_window();
+                    #[cfg(not(target_os = "macos"))]
                     cx.activate(true);
                 }
                 Err(err) => {
@@ -3573,6 +3618,10 @@ impl Controller {
                 .is_ok()
         {
             slot.handle = Some(handle);
+            self.pending_restore_app = None;
+            #[cfg(target_os = "macos")]
+            crate::overlay::activate_app_single_window();
+            #[cfg(not(target_os = "macos"))]
             cx.activate(true);
             // The panel keeps the previous run's content; tell its view the
             // controller changed so a repeated capture refreshes in place
@@ -3593,11 +3642,15 @@ impl Controller {
                 .inspect_err(|err| log::error!("failed to open {panel:?} window: {err:#}"))
                 .ok();
             controller.update(cx, |this, cx| {
+                this.pending_restore_app = None;
                 let slot = &mut this.panels[panel as usize];
                 slot.pending = false;
                 slot.handle = handle;
                 this.sync_dock_visible(cx);
             });
+            #[cfg(target_os = "macos")]
+            crate::overlay::activate_app_single_window();
+            #[cfg(not(target_os = "macos"))]
             cx.activate(true);
         });
     }

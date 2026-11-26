@@ -98,6 +98,13 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// 选区浮层（含滚动标注状态）放在 Pin（101）之上；仅用作录制/滚动边框时降到
+/// 控制条（101）之下。
+#[cfg(target_os = "macos")]
+const OVERLAY_WINDOW_LEVEL: isize = 102;
+#[cfg(target_os = "macos")]
+const RECORDING_OUTLINE_WINDOW_LEVEL: isize = 100;
+
 /// 预建浮层在冻结帧到达前先以零 alpha 上屏（仅 macOS），让 GPUI 提前建好
 /// surface，又不闪出窗口底色。Windows 的窗口在首帧之前就已显示，所以它在
 /// 冻结完成后才创建浮层。
@@ -106,12 +113,51 @@ pub fn pre_place(window: &mut Window) {
     macos_window::pre_place(window);
 }
 
+/// 记录当前最前方的其它应用 PID（当 SnapIt 自身不是最前应用时）。
+pub fn frontmost_other_app() -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_window::frontmost_other_app()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 仅激活 SnapIt 自身（macOS 不携带 NSApplicationActivateAllWindows），避免把
+/// 后台已打开的设置/历史/编辑等窗口一并拉到屏幕最前。
+pub fn activate_app_single_window() {
+    #[cfg(target_os = "macos")]
+    macos_window::activate_app_single_window();
+}
+
+/// 截图/录制结束后，将焦点交还原先的前台应用，避免 AppKit 自动把 SnapIt
+/// 其它未关闭窗口提升为 key window 盖到用户工作窗口之上。
+pub fn restore_frontmost_app(pid: i32) {
+    #[cfg(target_os = "macos")]
+    macos_window::restore_frontmost_app(pid);
+    #[cfg(not(target_os = "macos"))]
+    let _ = pid;
+}
+
 /// 立即把浮层从屏幕移除，但不销毁 GPUI 窗口。复制/保存时主线程销毁全屏
 /// overlay 要花约 37 ms（Metal layer + renderer drop），排在剪贴板写入前面；
-/// 先 orderOut 让浮层视觉上瞬间消失，等写入完成再真正 remove_window。
+/// 先 orderOut 让浮层视觉上瞬间消失，并解除 delegate 与 tracking area 避免
+/// 后续再向已摘除窗口投递失活或鼠标事件，等写入完成再真正 remove_window。
 #[cfg(target_os = "macos")]
 pub fn hide(window: &mut Window) {
     macos_window::hide(window);
+}
+
+/// 关闭并销毁窗口。在 macOS 上 `Window::remove_window()` 会把原生 `[NSWindow close]`
+/// 延迟到下一轮 foreground 任务，期间 AppKit 仍可能向已从 GPUI 移除的 `WindowId`
+/// 发送鼠标跟踪或失活回调（导致 `window not found` 错误日志）。先同步摘除
+/// delegate/firstResponder/trackingAreas 并 `orderOut:`，再调用 `remove_window()`。
+pub fn close_window(window: &mut Window) {
+    #[cfg(target_os = "macos")]
+    macos_window::hide(window);
+    window.remove_window();
 }
 
 /// Physical state of the Control key, read straight from AppKit rather than
@@ -496,6 +542,8 @@ impl OverlayView {
             root.style().background = Some(gpui_kit::transparent_black().into());
             cx.notify();
         });
+        #[cfg(target_os = "macos")]
+        macos_window::set_window_level(window, RECORDING_OUTLINE_WINDOW_LEVEL);
         crate::recording_bar::make_recording_window(window);
         cx.notify();
     }
@@ -520,6 +568,11 @@ impl OverlayView {
         self.toolbar_drag = None;
         self._scroll_subscription = Some(cx.observe(&controller, |_, _, cx| cx.notify()));
         self.scroll_annotation = Some(controller.downgrade());
+        #[cfg(target_os = "macos")]
+        {
+            macos_window::set_window_level(window, OVERLAY_WINDOW_LEVEL);
+            macos_window::activate_app_single_window();
+        }
         crate::recording_bar::make_interactive_window(window);
         self.focus_handle.focus(window, cx);
         window.activate_window();
@@ -537,6 +590,8 @@ impl OverlayView {
         self.toolbar_bounds.set(None);
         self.toolbar_drag = None;
         self.focus_handle.focus(window, cx);
+        #[cfg(target_os = "macos")]
+        macos_window::set_window_level(window, RECORDING_OUTLINE_WINDOW_LEVEL);
         crate::recording_bar::make_recording_window(window);
         cx.notify();
     }
@@ -2922,7 +2977,7 @@ mod macos_window {
         false
     }
 
-    fn native_window(window: &Window) -> Option<*mut AnyObject> {
+    fn native_view_and_window(window: &Window) -> Option<(*mut AnyObject, *mut AnyObject)> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         let handle = HasWindowHandle::window_handle(window).ok()?;
@@ -2932,7 +2987,65 @@ mod macos_window {
         unsafe {
             let view = handle.ns_view.as_ptr().cast::<AnyObject>();
             let native_window: *mut AnyObject = msg_send![view, window];
-            (!native_window.is_null()).then_some(native_window)
+            (!native_window.is_null()).then_some((view, native_window))
+        }
+    }
+
+    fn native_window(window: &Window) -> Option<*mut AnyObject> {
+        native_view_and_window(window).map(|(_, native_window)| native_window)
+    }
+
+    unsafe fn remove_tracking_areas(view: *mut AnyObject) {
+        if view.is_null() {
+            return;
+        }
+        let areas: *mut AnyObject = unsafe { msg_send![view, trackingAreas] };
+        if areas.is_null() {
+            return;
+        }
+        let count: usize = unsafe { msg_send![areas, count] };
+        let mut list = Vec::with_capacity(count);
+        for index in 0..count {
+            let area: *mut AnyObject = unsafe { msg_send![areas, objectAtIndex: index] };
+            if !area.is_null() {
+                list.push(area);
+            }
+        }
+        for area in list {
+            unsafe {
+                let _: () = msg_send![view, removeTrackingArea: area];
+            }
+        }
+    }
+
+    unsafe fn detach_native_window(native_window: *mut AnyObject, ns_view: *mut AnyObject) {
+        unsafe {
+            // 必须在 orderOut 之前清掉 delegate，避免窗口隐藏触发 windowDidResignKey
+            // 并把 activate_callback 投递给即将或已经移除的 GPUI WindowId。
+            let _: () = msg_send![native_window, setDelegate: std::ptr::null_mut::<AnyObject>()];
+            let _: Bool =
+                msg_send![native_window, makeFirstResponder: std::ptr::null_mut::<AnyObject>()];
+            let _: () = msg_send![native_window, setIgnoresMouseEvents: Bool::YES];
+            remove_tracking_areas(ns_view);
+            let content_view: *mut AnyObject = msg_send![native_window, contentView];
+            if !content_view.is_null() {
+                remove_tracking_areas(content_view);
+                let subviews: *mut AnyObject = msg_send![content_view, subviews];
+                if !subviews.is_null() {
+                    let count: usize = msg_send![subviews, count];
+                    let mut list = Vec::with_capacity(count);
+                    for index in 0..count {
+                        let subview: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+                        if !subview.is_null() {
+                            list.push(subview);
+                        }
+                    }
+                    for subview in list {
+                        remove_tracking_areas(subview);
+                    }
+                }
+            }
+            let _: () = msg_send![native_window, orderOut: std::ptr::null_mut::<AnyObject>()];
         }
     }
 
@@ -2948,6 +3061,7 @@ mod macos_window {
             return;
         };
         unsafe {
+            let _: () = msg_send![native_window, setLevel: super::OVERLAY_WINDOW_LEVEL];
             let _: () = msg_send![native_window, setAlphaValue: 0.0f64];
             let _: () = msg_send![native_window, setIgnoresMouseEvents: Bool::YES];
             clear_layer_background(native_window);
@@ -2955,6 +3069,60 @@ mod macos_window {
                 native_window,
                 orderFront: std::ptr::null_mut::<AnyObject>()
             ];
+        }
+    }
+
+    pub fn set_window_level(window: &mut Window, level: isize) {
+        let Some(native_window) = native_window(window) else {
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![native_window, setLevel: level];
+        }
+    }
+
+    pub fn frontmost_other_app() -> Option<i32> {
+        let workspace_class = AnyClass::get(c"NSWorkspace")?;
+        unsafe {
+            let workspace: *mut AnyObject = msg_send![workspace_class, sharedWorkspace];
+            if workspace.is_null() {
+                return None;
+            }
+            let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+            if app.is_null() {
+                return None;
+            }
+            let pid: i32 = msg_send![app, processIdentifier];
+            (pid > 0 && pid != std::process::id() as i32).then_some(pid)
+        }
+    }
+
+    pub fn activate_app_single_window() {
+        // NSApplicationActivateIgnoringOtherApps = 1 << 1，刻意不传
+        // NSApplicationActivateAllWindows (1 << 0)，避免把后台其它面板拉到最前。
+        const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
+        let Some(app_class) = AnyClass::get(c"NSRunningApplication") else {
+            return;
+        };
+        unsafe {
+            let app: *mut AnyObject = msg_send![app_class, currentApplication];
+            if !app.is_null() {
+                let _: Bool = msg_send![app, activateWithOptions: ACTIVATE_IGNORING_OTHER_APPS];
+            }
+        }
+    }
+
+    pub fn restore_frontmost_app(pid: i32) {
+        const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
+        let Some(app_class) = AnyClass::get(c"NSRunningApplication") else {
+            return;
+        };
+        unsafe {
+            let app: *mut AnyObject =
+                msg_send![app_class, runningApplicationWithProcessIdentifier: pid];
+            if !app.is_null() {
+                let _: Bool = msg_send![app, activateWithOptions: ACTIVATE_IGNORING_OTHER_APPS];
+            }
         }
     }
 
@@ -2978,14 +3146,14 @@ mod macos_window {
         }
     }
 
-    /// 从屏幕移除窗口但保留 GPUI 的一切状态，供稍后的 `remove_window` 真正销毁。
+    /// 从屏幕移除窗口并摘除事件回调，保留 GPUI 状态供稍后的 `remove_window` 销毁。
     /// `orderOut` 是同步且近乎零成本的；真正昂贵的是 GPUI 释放全屏 layer 的那 37 ms。
     pub fn hide(window: &mut Window) {
-        let Some(native_window) = native_window(window) else {
+        let Some((ns_view, native_window)) = native_view_and_window(window) else {
             return;
         };
         unsafe {
-            let _: () = msg_send![native_window, orderOut: std::ptr::null_mut::<AnyObject>()];
+            detach_native_window(native_window, ns_view);
         }
     }
 
@@ -2996,7 +3164,9 @@ mod macos_window {
         let Some(native_window) = native_window(window) else {
             return;
         };
+        activate_app_single_window();
         unsafe {
+            let _: () = msg_send![native_window, setLevel: super::OVERLAY_WINDOW_LEVEL];
             let _: () = msg_send![native_window, setAlphaValue: 1.0f64];
             let _: () = msg_send![native_window, setIgnoresMouseEvents: Bool::NO];
             let _: () = msg_send![

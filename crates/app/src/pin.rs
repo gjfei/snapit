@@ -653,7 +653,7 @@ impl PinView {
     ) {
         self.focus_handle.focus(window, cx);
         if event.click_count >= 2 {
-            window.remove_window();
+            crate::overlay::close_window(window);
         } else {
             window.start_window_move();
         }
@@ -834,7 +834,9 @@ impl Render for PinView {
             .size_full()
             .opacity(self.opacity)
             .cursor_move()
-            .on_action(cx.listener(|_, _: &ClosePin, window, _| window.remove_window()))
+            .on_action(
+                cx.listener(|_, _: &ClosePin, window, _| crate::overlay::close_window(window)),
+            )
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {

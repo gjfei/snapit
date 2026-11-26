@@ -145,7 +145,7 @@ impl Render for PermissionView {
         let close = cx.listener(|this, _, window, cx| {
             this.controller
                 .update(cx, |controller, _| controller.clear_pending_capture());
-            window.remove_window();
+            crate::overlay::close_window(window);
         });
         v_flex()
             .size_full()
@@ -183,7 +183,7 @@ impl Render for PermissionView {
                                     this.controller.update(cx, |controller, cx| {
                                         controller.continue_pending_capture(cx)
                                     });
-                                    window.remove_window();
+                                    crate::overlay::close_window(window);
                                 })),
                         )
                     }),

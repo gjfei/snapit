@@ -226,7 +226,7 @@ impl UpdateView {
                         .label(t!("update.later").to_string())
                         .on_click(|_, window, cx| {
                             updater::dismiss_job(cx);
-                            window.remove_window();
+                            crate::overlay::close_window(window);
                         }),
                 )
                 .child(finish)
@@ -240,7 +240,7 @@ impl UpdateView {
                         .label(t!("update.later").to_string())
                         .on_click(|_, window, cx| {
                             updater::dismiss_job(cx);
-                            window.remove_window();
+                            crate::overlay::close_window(window);
                         }),
                 )
                 .child(

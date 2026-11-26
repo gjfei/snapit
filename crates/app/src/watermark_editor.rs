@@ -2290,7 +2290,7 @@ impl WatermarkEditor {
                 this.redo(window, cx);
             }))
             .on_action(cx.listener(|_, _: &CloseEditor, window, _| {
-                window.remove_window();
+                crate::overlay::close_window(window);
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 let Some(drag) = this.layout_drag.as_ref() else {
@@ -2862,7 +2862,7 @@ impl WatermarkEditor {
                 this.nudge_selected(10.0, 0.0, window, cx);
             }))
             .on_action(cx.listener(|_, _: &CloseEditor, window, _| {
-                window.remove_window();
+                crate::overlay::close_window(window);
             }))
             .on_drop::<ExternalPaths>(cx.listener(Self::on_drop_files))
             .on_scroll(cx.listener(Self::on_canvas_scroll))
@@ -3753,7 +3753,7 @@ impl Render for WatermarkEditor {
                     .child(
                         Button::new("watermark-editor-cancel")
                             .label(t!("settings.watermark.editor.cancel").to_string())
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(|_, window, _| crate::overlay::close_window(window)),
                     )
                     .child(
                         Button::new("watermark-editor-save")
@@ -3762,7 +3762,7 @@ impl Render for WatermarkEditor {
                             .disabled(!can_save)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.save(window, cx) {
-                                    window.remove_window();
+                                    crate::overlay::close_window(window);
                                 }
                             })),
                     ),
