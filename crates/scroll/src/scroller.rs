@@ -46,9 +46,9 @@ impl ScrollSpeed {
 
     pub(crate) fn target_viewports_per_sec(self) -> f32 {
         match self {
-            Self::Slow => 1.2,
-            Self::Medium => 2.6,
-            Self::Fast => 4.8,
+            Self::Slow => 1.5,
+            Self::Medium => 4.0,
+            Self::Fast => 8.5,
         }
     }
 
@@ -125,33 +125,33 @@ impl ScrollSpeed {
             1.0
         };
         let active_pt = (active_h_px as f32 / scale).max(64.0);
-        let gain = gain.clamp(0.10, 3.0);
+        let gain = gain.clamp(0.10, 4.5);
         let vps = if rewind {
             1.8
         } else {
             self.target_viewports_per_sec()
         };
         let eval_window = if rewind {
-            Duration::from_millis(160)
+            Duration::from_millis(140)
         } else {
             match self {
-                Self::Slow => Duration::from_millis(260),
-                Self::Medium => Duration::from_millis(200),
-                Self::Fast => Duration::from_millis(160),
+                Self::Slow => Duration::from_millis(220),
+                Self::Medium => Duration::from_millis(160),
+                Self::Fast => Duration::from_millis(120),
             }
         };
 
         let mac_base_ms = if rewind {
-            24.0_f32
+            20.0_f32
         } else {
             match self {
-                Self::Slow => 32.0,
-                Self::Medium => 20.0,
-                Self::Fast => 16.0,
+                Self::Slow => 24.0,
+                Self::Medium => 12.0,
+                Self::Fast => 8.0,
             }
         };
         let raw_px = active_pt * vps * gain * (mac_base_ms / 1000.0);
-        let max_px = (active_pt * 0.35).max(8.0);
+        let max_px = (active_pt * 0.45).max(8.0);
         let (mac_px, mac_interval) = if raw_px < 8.0 {
             let ms = (mac_base_ms * (8.0 / raw_px.max(1.0)))
                 .round()
@@ -165,16 +165,16 @@ impl ScrollSpeed {
         };
 
         let win_base_ms = if rewind {
-            45.0_f32
+            36.0_f32
         } else {
             match self {
-                Self::Slow => 72.0,
-                Self::Medium => 42.0,
-                Self::Fast => 28.0,
+                Self::Slow => 56.0,
+                Self::Medium => 28.0,
+                Self::Fast => 16.0,
             }
         };
         let raw_notches = (active_pt * vps / 60.0) * gain * (win_base_ms / 1000.0);
-        let max_notches = ((active_pt * 0.35) / 60.0).ceil().clamp(1.0, 4.0) as i32;
+        let max_notches = ((active_pt * 0.45) / 60.0).ceil().clamp(1.0, 8.0) as i32;
         let (win_notches, win_interval) = if raw_notches < 1.0 {
             let ms = (win_base_ms / raw_notches.max(0.15))
                 .round()
@@ -323,9 +323,9 @@ mod tests {
     #[test]
     fn continuous_short_viewport_caps_mac_px_and_stretches_windows_interval() {
         let step = ScrollSpeed::Fast.plan_continuous(200, 1.0, 1.0, false);
-        assert!(step.mac_px <= (200.0_f32 * 0.35).round() as i32);
+        assert!(step.mac_px <= (200.0_f32 * 0.45).round() as i32);
         assert_eq!(step.win_notches, 1);
-        assert!(step.win_interval > Duration::from_millis(28));
+        assert!(step.win_interval > Duration::from_millis(16));
     }
 
     #[test]

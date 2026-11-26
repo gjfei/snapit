@@ -25,15 +25,15 @@ use image::RgbaImage;
 use snapit_capture::DiskImage;
 
 const PREVIEW_MAX_WIDTH: u32 = 320;
-const FINE_MAX_WIDTH: usize = 512;
+const FINE_MAX_WIDTH: usize = 384;
 const COARSE_STRIDE: usize = 4;
 const MAX_FINE_ROWS: usize = 64;
 const MAX_COARSE_CANDIDATES: usize = 10;
 const MAX_MATCH_MAD: f32 = 7.5;
 const MIN_INLIER_RATIO: f32 = 0.88;
 const INLIER_THRESHOLD: u8 = 12;
-const INITIAL_MARGIN_VOTES: u32 = 2;
-const MARGIN_CHANGE_VOTES: u32 = 6;
+const INITIAL_MARGIN_VOTES: u32 = 3;
+const MARGIN_CHANGE_VOTES: u32 = 8;
 static NEXT_PREVIEW_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +118,7 @@ struct FrameProfile {
     fine_w: usize,
     fine_luma: Vec<u8>,
     row_grad: Vec<f32>,
+    row_vert_grad: Vec<f32>,
     row_edge_columns: Vec<u32>,
     coarse_w: usize,
     coarse_h: usize,
@@ -146,18 +147,23 @@ impl FrameProfile {
         let fine_w = interior_w.div_ceil(fine_step).max(1);
         let mut fine_luma = vec![0u8; fine_w * h];
         let mut row_grad = vec![0.0_f32; h];
+        let mut row_vert_grad = vec![0.0_f32; h];
         let mut row_edge_columns = vec![0u32; h];
 
         for y in 0..h {
             let row_off = y * w * 4;
-            let dst_row = &mut fine_luma[y * fine_w..(y + 1) * fine_w];
+            let dst_start = y * fine_w;
             let mut prev_l = 0i32;
             let mut grad_sum = 0u32;
+            let mut vert_sum = 0u32;
             let mut edge_columns = 0u32;
             for (ix, x) in interior.clone().step_by(fine_step).enumerate() {
                 let p = row_off + x * 4;
                 let l = luma(raw[p], raw[p + 1], raw[p + 2]);
-                dst_row[ix] = l;
+                fine_luma[dst_start + ix] = l;
+                if y > 0 {
+                    vert_sum += u32::from(l.abs_diff(fine_luma[dst_start - fine_w + ix]));
+                }
                 if ix > 0 {
                     let delta = (i32::from(l) - prev_l).unsigned_abs();
                     grad_sum += delta;
@@ -168,6 +174,9 @@ impl FrameProfile {
                 prev_l = i32::from(l);
             }
             row_edge_columns[y] = edge_columns;
+            if y > 0 {
+                row_vert_grad[y] = vert_sum as f32 / fine_w as f32;
+            }
             if fine_w > 1 {
                 row_grad[y] = grad_sum as f32 / (fine_w - 1) as f32;
             }
@@ -185,19 +194,32 @@ impl FrameProfile {
                 grad_acc += g;
             }
             coarse_grad[cy] = grad_acc / (y1 - y0) as f32;
+            let full_y = y1 - y0 == COARSE_STRIDE;
             for cx in 0..coarse_w {
                 let x0 = cx * COARSE_STRIDE;
                 let x1 = (x0 + COARSE_STRIDE).min(fine_w);
-                let mut sum = 0u32;
-                let mut count = 0u32;
-                for y in y0..y1 {
-                    let row = &fine_luma[y * fine_w..];
-                    for &v in &row[x0..x1] {
-                        sum += u32::from(v);
-                        count += 1;
+                if full_y && x1 - x0 == 4 {
+                    let mut sum = 0u32;
+                    for y in y0..y1 {
+                        let r = y * fine_w + x0;
+                        sum += u32::from(fine_luma[r])
+                            + u32::from(fine_luma[r + 1])
+                            + u32::from(fine_luma[r + 2])
+                            + u32::from(fine_luma[r + 3]);
                     }
+                    coarse_luma[cy * coarse_w + cx] = (sum >> 4) as u8;
+                } else {
+                    let mut sum = 0u32;
+                    let mut count = 0u32;
+                    for y in y0..y1 {
+                        let row = &fine_luma[y * fine_w..];
+                        for &v in &row[x0..x1] {
+                            sum += u32::from(v);
+                            count += 1;
+                        }
+                    }
+                    coarse_luma[cy * coarse_w + cx] = (sum / count.max(1)) as u8;
                 }
-                coarse_luma[cy * coarse_w + cx] = (sum / count.max(1)) as u8;
             }
         }
 
@@ -209,6 +231,7 @@ impl FrameProfile {
             fine_w,
             fine_luma,
             row_grad,
+            row_vert_grad,
             row_edge_columns,
             coarse_w,
             coarse_h,
@@ -224,6 +247,26 @@ impl FrameProfile {
 
     fn has_broad_texture(&self, y: usize) -> bool {
         self.row_grad[y] >= 1.0 && self.row_edge_columns[y] * 12 >= self.fine_w as u32
+    }
+
+    /// Reject pure vertical stripes (e.g. git-graph branch rails) whose columns
+    /// have high horizontal contrast but zero vertical variation across rows.
+    fn band_has_vertical_texture(&self, y0: usize, y1: usize) -> bool {
+        let start = y0.max(1);
+        let end = y1.min(self.height as usize);
+        if end <= start {
+            return false;
+        }
+        let span = end - start;
+        let textured = self.row_vert_grad[start..end]
+            .iter()
+            .filter(|&&g| g >= 1.5)
+            .count();
+        if span < 12 {
+            textured >= 2
+        } else {
+            textured >= 3 && textured * 4 >= span
+        }
     }
 
     fn row_bytes(&self) -> usize {
@@ -923,8 +966,11 @@ impl Stitcher {
         if max_band < 8 {
             return Ok((self.fixed_top, self.fixed_bottom));
         }
-        let mut row_diff = vec![0.0_f32; h];
-        for (y, diff) in row_diff.iter_mut().enumerate().take(h) {
+        // Quick strided check across the frame so static periods do not compute
+        // full-height row differences.
+        let mut sampled_moving = 0usize;
+        let mut sampled_total = 0usize;
+        for y in (0..h).step_by(4) {
             let p_row = &prev.fine_luma[y * prev.fine_w..(y + 1) * prev.fine_w];
             let c_row = &curr.fine_luma[y * curr.fine_w..(y + 1) * curr.fine_w];
             let sum: u32 = p_row
@@ -932,12 +978,25 @@ impl Stitcher {
                 .zip(c_row)
                 .map(|(a, b)| u32::from(a.abs_diff(*b)))
                 .sum();
-            *diff = sum as f32 / prev.fine_w as f32;
+            if sum as f32 / prev.fine_w as f32 > 5.0 {
+                sampled_moving += 1;
+            }
+            sampled_total += 1;
         }
-        let moving_rows = row_diff.iter().filter(|&&d| d > 5.0).count();
-        if moving_rows < h / 6 {
+        if sampled_moving * 6 < sampled_total {
             return Ok((self.fixed_top, self.fixed_bottom));
         }
+
+        let row_diff_at = |y: usize| -> f32 {
+            let p_row = &prev.fine_luma[y * prev.fine_w..(y + 1) * prev.fine_w];
+            let c_row = &curr.fine_luma[y * curr.fine_w..(y + 1) * curr.fine_w];
+            let sum: u32 = p_row
+                .iter()
+                .zip(c_row)
+                .map(|(a, b)| u32::from(a.abs_diff(*b)))
+                .sum();
+            sum as f32 / prev.fine_w as f32
+        };
 
         // Top sticky scan: stop at 4 consecutive moving rows. Include textured
         // static rows plus up to 8 uniform padding/border rows immediately
@@ -946,7 +1005,8 @@ impl Stitcher {
         let mut seen_texture = false;
         let mut last_textured = 0usize;
         let mut consecutive_moving = 0usize;
-        for (y, &diff) in row_diff.iter().enumerate().take(max_band) {
+        for y in 0..max_band {
+            let diff = row_diff_at(y);
             if diff > 5.0 {
                 consecutive_moving += 1;
                 if consecutive_moving >= 4 {
@@ -965,6 +1025,9 @@ impl Stitcher {
                 }
             }
         }
+        if cand_top > 0 && !curr.band_has_vertical_texture(0, cand_top) {
+            cand_top = 0;
+        }
 
         // Bottom sticky scan: symmetric upward scan.
         let mut cand_bottom = 0usize;
@@ -973,14 +1036,15 @@ impl Stitcher {
         consecutive_moving = 0;
         for offset in 0..max_band {
             let y = h - 1 - offset;
-            if row_diff[y] > 5.0 {
+            let diff = row_diff_at(y);
+            if diff > 5.0 {
                 consecutive_moving += 1;
                 if consecutive_moving >= 4 {
                     break;
                 }
             } else {
                 consecutive_moving = 0;
-                if row_diff[y] <= 2.5 {
+                if diff <= 2.5 {
                     if curr.has_broad_texture(y) {
                         seen_texture = true;
                         last_textured = offset + 1;
@@ -990,6 +1054,9 @@ impl Stitcher {
                     }
                 }
             }
+        }
+        if cand_bottom > 0 && !curr.band_has_vertical_texture(h - cand_bottom, h) {
+            cand_bottom = 0;
         }
 
         let cand_top = cand_top as u32;
@@ -1033,6 +1100,7 @@ impl Stitcher {
         if (next_top != self.fixed_top || next_bottom != self.fixed_bottom)
             && next_top + next_bottom + min_active <= self.frame_height
         {
+            self.flush_pending()?;
             self.apply_fixed_margins(next_top, next_bottom, curr)?;
         }
 
@@ -1068,43 +1136,87 @@ impl Stitcher {
     ) -> Result<()> {
         let old_top = self.fixed_top;
         let old_bottom = self.fixed_bottom;
+        let old_active_h = self.frame_height.saturating_sub(old_top + old_bottom);
+        let at_canvas_top =
+            self.committed.is_none() || self.viewport_y <= -(self.above_rows as i32);
+        let at_canvas_bottom = self.committed.is_none()
+            || self.viewport_y + old_active_h as i32 >= self.below_rows as i32;
+        let stride = curr.row_bytes();
+
         if new_top > old_top {
             let take = (new_top - old_top).min(self.above_rows + self.below_rows);
             if take > 0 {
                 let from_above = take.min(self.above_rows);
-                self.rows.trim_top_with_origin_shift(take, from_above)?;
-                self.above_rows -= from_above;
-                self.below_rows -= take - from_above;
-                self.fixed_top += take;
-                self.update_header(curr);
+                if at_canvas_top {
+                    self.rows.trim_top_with_origin_shift(take, from_above)?;
+                    self.above_rows -= from_above;
+                    self.below_rows -= take - from_above;
+                    self.fixed_top += take;
+                    if from_above > 0 {
+                        self.rebase_anchors(from_above as i32);
+                    }
+                    self.update_header(curr);
+                } else {
+                    let preserved = self
+                        .rows
+                        .read_rows(-(self.above_rows as i32), take)?
+                        .into_raw();
+                    self.rows.trim_top_with_origin_shift(take, from_above)?;
+                    self.above_rows -= from_above;
+                    self.below_rows -= take - from_above;
+                    self.fixed_top += take;
+                    if from_above > 0 {
+                        self.rebase_anchors(from_above as i32);
+                    }
+                    self.header_rows.extend_from_slice(&preserved);
+                }
             }
         } else if new_top < old_top {
             let restored = old_top - new_top;
-            let stride = curr.row_bytes();
             let exposed =
                 self.header_rows[new_top as usize * stride..old_top as usize * stride].to_vec();
             self.rows.prepend_up(-(self.above_rows as i32), &exposed)?;
             self.above_rows += restored;
             self.fixed_top = new_top;
             self.rebase_anchors(-(restored as i32));
-            self.update_header(curr);
+            if at_canvas_top {
+                self.update_header(curr);
+            } else {
+                self.header_rows.truncate(new_top as usize * stride);
+            }
         }
         if new_bottom > old_bottom {
             let take = (new_bottom - old_bottom).min(self.below_rows);
             if take > 0 {
-                self.rows.trim_bottom(take)?;
-                self.below_rows -= take;
-                self.fixed_bottom += take;
-                self.update_footer(curr);
+                if at_canvas_bottom {
+                    self.rows.trim_bottom(take)?;
+                    self.below_rows -= take;
+                    self.fixed_bottom += take;
+                    self.update_footer(curr);
+                } else {
+                    let preserved = self
+                        .rows
+                        .read_rows((self.below_rows - take) as i32, take)?
+                        .into_raw();
+                    self.rows.trim_bottom(take)?;
+                    self.below_rows -= take;
+                    self.fixed_bottom += take;
+                    let mut next_footer = preserved;
+                    next_footer.extend_from_slice(&self.footer_rows);
+                    self.footer_rows = next_footer;
+                }
             }
         } else if new_bottom < old_bottom {
             let restored = old_bottom - new_bottom;
-            let stride = curr.row_bytes();
             let exposed = self.footer_rows[..restored as usize * stride].to_vec();
             self.rows.append_down(self.below_rows as i32, &exposed)?;
             self.below_rows += restored;
             self.fixed_bottom = new_bottom;
-            self.update_footer(curr);
+            if at_canvas_bottom {
+                self.update_footer(curr);
+            } else {
+                self.footer_rows.drain(..restored as usize * stride);
+            }
         }
         log::info!(
             "scroll fixed margins updated: top={} bottom={} (active_h={})",
@@ -1627,8 +1739,9 @@ fn estimate_shift(
         && pred.abs() <= active_h * 80 / 100
     {
         let c_pred = (pred as f32 / COARSE_STRIDE as f32).round() as i32;
-        let win_lo = (c_pred - 16).max(-c_max);
-        let win_hi = (c_pred + 16).min(c_max);
+        let half_win = (c_pred.abs() / 3).clamp(16, 48);
+        let win_lo = (c_pred - half_win).max(-c_max);
+        let win_hi = (c_pred + half_win).min(c_max);
         let narrow_coarse = coarse_band_scores(prev, curr, c_top, c_bot, win_lo, win_hi);
         let narrow_cands = coarse_minima(&narrow_coarse, 3);
         let mut narrow_fine = refine_coarse_candidates(
@@ -1651,8 +1764,8 @@ fn estimate_shift(
                     && score_fine_shift(prev, curr, active_top as i32, active_bottom as i32, probe)
                         .is_some_and(|s| s.mad >= best_score.mad + 1.5)
             });
-            if best_score.mad <= 2.5
-                && best_score.inlier >= 0.96
+            if best_score.mad <= 3.5
+                && best_score.inlier >= 0.94
                 && best_score.textured_rows >= 8
                 && unique_in_window
                 && sharp_peak
@@ -2743,5 +2856,70 @@ mod tests {
             let (start, rows) = stitcher.preview_range();
             assert_eq!(start + rows, stitcher.total_height());
         }
+    }
+
+    #[test]
+    fn vertical_rails_do_not_trigger_fixed_margins() {
+        let width = 480u32;
+        let height = 2200u32;
+        let mut doc = RgbaImage::from_pixel(width, height, image::Rgba([24, 26, 32, 255]));
+        // 16 vertical git-graph rails covering the left half plus sparsely
+        // spaced commit message rows (simulating dense branch lines where top
+        // 40px can happen to contain only rails + 1 thin row).
+        for y in 0..height {
+            for lane in 0..16u32 {
+                let rx = 20 + lane * 14;
+                let r = 60 + ((lane * 37) % 170) as u8;
+                let g = 80 + ((lane * 73) % 160) as u8;
+                let b = 90 + ((lane * 113) % 150) as u8;
+                for dx in 0..3 {
+                    doc.put_pixel(rx + dx, y, image::Rgba([r, g, b, 255]));
+                }
+            }
+            if y % 56 >= 18 && y % 56 < 32 {
+                let commit = y / 56;
+                for x in 260..440u32 {
+                    if (x / 6 + commit) % 3 != 0 {
+                        let c = 150 + ((commit * 29 + x) % 90) as u8;
+                        doc.put_pixel(x, y, image::Rgba([c, c, 210, 255]));
+                    }
+                }
+            }
+        }
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in (0..=1680).step_by(56) {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, 500, 0, 0, false, false));
+        }
+        let _ = stitcher.feed(viewport_frame(&doc, 1700, 500, 0, 0, false, false));
+        assert_eq!(stitcher.fixed_margins(), (0, 0));
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(assembled.dimensions(), doc.dimensions());
+        assert_eq!(assembled.as_raw(), doc.as_raw());
+    }
+
+    #[test]
+    fn toggling_fixed_top_mid_scroll_preserves_top_and_alignment() {
+        let doc = make_document(400, 2400);
+        let view_h = 500u32;
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [0u32, 140, 300, 480, 680, 900] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false));
+        }
+        stitcher.flush_pending().unwrap();
+        let mid_profile =
+            FrameProfile::from_image(viewport_frame(&doc, 900, view_h, 0, 0, false, false), 1.0);
+        // Simulate transient top/bottom detection mid-page and back to (0, 0),
+        // including growing while `above_rows > 0`.
+        stitcher.apply_fixed_margins(24, 16, &mid_profile).unwrap();
+        stitcher.apply_fixed_margins(0, 0, &mid_profile).unwrap();
+        stitcher.apply_fixed_margins(32, 0, &mid_profile).unwrap();
+        stitcher.apply_fixed_margins(0, 0, &mid_profile).unwrap();
+
+        for scroll_y in [1120u32, 1360, 1620, 1900] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false));
+        }
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(assembled.dimensions(), doc.dimensions());
+        assert_eq!(assembled.as_raw(), doc.as_raw());
     }
 }

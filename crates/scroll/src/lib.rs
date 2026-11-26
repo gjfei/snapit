@@ -26,7 +26,7 @@ pub use stitch::{
     FeedOutcome, PreviewTile, ScrollDirection, ScrollWarning, StitchConfig, Stitcher,
 };
 
-const CAPTURE_FPS: u32 = 60;
+const CAPTURE_FPS: u32 = 0;
 const POLL_TIMEOUT: Duration = Duration::from_millis(4);
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(120);
 const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
@@ -34,7 +34,7 @@ const FRAME_BUFFER_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const MIN_FRAME_BUFFER_CAPACITY: usize = 4;
 const MAX_FRAME_BUFFER_CAPACITY: usize = 64;
 const AUTO_SCROLL_STALL_LIMIT: u32 = 5;
-const AUTO_SCROLL_QUEUE_BACKPRESSURE: usize = 4;
+const AUTO_SCROLL_QUEUE_BACKPRESSURE: usize = 6;
 const AUTO_SCROLL_REWIND_LIMIT: u32 = 6;
 const SETTLE_DRAIN_CAP: Duration = Duration::from_millis(250);
 
@@ -556,12 +556,12 @@ impl AutoScrollState {
             self.warning_retries = 0;
             if active_h > 0 {
                 if self.window_max_frame_dy as f32 > active_h as f32 * 0.50 {
-                    self.gain = (self.gain * 0.65).clamp(0.10, 3.0);
+                    self.gain = (self.gain * 0.65).clamp(0.10, 4.5);
                 } else {
                     let actual = self.window_displacement.unsigned_abs() as f32;
                     let ratio = target_px.max(32.0) / actual;
                     self.gain =
-                        (self.gain * (0.65 + 0.35 * ratio.clamp(0.4, 1.8))).clamp(0.10, 3.0);
+                        (self.gain * (0.55 + 0.45 * ratio.clamp(0.4, 2.0))).clamp(0.10, 4.5);
                 }
             }
             return AutoScrollSettlement::Continue;
@@ -797,11 +797,13 @@ fn capture_loop(
         (pause_frame.as_ref(), pause_revision),
     );
     let _ = ready_tx.send(Ok(()));
+    let display_hz = snapit_capture::monitor_refresh_rate(monitor_id);
     log::info!(
-        "scroll capture started: {}x{} fps={} speed={:?}",
+        "scroll capture started: {}x{} fps={} display_hz={:?} speed={:?}",
         stitcher.width(),
         stitcher.total_height(),
         options.fps,
+        display_hz,
         options.auto_scroll_speed
     );
 
