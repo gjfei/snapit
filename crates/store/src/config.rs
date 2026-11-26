@@ -186,19 +186,13 @@ impl ScrollSpeed {
 #[serde(default)]
 #[non_exhaustive]
 pub struct ScrollConfig {
-    pub max_height: u32,
     pub auto_scroll_speed: ScrollSpeed,
     pub show_preview: bool,
-}
-
-impl ScrollConfig {
-    pub const HEIGHT_RANGE: (u32, u32) = (4_000, 60_000);
 }
 
 impl Default for ScrollConfig {
     fn default() -> Self {
         Self {
-            max_height: 30_000,
             auto_scroll_speed: ScrollSpeed::Medium,
             show_preview: true,
         }
@@ -912,14 +906,35 @@ impl Default for WatermarkTemplate {
 }
 
 impl WatermarkTemplate {
+    pub const MAX_NAME_CHARS: usize = 64;
+
     pub fn sanitize(&mut self) {
-        let name = self.name.trim();
+        let name = normalize_template_name(&self.name);
         self.name = if name.is_empty() {
             "Watermark".into()
         } else {
-            name.chars().take(64).collect()
+            name
         };
         self.preset.sanitize();
+    }
+}
+
+fn normalize_template_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .take(WatermarkTemplate::MAX_NAME_CHARS)
+        .collect()
+}
+
+fn format_numbered_template_name(base: &str, suffix: usize) -> String {
+    let suffix_str = format!(" {suffix}");
+    let max_prefix = WatermarkTemplate::MAX_NAME_CHARS.saturating_sub(suffix_str.chars().count());
+    let prefix: String = base.trim().chars().take(max_prefix).collect();
+    let prefix = prefix.trim_end();
+    if prefix.is_empty() {
+        format!("Watermark{suffix_str}")
+    } else {
+        format!("{prefix}{suffix_str}")
     }
 }
 
@@ -927,13 +942,7 @@ impl WatermarkTemplate {
 #[serde(default)]
 #[non_exhaustive]
 pub struct WatermarkConfig {
-    pub enabled: bool,
-    pub shared: bool,
-    pub apply_to_screenshots: bool,
-    pub apply_to_animations: bool,
-    pub apply_to_videos: bool,
     pub templates: BTreeMap<String, WatermarkTemplate>,
-    pub shared_template: Option<String>,
     pub screenshots_template: Option<String>,
     pub animations_template: Option<String>,
     pub videos_template: Option<String>,
@@ -942,13 +951,7 @@ pub struct WatermarkConfig {
 impl Default for WatermarkConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            shared: true,
-            apply_to_screenshots: true,
-            apply_to_animations: false,
-            apply_to_videos: false,
             templates: BTreeMap::from([("default".into(), WatermarkTemplate::default())]),
-            shared_template: Some("default".into()),
             screenshots_template: None,
             animations_template: None,
             videos_template: None,
@@ -959,34 +962,12 @@ impl Default for WatermarkConfig {
 impl WatermarkConfig {
     pub const DEFAULT_TEMPLATE_ID: &'static str = "default";
 
-    pub fn has_active_target(&self) -> bool {
-        self.apply_to_screenshots || self.apply_to_animations || self.apply_to_videos
-    }
-
+    /// A target is watermarked exactly when it has a template selected.
     pub fn target_enabled(&self, target: WatermarkTarget) -> bool {
-        match target {
-            WatermarkTarget::Screenshot => self.apply_to_screenshots,
-            WatermarkTarget::Animation => self.apply_to_animations,
-            WatermarkTarget::Video => self.apply_to_videos,
-        }
-    }
-
-    pub fn set_target_enabled(&mut self, target: WatermarkTarget, enabled: bool) {
-        match target {
-            WatermarkTarget::Screenshot => self.apply_to_screenshots = enabled,
-            WatermarkTarget::Animation => self.apply_to_animations = enabled,
-            WatermarkTarget::Video => self.apply_to_videos = enabled,
-        }
-    }
-
-    pub fn set_shared(&mut self, shared: bool) {
-        self.shared = shared;
+        self.selected_template_id(target).is_some()
     }
 
     fn selection(&self, target: WatermarkTarget) -> &Option<String> {
-        if self.shared {
-            return &self.shared_template;
-        }
         match target {
             WatermarkTarget::Screenshot => &self.screenshots_template,
             WatermarkTarget::Animation => &self.animations_template,
@@ -995,9 +976,6 @@ impl WatermarkConfig {
     }
 
     fn selection_mut(&mut self, target: WatermarkTarget) -> &mut Option<String> {
-        if self.shared {
-            return &mut self.shared_template;
-        }
         match target {
             WatermarkTarget::Screenshot => &mut self.screenshots_template,
             WatermarkTarget::Animation => &mut self.animations_template,
@@ -1009,16 +987,8 @@ impl WatermarkConfig {
         self.selection(target).as_deref()
     }
 
-    pub fn effective_template_id(&self, target: WatermarkTarget) -> Option<&str> {
-        self.selection(target)
-            .as_deref()
-            .or(self.shared_template.as_deref())
-            .or(Some(Self::DEFAULT_TEMPLATE_ID))
-            .filter(|id| self.templates.contains_key(*id))
-    }
-
     pub fn template(&self, target: WatermarkTarget) -> Option<&WatermarkTemplate> {
-        self.effective_template_id(target)
+        self.selected_template_id(target)
             .and_then(|id| self.templates.get(id))
     }
 
@@ -1041,57 +1011,96 @@ impl WatermarkConfig {
     }
 
     pub fn template_name_exists(&self, name: &str, except: Option<&str>) -> bool {
-        let name = name.trim().to_lowercase();
+        let name = normalize_template_name(name).to_lowercase();
         self.templates.iter().any(|(id, template)| {
-            Some(id.as_str()) != except && template.name.trim().to_lowercase() == name
+            Some(id.as_str()) != except
+                && normalize_template_name(&template.name).to_lowercase() == name
         })
     }
 
-    pub fn template_usages(&self, id: &str) -> Vec<WatermarkTarget> {
-        WatermarkTarget::ALL
-            .into_iter()
-            .filter(|target| self.effective_template_id(*target) == Some(id))
-            .collect()
-    }
-
-    pub fn duplicate_template(
-        &mut self,
-        source_id: &str,
-        target: WatermarkTarget,
-    ) -> Option<String> {
-        let source = self.templates.get(source_id)?.clone();
-        let base = source.name.trim();
-        let base = if base.is_empty() { "Watermark" } else { base };
+    /// `base`, or the first free `"base N"` when that name is taken.
+    pub fn unique_template_name(&self, base: &str) -> String {
+        let base = normalize_template_name(base);
+        let base = if base.is_empty() {
+            "Watermark"
+        } else {
+            base.as_str()
+        };
+        if !self.template_name_exists(base, None) {
+            return base.to_string();
+        }
         let mut suffix = 2usize;
-        let unique_name = loop {
-            let candidate = format!("{base} {suffix}");
+        loop {
+            let candidate = format_numbered_template_name(base, suffix);
             if !self.template_name_exists(&candidate, None) {
-                break candidate;
+                return candidate;
             }
             suffix += 1;
+        }
+    }
+
+    /// Choose a non-colliding copy name for `current` without producing `"X 2 2"`.
+    pub fn next_duplicate_name(&self, current: &str) -> String {
+        let current = normalize_template_name(current);
+        let current_ref = if current.is_empty() {
+            "Watermark"
+        } else {
+            current.as_str()
         };
-        Some(self.save_template(None, unique_name, source.preset, target))
+        let (base, min_suffix) = match current_ref.rsplit_once(' ') {
+            Some((stem, suffix))
+                if !stem.trim_end().is_empty()
+                    && suffix.parse::<usize>().is_ok_and(|n| n >= 2)
+                    && self.template_name_exists(stem.trim_end(), None) =>
+            {
+                let stem = stem.trim_end();
+                if let Ok(n) = suffix.parse::<usize>() {
+                    (stem, n.saturating_add(1))
+                } else {
+                    (current_ref, 2)
+                }
+            }
+            _ => (current_ref, 2),
+        };
+        let current_lower = current_ref.to_lowercase();
+        let mut suffix = min_suffix;
+        loop {
+            let candidate = format_numbered_template_name(base, suffix);
+            if candidate.to_lowercase() != current_lower
+                && !self.template_name_exists(&candidate, None)
+            {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    pub fn duplicate_template(&mut self, source_id: &str) -> Option<String> {
+        let source = self.templates.get(source_id)?.clone();
+        let name = self.next_duplicate_name(&source.name);
+        Some(self.save_template(None, name, source.preset))
     }
 
     pub fn rename_template(&mut self, id: &str, name: String) -> bool {
-        let trimmed = name.trim();
-        if trimmed.is_empty() || self.template_name_exists(trimmed, Some(id)) {
+        let normalized = normalize_template_name(&name);
+        if normalized.is_empty() || self.template_name_exists(&normalized, Some(id)) {
             return false;
         }
         let Some(template) = self.templates.get_mut(id) else {
             return false;
         };
-        template.name = trimmed.chars().take(64).collect();
+        template.name = normalized;
         template.sanitize();
         true
     }
 
+    /// Insert a template under `id` (or a generated one) without selecting it
+    /// for any output; the Settings dropdown owns that choice.
     pub fn save_template(
         &mut self,
         id: Option<String>,
         name: String,
         preset: WatermarkPreset,
-        target: WatermarkTarget,
     ) -> String {
         let id = id
             .filter(|id| self.templates.contains_key(id))
@@ -1108,59 +1117,37 @@ impl WatermarkConfig {
         let mut template = WatermarkTemplate { name, preset };
         template.sanitize();
         self.templates.insert(id.clone(), template);
-        *self.selection_mut(target) = Some(id.clone());
         id
     }
 
-    /// Save the stamp composition from the designer without overwriting the
-    /// Settings-owned template name or output layout (`placement`, `margins`,
-    /// `tiled`, `tile_spacing_*`) on an existing template.
+    /// Save the stamp composition from the designer. An existing template keeps
+    /// its name (renaming is a separate action).
     pub fn save_template_design(
         &mut self,
         id: Option<String>,
         fallback_name: String,
         mut design: WatermarkPreset,
-        target: WatermarkTarget,
     ) -> String {
         design.normalize_element_origins();
         design.sanitize();
         if let Some(existing_id) = id.filter(|id| self.templates.contains_key(id)) {
             if let Some(template) = self.templates.get_mut(&existing_id) {
-                template.preset.elements = design.elements;
-                template.preset.rotation_degrees = design.rotation_degrees;
-                template.preset.scale = design.scale;
+                template.preset = design;
                 template.sanitize();
             }
-            *self.selection_mut(target) = Some(existing_id.clone());
             return existing_id;
         }
-        let base_name = fallback_name.trim();
-        let base_name = if base_name.is_empty() {
-            "Watermark"
-        } else {
-            base_name
-        };
-        let mut unique_name = base_name.to_string();
-        let mut suffix = 2usize;
-        while self.template_name_exists(&unique_name, None) {
-            unique_name = format!("{base_name} {suffix}");
-            suffix += 1;
-        }
-        self.save_template(None, unique_name, design, target)
+        let name = self.unique_template_name(&fallback_name);
+        self.save_template(None, name, design)
     }
 
     pub fn delete_template(&mut self, id: &str) -> bool {
         if id == Self::DEFAULT_TEMPLATE_ID || self.templates.remove(id).is_none() {
             return false;
         }
-        for selection in [
-            &mut self.shared_template,
-            &mut self.screenshots_template,
-            &mut self.animations_template,
-            &mut self.videos_template,
-        ] {
-            if selection.as_deref() == Some(id) {
-                *selection = None;
+        for target in WatermarkTarget::ALL {
+            if self.selection(target).as_deref() == Some(id) {
+                *self.selection_mut(target) = None;
             }
         }
         true
@@ -1176,17 +1163,13 @@ impl WatermarkConfig {
         for template in self.templates.values_mut() {
             template.sanitize();
         }
-        for selection in [
-            &mut self.shared_template,
-            &mut self.screenshots_template,
-            &mut self.animations_template,
-            &mut self.videos_template,
-        ] {
-            if selection
+        for target in WatermarkTarget::ALL {
+            let stale = self
+                .selection(target)
                 .as_ref()
-                .is_some_and(|id| !self.templates.contains_key(id))
-            {
-                *selection = None;
+                .is_some_and(|id| !self.templates.contains_key(id));
+            if stale {
+                *self.selection_mut(target) = None;
             }
         }
     }
@@ -1229,8 +1212,6 @@ pub struct Config {
 impl Config {
     /// Clamp values a hand-edited file may have pushed out of range.
     pub fn sanitize(&mut self) {
-        let (min_h, max_h) = ScrollConfig::HEIGHT_RANGE;
-        self.scroll.max_height = self.scroll.max_height.clamp(min_h, max_h);
         let (min_fps, max_fps) = RecordingConfig::FPS_RANGE;
         let (min_secs, max_secs) = RecordingConfig::DURATION_RANGE;
         self.recording.gif_fps = self.recording.gif_fps.clamp(min_fps, max_fps);
@@ -1663,28 +1644,71 @@ mod tests {
     }
 
     #[test]
-    fn watermark_defaults_use_only_the_screenshot_target() {
+    fn watermark_defaults_select_no_target() {
         let config = Config::from_toml("[recording]\ngif_fps = 20\n").unwrap();
         assert_eq!(config.watermark, WatermarkConfig::default());
-        assert!(!config.watermark.enabled);
-        assert!(config.watermark.apply_to_screenshots);
-        assert!(!config.watermark.apply_to_animations);
-        assert!(!config.watermark.apply_to_videos);
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Animation),
+            None
+        );
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Video),
+            None
+        );
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !config.watermark.target_enabled(target))
+        );
+        assert_eq!(config.watermark.templates.len(), 1);
+        assert!(
+            config
+                .watermark
+                .templates
+                .contains_key(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+        );
     }
 
     #[test]
     fn watermark_application_targets_round_trip_independently() {
+        let default_id = WatermarkConfig::DEFAULT_TEMPLATE_ID.to_string();
         for screenshots in [false, true] {
             for animations in [false, true] {
                 for videos in [false, true] {
                     let mut config = Config::default();
-                    config.watermark.apply_to_screenshots = screenshots;
-                    config.watermark.apply_to_animations = animations;
-                    config.watermark.apply_to_videos = videos;
+                    let selections = [
+                        (WatermarkTarget::Screenshot, screenshots),
+                        (WatermarkTarget::Animation, animations),
+                        (WatermarkTarget::Video, videos),
+                    ];
+                    for (target, selected) in selections {
+                        let id = selected.then(|| default_id.clone());
+                        config.watermark.select_template(target, id);
+                    }
+
                     let reloaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
                     assert_eq!(reloaded.watermark, config.watermark);
+                    for (target, selected) in selections {
+                        assert_eq!(
+                            reloaded.watermark.selected_template_id(target),
+                            selected.then_some(default_id.as_str())
+                        );
+                        assert_eq!(reloaded.watermark.target_enabled(target), selected);
+                    }
                     assert_eq!(
-                        reloaded.watermark.has_active_target(),
+                        WatermarkTarget::ALL
+                            .into_iter()
+                            .any(|target| reloaded.watermark.target_enabled(target)),
                         screenshots || animations || videos
                     );
                 }
@@ -1695,9 +1719,7 @@ mod tests {
     #[test]
     fn watermark_templates_round_trip_and_unknown_preset_values_fall_back() {
         let config = Config::from_toml(
-            "[watermark]\nenabled = true\nshared = false\napply_to_screenshots = false\n\
-             apply_to_animations = true\napply_to_videos = false\nshared_template = \"default\"\n\
-             screenshots_template = \"brand\"\n\
+            "[watermark]\nscreenshots_template = \"brand\"\n\
              [watermark.templates.brand]\nname = \"Brand\"\n\
              [watermark.templates.brand.preset]\nplacement = \"top-center\"\n\
              margin_x = 12.5\nrotation_degrees = -15.0\nscale = 1.75\ntiled = true\n\
@@ -1724,9 +1746,24 @@ mod tests {
         assert_eq!(preset.placement, WatermarkPlacement::TopCenter);
         assert_eq!(preset.scale, 1.75);
         assert!(preset.tiled);
-        assert!(!config.watermark.apply_to_screenshots);
-        assert!(config.watermark.apply_to_animations);
-        assert!(!config.watermark.apply_to_videos);
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Screenshot),
+            Some("brand")
+        );
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Animation),
+            None
+        );
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Video),
+            None
+        );
         let reloaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
         assert_eq!(reloaded.watermark, config.watermark);
 
@@ -1758,24 +1795,48 @@ mod tests {
              margin_x = 2.0\napply_to_videos = true\n",
         )
         .unwrap();
-        assert!(config.watermark.enabled);
-        assert!(config.watermark.apply_to_videos);
         assert_eq!(
-            config.watermark.templates,
-            WatermarkConfig::default().templates
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Screenshot),
+            None
         );
         assert_eq!(
             config
                 .watermark
+                .selected_template_id(WatermarkTarget::Animation),
+            None
+        );
+        assert_eq!(
+            config
+                .watermark
+                .selected_template_id(WatermarkTarget::Video),
+            None
+        );
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !config.watermark.target_enabled(target))
+        );
+        assert_eq!(
+            config.watermark.templates,
+            WatermarkConfig::default().templates
+        );
+        assert!(
+            config
+                .watermark
                 .preset(WatermarkTarget::Screenshot)
-                .unwrap(),
-            &WatermarkPreset::default()
+                .is_none()
         );
     }
 
     #[test]
     fn watermark_template_non_finite_and_out_of_range_values_are_sanitized() {
         let mut config = Config::default();
+        config.watermark.select_template(
+            WatermarkTarget::Screenshot,
+            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()),
+        );
         let preset = &mut config
             .watermark
             .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
@@ -1813,30 +1874,53 @@ mod tests {
     }
 
     #[test]
-    fn watermark_templates_are_independent_with_shared_inheritance() {
+    fn watermark_templates_are_selected_independently_per_target() {
         let mut watermark = WatermarkConfig::default();
-        let mut shared = WatermarkPreset::default();
-        shared.elements[0].text.content = "Shared".into();
-        watermark.save_template(
-            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()),
-            "Shared".into(),
-            shared,
-            WatermarkTarget::Screenshot,
-        );
-        watermark.set_shared(false);
+
+        let mut screenshot = WatermarkPreset::default();
+        screenshot.elements[0].text.content = "Screenshot".into();
+        let screenshot_id = watermark.save_template(None, "Screenshot".into(), screenshot);
 
         let mut animation = WatermarkPreset::default();
         animation.elements[0].text.content = "Animation".into();
-        watermark.save_template(
-            None,
-            "Animation".into(),
-            animation,
-            WatermarkTarget::Animation,
-        );
+        let animation_id = watermark.save_template(None, "Animation".into(), animation);
+
         let mut video = WatermarkPreset::default();
         video.elements[0].text.content = "Video".into();
-        watermark.save_template(None, "Video".into(), video, WatermarkTarget::Video);
+        let video_id = watermark.save_template(None, "Video".into(), video);
 
+        // Saving a template never selects it; the choice belongs to each output.
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !watermark.target_enabled(target))
+        );
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+
+        watermark.select_template(WatermarkTarget::Screenshot, Some(screenshot_id.clone()));
+        watermark.select_template(WatermarkTarget::Animation, Some(animation_id.clone()));
+        watermark.select_template(WatermarkTarget::Video, Some(video_id.clone()));
+
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            Some(screenshot_id.as_str())
+        );
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Animation),
+            Some(animation_id.as_str())
+        );
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Video),
+            Some(video_id.as_str())
+        );
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .any(|target| watermark.target_enabled(target))
+        );
         assert_eq!(
             watermark
                 .preset(WatermarkTarget::Screenshot)
@@ -1844,7 +1928,7 @@ mod tests {
                 .elements[0]
                 .text
                 .content,
-            "Shared"
+            "Screenshot"
         );
         assert_eq!(
             watermark
@@ -1861,27 +1945,19 @@ mod tests {
                 .content,
             "Video"
         );
-        assert_eq!(
-            watermark.selected_template_id(WatermarkTarget::Screenshot),
-            None
-        );
 
-        watermark.set_shared(true);
-        for target in WatermarkTarget::ALL {
-            assert_eq!(
-                watermark.preset(target).unwrap().elements[0].text.content,
-                "Shared"
-            );
-        }
-        watermark.set_shared(false);
+        // Deselecting one output leaves the others untouched; there is no shared fallback.
+        watermark.select_template(WatermarkTarget::Animation, None);
+        assert!(!watermark.target_enabled(WatermarkTarget::Animation));
+        assert!(watermark.preset(WatermarkTarget::Animation).is_none());
         assert_eq!(
             watermark
-                .preset(WatermarkTarget::Animation)
+                .preset(WatermarkTarget::Screenshot)
                 .unwrap()
                 .elements[0]
                 .text
                 .content,
-            "Animation"
+            "Screenshot"
         );
         assert_eq!(
             watermark.preset(WatermarkTarget::Video).unwrap().elements[0]
@@ -1892,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn watermark_rename_and_design_save_preserve_settings_layout() {
+    fn watermark_rename_and_design_save_replace_preset() {
         let mut watermark = WatermarkConfig::default();
         let template = watermark
             .template_mut(WatermarkConfig::DEFAULT_TEMPLATE_ID)
@@ -1932,7 +2008,6 @@ mod tests {
             Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()),
             "Ignored".into(),
             design,
-            WatermarkTarget::Screenshot,
         );
         assert_eq!(saved_id, WatermarkConfig::DEFAULT_TEMPLATE_ID);
         let updated = watermark
@@ -1940,18 +2015,28 @@ mod tests {
             .get(WatermarkConfig::DEFAULT_TEMPLATE_ID)
             .unwrap();
         assert_eq!(updated.name, "Primary");
-        assert_eq!(updated.preset.placement, WatermarkPlacement::TopLeft);
-        assert_eq!(updated.preset.margin_x, 40.0);
-        assert_eq!(updated.preset.margin_y, 50.0);
-        assert!(updated.preset.tiled);
-        assert_eq!(updated.preset.tile_spacing_x, 200.0);
-        assert_eq!(updated.preset.tile_spacing_y, 140.0);
+        assert_eq!(updated.preset.placement, WatermarkPlacement::Center);
+        assert_eq!(updated.preset.margin_x, 0.0);
+        assert_eq!(updated.preset.margin_y, 24.0);
+        assert!(!updated.preset.tiled);
+        assert_eq!(updated.preset.tile_spacing_x, 160.0);
+        assert_eq!(updated.preset.tile_spacing_y, 96.0);
         assert_eq!(updated.preset.rotation_degrees, 15.0);
         assert_eq!(updated.preset.scale, 1.5);
         assert_eq!(updated.preset.elements[0].x, 0.0);
         assert_eq!(updated.preset.elements[0].y, 0.0);
         assert_eq!(updated.preset.elements[1].x, 30.0);
         assert_eq!(updated.preset.elements[1].y, 40.0);
+        // Saving a design no longer selects it for any output.
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !watermark.target_enabled(target))
+        );
     }
 
     #[test]
@@ -1959,31 +2044,38 @@ mod tests {
         let mut watermark = WatermarkConfig::default();
         assert!(watermark.template_name_exists(" snapIT ", None));
         assert!(!watermark.template_name_exists("snapIT", Some("default")));
-        let id = watermark.save_template(
-            None,
-            "Brand".into(),
-            WatermarkPreset::default(),
-            WatermarkTarget::Screenshot,
-        );
+        let id = watermark.save_template(None, "Brand".into(), WatermarkPreset::default());
         assert!(watermark.template_name_exists("brand", None));
         assert!(!watermark.template_name_exists("brand", Some(&id)));
+        assert_eq!(watermark.unique_template_name("Brand"), "Brand 2");
+        // Saving does not automatically select the template for an output.
+        assert_eq!(
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+        assert!(!watermark.delete_template(WatermarkConfig::DEFAULT_TEMPLATE_ID));
+
+        watermark.select_template(WatermarkTarget::Screenshot, Some(id.clone()));
         assert_eq!(
             watermark.selected_template_id(WatermarkTarget::Screenshot),
             Some(id.as_str())
         );
-        assert!(!watermark.delete_template(WatermarkConfig::DEFAULT_TEMPLATE_ID));
         assert!(watermark.delete_template(&id));
         assert!(!watermark.templates.contains_key(&id));
         assert_eq!(
-            watermark.effective_template_id(WatermarkTarget::Screenshot),
-            Some(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+            watermark.selected_template_id(WatermarkTarget::Screenshot),
+            None
+        );
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !watermark.target_enabled(target))
         );
     }
 
     #[test]
-    fn watermark_invalid_template_references_fall_back_after_sanitize() {
+    fn watermark_invalid_template_references_are_cleared_after_sanitize() {
         let mut watermark = WatermarkConfig {
-            shared_template: Some("missing".into()),
             screenshots_template: Some("missing".into()),
             animations_template: Some("missing".into()),
             videos_template: Some("missing".into()),
@@ -1991,11 +2083,19 @@ mod tests {
         };
         watermark.sanitize();
         for target in WatermarkTarget::ALL {
-            assert_eq!(
-                watermark.effective_template_id(target),
-                Some(WatermarkConfig::DEFAULT_TEMPLATE_ID)
-            );
+            assert_eq!(watermark.selected_template_id(target), None);
+            assert!(!watermark.target_enabled(target));
         }
+        assert!(
+            WatermarkTarget::ALL
+                .into_iter()
+                .all(|target| !watermark.target_enabled(target))
+        );
+        assert!(
+            watermark
+                .templates
+                .contains_key(WatermarkConfig::DEFAULT_TEMPLATE_ID)
+        );
     }
 
     #[test]
@@ -2023,6 +2123,18 @@ mod tests {
             .preset
             .elements
             .push(img);
+
+        // Which outputs use a template is now an explicit per-target selection.
+        for target in WatermarkTarget::ALL {
+            watermark.select_template(target, Some(WatermarkConfig::DEFAULT_TEMPLATE_ID.into()));
+        }
+        let default_id = WatermarkConfig::DEFAULT_TEMPLATE_ID;
+        let usages = |config: &WatermarkConfig, id: &str| -> Vec<WatermarkTarget> {
+            WatermarkTarget::ALL
+                .into_iter()
+                .filter(|target| config.selected_template_id(*target) == Some(id))
+                .collect()
+        };
 
         let config = Config {
             watermark: watermark.clone(),
@@ -2073,22 +2185,23 @@ mod tests {
         assert_eq!(sanitized.elements[1].image.corner_radius, 50.0);
 
         assert_eq!(
-            watermark.template_usages(WatermarkConfig::DEFAULT_TEMPLATE_ID),
+            usages(&watermark, default_id),
             WatermarkTarget::ALL.to_vec()
         );
-        watermark.set_shared(false);
+
+        // Deselect one output, then duplicate: the copy is not selected anywhere.
+        watermark.select_template(WatermarkTarget::Video, None);
         let dup_id = watermark
-            .duplicate_template(WatermarkConfig::DEFAULT_TEMPLATE_ID, WatermarkTarget::Video)
+            .duplicate_template(WatermarkConfig::DEFAULT_TEMPLATE_ID)
             .unwrap();
         assert_eq!(watermark.templates.get(&dup_id).unwrap().name, "SnapIt 2");
         assert_eq!(
-            watermark.template_usages(WatermarkConfig::DEFAULT_TEMPLATE_ID),
+            usages(&watermark, default_id),
             vec![WatermarkTarget::Screenshot, WatermarkTarget::Animation]
         );
-        assert_eq!(
-            watermark.template_usages(&dup_id),
-            vec![WatermarkTarget::Video]
-        );
+        assert_eq!(usages(&watermark, &dup_id), Vec::<WatermarkTarget>::new());
+        watermark.select_template(WatermarkTarget::Video, Some(dup_id.clone()));
+        assert_eq!(usages(&watermark, &dup_id), vec![WatermarkTarget::Video]);
     }
 
     #[test]
@@ -2097,19 +2210,54 @@ mod tests {
         assert_eq!(legacy.hotkeys.scroll, Hotkeys::default().scroll);
         assert_eq!(legacy.scroll, ScrollConfig::default());
 
-        let mut custom = Config::from_toml(
-            "[scroll]\nmax_height = 999999\nauto_scroll_speed = \"fast\"\nshow_preview = false\n",
-        )
-        .unwrap();
-        assert_eq!(custom.scroll.max_height, ScrollConfig::HEIGHT_RANGE.1);
+        let mut custom =
+            Config::from_toml("[scroll]\nauto_scroll_speed = \"fast\"\nshow_preview = false\n")
+                .unwrap();
         assert_eq!(custom.scroll.auto_scroll_speed, ScrollSpeed::Fast);
         assert!(!custom.scroll.show_preview);
 
-        custom.scroll.max_height = 10;
         custom.sanitize();
-        assert_eq!(custom.scroll.max_height, ScrollConfig::HEIGHT_RANGE.0);
 
         let reloaded = Config::from_toml(&custom.to_toml().unwrap()).unwrap();
         assert_eq!(reloaded.scroll, custom.scroll);
+    }
+
+    #[test]
+    fn watermark_name_dedup_and_rename_respect_64_char_limit() {
+        let mut watermark = WatermarkConfig::default();
+        let long_a = format!("{}A", "x".repeat(64));
+        let long_b = format!("{}B", "x".repeat(64));
+        let id_a = watermark.save_template(None, long_a.clone(), WatermarkPreset::default());
+        assert_eq!(
+            watermark.templates.get(&id_a).unwrap().name.chars().count(),
+            WatermarkTemplate::MAX_NAME_CHARS
+        );
+        // Second name sharing the 64-char prefix must be recognized as duplicate.
+        assert!(watermark.template_name_exists(&long_b, None));
+        let id_b = watermark.save_template(None, "Other".into(), WatermarkPreset::default());
+        assert!(!watermark.rename_template(&id_b, long_b));
+
+        // Generating a unique name from a full-length 64-char name stays within 64 chars
+        // and remains distinct after sanitize().
+        let generated = watermark.unique_template_name(&long_a);
+        assert!(generated.chars().count() <= WatermarkTemplate::MAX_NAME_CHARS);
+        assert_ne!(generated, watermark.templates.get(&id_a).unwrap().name);
+        assert!(!watermark.template_name_exists(&generated, None));
+    }
+
+    #[test]
+    fn watermark_next_duplicate_name_avoids_repeated_suffixes() {
+        let mut watermark = WatermarkConfig::default();
+        let first_dup = watermark.next_duplicate_name("SnapIt");
+        assert_eq!(first_dup, "SnapIt 2");
+        let id2 = watermark.save_template(None, first_dup, WatermarkPreset::default());
+        assert_eq!(watermark.next_duplicate_name("SnapIt 2"), "SnapIt 3");
+        // Unsaved draft with an existing stem also increments cleanly instead of appending "2".
+        watermark.delete_template(&id2);
+        assert_eq!(watermark.next_duplicate_name("SnapIt 2"), "SnapIt 3");
+        // Unsaved draft without an existing stem still avoids colliding with itself.
+        assert_eq!(watermark.next_duplicate_name("Draft"), "Draft 2");
+        // Trailing year numbers remain part of the base when no matching stem exists.
+        assert_eq!(watermark.next_duplicate_name("Brand 2026"), "Brand 2026 2");
     }
 }

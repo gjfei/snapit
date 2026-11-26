@@ -9,15 +9,19 @@ use std::{
 use gpui_kit::AppContext as _;
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Selectable as _, Sizable as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     h_flex,
-    input::{AnyInputState, InputEvent, InputState, NumberInput, Textarea, TextareaState},
+    input::{AnyInputState, Input, InputEvent, InputState, NumberInput, Textarea, TextareaState},
     label::Label,
     scroll::ScrollableElement as _,
+    searchable_list::SearchableVec,
+    select::{Select, SelectEvent, SelectState},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
+    tab::{Tab, TabBar},
     toolbar::Toolbar,
     v_flex,
 };
@@ -32,12 +36,12 @@ use gpui_kit::{
 };
 use snapit_capture::ElementBounds;
 use snapit_store::{
-    WatermarkElement, WatermarkKind, WatermarkPlacement, WatermarkPreset, WatermarkTarget,
+    WatermarkConfig, WatermarkElement, WatermarkKind, WatermarkPlacement, WatermarkPreset,
+    WatermarkTarget,
 };
 
 use crate::{appearance, controller::Controller, settings::AppSettings};
 
-pub(crate) const INHERIT_VALUE: &str = "__inherit__";
 const CONTEXT: &str = "SnapItWatermarkEditor";
 const PREVIEW_SCALE: f32 = 2.0;
 const CHECKER_TILE_PX: f32 = 12.0;
@@ -205,19 +209,30 @@ impl gpui_kit::component::searchable_list::SearchableListItem for WatermarkChoic
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PreviewBackdrop {
-    Checkerboard,
-    Light,
-    Dark,
+#[derive(Clone)]
+enum TemplateAction {
+    Load(String),
+    New,
+    Duplicate,
+    Delete(String),
 }
 
-const NUMBER_FIELDS: [NumberField; 5] = [
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorMode {
+    Design,
+    Layout,
+}
+
+const NUMBER_FIELDS: [NumberField; 9] = [
     NumberField::FontSize,
     NumberField::ImageWidth,
     NumberField::OffsetX,
     NumberField::OffsetY,
     NumberField::StrokeWidth,
+    NumberField::MarginX,
+    NumberField::MarginY,
+    NumberField::TileSpacingX,
+    NumberField::TileSpacingY,
 ];
 
 const SLIDER_FIELDS: [SliderField; 5] = [
@@ -235,6 +250,20 @@ enum NumberField {
     OffsetX,
     OffsetY,
     StrokeWidth,
+    MarginX,
+    MarginY,
+    TileSpacingX,
+    TileSpacingY,
+}
+
+#[derive(Clone)]
+struct LayoutPreviewDrag {
+    press: Point<Pixels>,
+    start_margin_x: f32,
+    start_margin_y: f32,
+    ratio: f32,
+    placement: WatermarkPlacement,
+    start_preset: WatermarkPreset,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -430,6 +459,10 @@ pub(crate) struct WatermarkEditor {
     target: WatermarkTarget,
     template_id: Option<String>,
     fallback_name: String,
+    name_input: Entity<InputState>,
+    name_error: Option<String>,
+    template_select: Entity<SelectState<SearchableVec<WatermarkChoice>>>,
+    last_template_choices: Vec<WatermarkChoice>,
     preset: WatermarkPreset,
     undo_stack: Vec<WatermarkPreset>,
     redo_stack: Vec<WatermarkPreset>,
@@ -442,17 +475,25 @@ pub(crate) struct WatermarkEditor {
     stroke_color: Entity<ColorPickerState>,
     background_color: Entity<ColorPickerState>,
     sliders: [Entity<SliderState>; 5],
-    number_inputs: [Entity<InputState>; 5],
-    shown_numbers: [f64; 5],
+    number_inputs: [Entity<InputState>; 9],
+    shown_numbers: [f64; 9],
     syncing_controls: bool,
-    backdrop: PreviewBackdrop,
+    mode: EditorMode,
     zoom_override: Option<f32>,
     preview: Option<StampPreview>,
     preview_revision: u64,
     requested_preview_revision: u64,
     preview_pending: bool,
     preview_error: Option<String>,
+    preview_worker_running: bool,
     preview_task: Option<Task<()>>,
+    layout_preview: Option<Arc<RenderImage>>,
+    layout_preview_revision: u64,
+    requested_layout_preview_revision: u64,
+    layout_preview_error: Option<String>,
+    layout_preview_worker_running: bool,
+    layout_preview_task: Option<Task<()>>,
+    layout_drag: Option<LayoutPreviewDrag>,
     pending_assets: PendingWatermarkAssets,
     preview_layout: Rc<Cell<Option<PreviewLayout>>>,
     gesture: Option<CanvasGesture>,
@@ -600,12 +641,56 @@ impl WatermarkEditor {
             })
         });
 
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(fallback_name.clone())
+                .placeholder(t!("settings.watermark.template.name").to_string())
+        });
+        let name_subscription = cx.subscribe(&name_input, |this, input, event, cx| {
+            if this.syncing_controls || !matches!(event, InputEvent::Change) {
+                return;
+            }
+            this.fallback_name = input.read(cx).value().to_string();
+            this.name_error = None;
+            cx.notify();
+        });
+
+        let choices = template_choices(&AppSettings::get(cx).watermark);
+        let selected_index = template_id
+            .as_deref()
+            .and_then(|id| choices.iter().position(|choice| choice.value == id))
+            .map(|index| IndexPath::default().row(index));
+        let template_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::from(choices.clone()),
+                selected_index,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let template_subscription = cx.subscribe_in(
+            &template_select,
+            window,
+            |this, _, event: &SelectEvent<SearchableVec<WatermarkChoice>>, window, cx| {
+                let SelectEvent::Confirm(Some(id)) = event else {
+                    return;
+                };
+                if this.template_id.as_deref() == Some(id.as_str()) {
+                    return;
+                }
+                this.confirm_discard(window, cx, TemplateAction::Load(id.clone()));
+            },
+        );
+
         let mut subscriptions = vec![
             appearance::follow_system_theme(window),
             text_subscription,
             color_subscription,
             stroke_color_subscription,
             background_color_subscription,
+            name_subscription,
+            template_subscription,
         ];
         for (index, state) in sliders.iter().enumerate() {
             let field = SLIDER_FIELDS[index];
@@ -637,7 +722,17 @@ impl WatermarkEditor {
             }));
         }
 
-        let shown_numbers = [24.0, 120.0, 0.0, 0.0, 0.0];
+        let shown_numbers = [
+            24.0,
+            120.0,
+            0.0,
+            0.0,
+            0.0,
+            preset.margin_x as f64,
+            preset.margin_y as f64,
+            preset.tile_spacing_x as f64,
+            preset.tile_spacing_y as f64,
+        ];
         let number_inputs = std::array::from_fn(|index| {
             let field = NUMBER_FIELDS[index];
             let (min, max, step) = number_range(field);
@@ -666,7 +761,11 @@ impl WatermarkEditor {
                 this.push_undo_snapshot();
                 this.set_number(field, parsed);
                 this.shown_numbers[index] = parsed;
-                this.refresh_preview(cx);
+                if field.is_layout() {
+                    this.refresh_layout_preview(cx);
+                } else {
+                    this.refresh_preview(cx);
+                }
             }));
             input
         });
@@ -676,6 +775,10 @@ impl WatermarkEditor {
             target,
             template_id,
             fallback_name,
+            name_input,
+            name_error: None,
+            template_select,
+            last_template_choices: choices,
             preset,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -691,14 +794,22 @@ impl WatermarkEditor {
             number_inputs,
             shown_numbers,
             syncing_controls: false,
-            backdrop: PreviewBackdrop::Checkerboard,
+            mode: EditorMode::Design,
             zoom_override: None,
             preview: None,
             preview_revision: 0,
             requested_preview_revision: 0,
             preview_pending: false,
             preview_error: None,
+            preview_worker_running: false,
             preview_task: None,
+            layout_preview: None,
+            layout_preview_revision: 0,
+            requested_layout_preview_revision: 0,
+            layout_preview_error: None,
+            layout_preview_worker_running: false,
+            layout_preview_task: None,
+            layout_drag: None,
             pending_assets: PendingWatermarkAssets::new(&AppSettings::get(cx).watermark),
             preview_layout: Rc::new(Cell::new(None)),
             gesture: None,
@@ -755,6 +866,7 @@ impl WatermarkEditor {
         self.slider_undo_snapshot = None;
         self.ensure_valid_selection();
         self.gesture = None;
+        self.layout_drag = None;
         self.snap_guides.clear();
         self.sync_controls(window, cx);
         self.refresh_preview(cx);
@@ -769,6 +881,7 @@ impl WatermarkEditor {
         self.slider_undo_snapshot = None;
         self.ensure_valid_selection();
         self.gesture = None;
+        self.layout_drag = None;
         self.snap_guides.clear();
         self.sync_controls(window, cx);
         self.refresh_preview(cx);
@@ -783,9 +896,172 @@ impl WatermarkEditor {
         self.selected_id = self.preset.elements.first().map(|el| el.id.clone());
     }
 
+    fn is_dirty(&self, cx: &App) -> bool {
+        let watermark = &AppSettings::get(cx).watermark;
+        match self.template_id.as_deref() {
+            Some(id) => watermark.templates.get(id).is_none_or(|template| {
+                self.preset != template.preset || self.fallback_name.trim() != template.name
+            }),
+            None => !self.preset.elements.is_empty() || !self.fallback_name.trim().is_empty(),
+        }
+    }
+
+    fn apply_draft(
+        &mut self,
+        template_id: Option<String>,
+        name: String,
+        preset: WatermarkPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.template_id = template_id;
+        self.fallback_name = name;
+        self.preset = preset;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.slider_undo_snapshot = None;
+        self.gesture = None;
+        self.error = None;
+        self.name_error = None;
+        self.selected_id = self.preset.elements.first().map(|el| el.id.clone());
+        self.ensure_valid_selection();
+        self.sync_controls(window, cx);
+        self.refresh_preview(cx);
+        if self.mode == EditorMode::Layout {
+            self.refresh_layout_preview(cx);
+        }
+        cx.notify();
+    }
+
+    fn load_saved_template(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(template) = AppSettings::get(cx).watermark.templates.get(id).cloned() else {
+            return;
+        };
+        self.apply_draft(
+            Some(id.to_string()),
+            template.name,
+            template.preset,
+            window,
+            cx,
+        );
+    }
+
+    fn apply_template_action(
+        &mut self,
+        action: TemplateAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            TemplateAction::Load(id) => self.load_saved_template(&id, window, cx),
+            TemplateAction::New => {
+                let name = AppSettings::get(cx)
+                    .watermark
+                    .unique_template_name("Watermark");
+                self.apply_draft(None, name, WatermarkStarter::Blank.preset(), window, cx);
+            }
+            TemplateAction::Duplicate => {
+                let preset = self.preset.clone();
+                let name = AppSettings::get(cx)
+                    .watermark
+                    .next_duplicate_name(&self.fallback_name);
+                self.apply_draft(None, name, preset, window, cx);
+            }
+            TemplateAction::Delete(id) => {
+                AppSettings::update(cx, |config| {
+                    config.watermark.delete_template(&id);
+                });
+                self.load_saved_template(WatermarkConfig::DEFAULT_TEMPLATE_ID, window, cx);
+            }
+        }
+    }
+
+    fn confirm_discard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: TemplateAction,
+    ) {
+        if !self.is_dirty(cx) {
+            self.apply_template_action(action, window, cx);
+            return;
+        }
+        // The select committed the new highlight before emitting Confirm. If the
+        // user cancels, put it back on the template that is actually loaded.
+        self.sync_controls(window, cx);
+        let editor = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let editor = editor.clone();
+            let action = action.clone();
+            alert
+                .title(t!("settings.watermark.editor.unsaved_title").to_string())
+                .description(t!("settings.watermark.editor.unsaved_desc").to_string())
+                .show_cancel(true)
+                .ok_text(t!("settings.watermark.editor.discard").to_string())
+                .on_ok(move |_, window, cx| {
+                    editor.update(cx, |this, cx| {
+                        this.apply_template_action(action.clone(), window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.template_id.clone() else {
+            return;
+        };
+        if id == WatermarkConfig::DEFAULT_TEMPLATE_ID {
+            return;
+        }
+        let name = self.fallback_name.clone();
+        let editor = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let editor = editor.clone();
+            let id = id.clone();
+            alert
+                .title(
+                    t!(
+                        "settings.watermark.template.delete_title",
+                        name = name.clone()
+                    )
+                    .to_string(),
+                )
+                .description(t!("settings.watermark.template.delete_desc").to_string())
+                .confirm()
+                .ok_text(t!("settings.watermark.template.delete").to_string())
+                .on_ok(move |_, window, cx| {
+                    editor.update(cx, |this, cx| {
+                        this.apply_template_action(TemplateAction::Delete(id.clone()), window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
     fn sync_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.syncing_controls = true;
-        if let Some(element) = self.selected_element().cloned() {
+        if self.name_input.read(cx).value() != self.fallback_name {
+            self.name_input.update(cx, |input, cx| {
+                input.set_value(self.fallback_name.clone(), window, cx);
+            });
+        }
+        let selected_value = self.template_id.clone().unwrap_or_default();
+        if self.template_select.read(cx).selected_value() != Some(&selected_value) {
+            self.template_select.update(cx, |state, cx| {
+                state.set_selected_value(&selected_value, window, cx);
+            });
+        }
+        if self.mode == EditorMode::Layout {
+            let slider_values = [self.preset.rotation_degrees, self.preset.scale];
+            for (index, value) in slider_values.into_iter().enumerate() {
+                self.sliders[index].update(cx, |slider, cx| {
+                    if (slider.value().end() - value).abs() > 0.0001 {
+                        slider.set_value(value, window, cx);
+                    }
+                });
+            }
+        } else if let Some(element) = self.selected_element().cloned() {
             if self.text_input.read(cx).value() != element.text.content {
                 self.text_input.update(cx, |input, cx| {
                     input.set_value(element.text.content.clone(), window, cx);
@@ -849,47 +1125,174 @@ impl WatermarkEditor {
                 });
             }
         }
+        let layout_numbers = [
+            (5, self.preset.margin_x as f64),
+            (6, self.preset.margin_y as f64),
+            (7, self.preset.tile_spacing_x as f64),
+            (8, self.preset.tile_spacing_y as f64),
+        ];
+        for (index, value) in layout_numbers {
+            if (self.shown_numbers[index] - value).abs() > 0.001 {
+                self.shown_numbers[index] = value;
+                self.number_inputs[index].update(cx, |input, cx| {
+                    input.set_value(format_number(value), window, cx);
+                });
+            }
+        }
         self.syncing_controls = false;
     }
 
+    fn set_mode(&mut self, mode: EditorMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.gesture = None;
+        self.layout_drag = None;
+        self.slider_undo_snapshot = None;
+        self.snap_guides.clear();
+        self.sync_controls(window, cx);
+        if mode == EditorMode::Layout {
+            self.refresh_layout_preview(cx);
+        }
+        self.canvas_focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn refresh_preview(&mut self, cx: &mut Context<Self>) {
-        let revision = self.requested_preview_revision.wrapping_add(1);
-        self.requested_preview_revision = revision;
+        self.requested_preview_revision = self.requested_preview_revision.wrapping_add(1);
         self.preview_pending = true;
         self.preview_error = None;
-        let preset = self.preset.clone();
-        let image_dir = AppSettings::watermark_dir(cx).to_path_buf();
-        self.preview_task = Some(cx.spawn(
-            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let result = cx
-                    .background_spawn(async move { build_stamp_preview(&preset, &image_dir) })
-                    .await;
-                this.update(cx, |editor, cx| {
-                    if editor.requested_preview_revision != revision {
-                        return;
-                    }
-                    editor.preview_pending = false;
-                    match result {
-                        Ok(preview) => {
-                            editor.preview_revision = revision;
-                            editor.preview = Some(preview);
-                            editor.preview_error = None;
+        if !self.preview_worker_running {
+            self.preview_worker_running = true;
+            self.preview_task = Some(cx.spawn(
+                async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+                    let next = this.update(cx, |editor, cx| {
+                        let revision = editor.requested_preview_revision;
+                        let preset = editor.preset.clone();
+                        let image_dir = AppSettings::watermark_dir(cx).to_path_buf();
+                        (revision, preset, image_dir)
+                    });
+                    let Ok((revision, preset, image_dir)) = next else {
+                        break;
+                    };
+                    let result = cx
+                        .background_spawn(async move { build_stamp_preview(&preset, &image_dir) })
+                        .await;
+                    let keep_going = this.update(cx, |editor, cx| {
+                        let up_to_date = editor.requested_preview_revision == revision;
+                        if up_to_date {
+                            editor.preview_pending = false;
+                            editor.preview_worker_running = false;
                         }
-                        Err(error) => {
-                            log::warn!("watermark stamp preview failed: {error}");
-                            editor.preview_error = Some(error);
+                        match result {
+                            Ok(preview) => {
+                                editor.preview_revision = revision;
+                                editor.preview = Some(preview);
+                                editor.preview_error = None;
+                            }
+                            Err(error) if up_to_date => {
+                                log::warn!("watermark stamp preview failed: {error}");
+                                editor.preview_error = Some(error);
+                            }
+                            Err(_) => {}
                         }
+                        cx.notify();
+                        !up_to_date
+                    });
+                    if !matches!(keep_going, Ok(true)) {
+                        break;
                     }
-                    cx.notify();
-                })
-                .ok();
-            },
-        ));
+                },
+            ));
+        }
+        if self.mode == EditorMode::Layout {
+            self.refresh_layout_preview(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn refresh_layout_preview(&mut self, cx: &mut Context<Self>) {
+        self.requested_layout_preview_revision =
+            self.requested_layout_preview_revision.wrapping_add(1);
+        self.layout_preview_error = None;
+        if !self.layout_preview_worker_running {
+            self.layout_preview_worker_running = true;
+            self.layout_preview_task = Some(cx.spawn(
+                async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+                    let next = this.update(cx, |editor, cx| {
+                        let revision = editor.requested_layout_preview_revision;
+                        let target = editor.target;
+                        let mut preset = editor.preset.clone();
+                        preset.normalize_element_origins();
+                        preset.sanitize();
+                        let image_dir = AppSettings::watermark_dir(cx).to_path_buf();
+                        (revision, target, preset, image_dir)
+                    });
+                    let Ok((revision, target, preset, image_dir)) = next else {
+                        break;
+                    };
+                    let result = cx
+                        .background_spawn(async move {
+                            crate::settings_view::build_watermark_preview_scaled(
+                                target,
+                                &preset,
+                                &image_dir,
+                                PREVIEW_SCALE,
+                            )
+                        })
+                        .await;
+                    let keep_going = this.update(cx, |editor, cx| {
+                        let up_to_date = editor.requested_layout_preview_revision == revision;
+                        if up_to_date {
+                            editor.layout_preview_worker_running = false;
+                        }
+                        match result {
+                            Ok(image) => {
+                                editor.layout_preview_revision = revision;
+                                editor.layout_preview = Some(image);
+                                editor.layout_preview_error = None;
+                            }
+                            Err(error) if up_to_date => {
+                                log::warn!("watermark layout preview failed: {error}");
+                                editor.layout_preview_error = Some(error);
+                            }
+                            Err(_) => {}
+                        }
+                        cx.notify();
+                        !up_to_date
+                    });
+                    if !matches!(keep_going, Ok(true)) {
+                        break;
+                    }
+                },
+            ));
+        }
         cx.notify();
     }
 
     fn set_number(&mut self, field: NumberField, value: f64) {
         let value = value as f32;
+        match field {
+            NumberField::MarginX => {
+                self.preset.margin_x = value.clamp(0.0, 2048.0);
+                return;
+            }
+            NumberField::MarginY => {
+                self.preset.margin_y = value.clamp(0.0, 2048.0);
+                return;
+            }
+            NumberField::TileSpacingX => {
+                self.preset.tile_spacing_x = value.clamp(8.0, 4096.0);
+                return;
+            }
+            NumberField::TileSpacingY => {
+                self.preset.tile_spacing_y = value.clamp(8.0, 4096.0);
+                return;
+            }
+            _ => {}
+        }
         let Some(element) = self.selected_element_mut() else {
             return;
         };
@@ -905,10 +1308,22 @@ impl WatermarkEditor {
             NumberField::OffsetX => element.x = value.clamp(-4096.0, 4096.0),
             NumberField::OffsetY => element.y = value.clamp(-4096.0, 4096.0),
             NumberField::StrokeWidth => element.text.stroke_width = value.clamp(0.0, 12.0),
+            NumberField::MarginX
+            | NumberField::MarginY
+            | NumberField::TileSpacingX
+            | NumberField::TileSpacingY => {}
         }
     }
 
     fn set_slider(&mut self, field: SliderField, value: f32) {
+        if self.mode == EditorMode::Layout {
+            match field {
+                SliderField::Rotation => self.preset.rotation_degrees = value.clamp(-180.0, 180.0),
+                SliderField::Scale => self.preset.scale = value.clamp(0.1, 8.0),
+                _ => {}
+            }
+            return;
+        }
         if let Some(element) = self.selected_element_mut() {
             match field {
                 SliderField::Rotation => element.rotation_degrees = value.clamp(-180.0, 180.0),
@@ -1219,7 +1634,7 @@ impl WatermarkEditor {
         preset_is_valid(&self.preset) && self.preview_is_fresh()
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) -> bool {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.preview_is_fresh() {
             cx.notify();
             return false;
@@ -1241,15 +1656,44 @@ impl WatermarkEditor {
                 return false;
             }
         }
+        let name = self.fallback_name.trim().to_string();
+        if name.is_empty() {
+            self.name_error = Some(t!("settings.watermark.template.name_required").to_string());
+            cx.notify();
+            return false;
+        }
+        if AppSettings::get(cx)
+            .watermark
+            .template_name_exists(&name, self.template_id.as_deref())
+        {
+            self.name_error =
+                Some(t!("settings.watermark.template.name_exists", name = name).to_string());
+            cx.notify();
+            return false;
+        }
+        self.name_error = None;
+
         let design = self.preset.clone();
+        let template_id = self.template_id.clone();
+        let mut saved_id = template_id.clone();
         AppSettings::update(cx, |config| {
-            config.watermark.save_template_design(
-                self.template_id.clone(),
-                self.fallback_name.clone(),
-                design,
-                self.target,
+            if let Some(id) = template_id.as_deref() {
+                config.watermark.rename_template(id, name.clone());
+            }
+            saved_id = Some(
+                config
+                    .watermark
+                    .save_template_design(template_id, name, design),
             );
         });
+        self.template_id = saved_id.clone();
+        if let Some(id) = saved_id.as_deref()
+            && let Some(saved) = AppSettings::get(cx).watermark.templates.get(id).cloned()
+        {
+            self.fallback_name = saved.name;
+            self.preset = saved.preset;
+            self.sync_controls(window, cx);
+        }
         let retained = AppSettings::get(cx)
             .watermark
             .templates
@@ -1788,6 +2232,425 @@ impl WatermarkEditor {
             ))
     }
 
+    fn render_layout_toolbar(&self, cx: &mut Context<Self>) -> Toolbar {
+        let editor = cx.entity();
+        Toolbar::new("watermark-layout-tools")
+            .child(
+                Button::new("watermark-layout-undo")
+                    .ghost()
+                    .icon(LucideIcon::Undo2)
+                    .tooltip(t!("settings.watermark.editor.undo").to_string())
+                    .accessibility_label(t!("settings.watermark.editor.undo").to_string())
+                    .disabled(self.undo_stack.is_empty())
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_, window, cx| {
+                            editor.update(cx, |this, cx| this.undo(window, cx));
+                        }
+                    }),
+            )
+            .child(
+                Button::new("watermark-layout-redo")
+                    .ghost()
+                    .icon(LucideIcon::Redo2)
+                    .tooltip(t!("settings.watermark.editor.redo").to_string())
+                    .accessibility_label(t!("settings.watermark.editor.redo").to_string())
+                    .disabled(self.redo_stack.is_empty())
+                    .on_click(move |_, window, cx| {
+                        editor.update(cx, |this, cx| this.redo(window, cx));
+                    }),
+            )
+    }
+
+    fn render_layout_preview_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let target = self.target;
+        let image = self.layout_preview.clone();
+        let error = self.layout_preview_error.clone();
+        let drag_enabled =
+            !self.preset.tiled && self.preset.placement != WatermarkPlacement::Center;
+        let start_margin_x = self.preset.margin_x;
+        let start_margin_y = self.preset.margin_y;
+        let placement = self.preset.placement;
+        let editor = cx.entity();
+        let theme = cx.theme();
+
+        v_flex()
+            .id("watermark-layout-preview-pane")
+            .key_context(CONTEXT)
+            .track_focus(&self.canvas_focus)
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .p_3()
+            .gap_2()
+            .on_action(cx.listener(|this, _: &UndoEdit, window, cx| {
+                this.undo(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RedoEdit, window, cx| {
+                this.redo(window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &CloseEditor, window, _| {
+                window.remove_window();
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let Some(drag) = this.layout_drag.as_ref() else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    let start = drag.start_preset.clone();
+                    this.layout_drag = None;
+                    if this.preset != start {
+                        this.push_specific_undo(start);
+                    }
+                    cx.notify();
+                    return;
+                }
+                let (x_dir, y_dir) = crate::settings_view::preview_margin_axes(drag.placement);
+                let dx = f32::from(event.position.x - drag.press.x) * drag.ratio;
+                let dy = f32::from(event.position.y - drag.press.y) * drag.ratio;
+                let mut changed = false;
+                if x_dir != 0.0 {
+                    let next = (drag.start_margin_x + dx * x_dir)
+                        .round()
+                        .clamp(0.0, 2048.0);
+                    if (this.preset.margin_x - next).abs() > 0.1 {
+                        this.preset.margin_x = next;
+                        changed = true;
+                    }
+                }
+                if y_dir != 0.0 {
+                    let next = (drag.start_margin_y + dy * y_dir)
+                        .round()
+                        .clamp(0.0, 2048.0);
+                    if (this.preset.margin_y - next).abs() > 0.1 {
+                        this.preset.margin_y = next;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    this.sync_controls(window, cx);
+                    this.refresh_layout_preview(cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(drag) = this.layout_drag.take() {
+                        if this.preset != drag.start_preset {
+                            this.push_specific_undo(drag.start_preset);
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(drag) = this.layout_drag.take() {
+                        if this.preset != drag.start_preset {
+                            this.push_specific_undo(drag.start_preset);
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(240.))
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .overflow_hidden()
+                    .p_4()
+                    .child(container_query(move |avail, _, cx| {
+                        let (width, height) = crate::settings_view::watermark_preview_size(
+                            target,
+                            f32::from(avail.width).max(1.0),
+                            f32::from(avail.height).max(1.0),
+                        );
+                        let logical_width = match target {
+                            WatermarkTarget::Animation => 240.0,
+                            WatermarkTarget::Screenshot | WatermarkTarget::Video => 480.0,
+                        };
+                        let ratio = if width > 0.0 {
+                            logical_width / width
+                        } else {
+                            1.0
+                        };
+                        let down_editor = editor.clone();
+
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .children(image.clone().map(|image| {
+                                div()
+                                    .id("watermark-layout-preview-canvas")
+                                    .w(px(width))
+                                    .h(px(height))
+                                    .flex_none()
+                                    .rounded(cx.theme().radius)
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .when(drag_enabled, |this| this.cursor(CursorStyle::OpenHand))
+                                    .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                                        if !drag_enabled {
+                                            return;
+                                        }
+                                        down_editor.update(cx, |this, cx| {
+                                            this.layout_drag = Some(LayoutPreviewDrag {
+                                                press: event.position,
+                                                start_margin_x,
+                                                start_margin_y,
+                                                ratio,
+                                                placement,
+                                                start_preset: this.preset.clone(),
+                                            });
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child(img(image).size_full().object_fit(ObjectFit::Fill))
+                            }))
+                            .children(error.clone().map(|error| {
+                                div()
+                                    .p_4()
+                                    .text_sm()
+                                    .text_color(cx.theme().danger)
+                                    .child(error)
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(if drag_enabled {
+                        format!(
+                            "{} {}",
+                            t!("settings.watermark.preview.desc"),
+                            t!("settings.watermark.preview.drag_hint")
+                        )
+                    } else {
+                        t!("settings.watermark.preview.desc").to_string()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_layout_inspector(&self, cx: &mut Context<Self>) -> AnyElement {
+        const ROWS: [[WatermarkPlacement; 3]; 3] = [
+            [
+                WatermarkPlacement::TopLeft,
+                WatermarkPlacement::TopCenter,
+                WatermarkPlacement::TopRight,
+            ],
+            [
+                WatermarkPlacement::MiddleLeft,
+                WatermarkPlacement::Center,
+                WatermarkPlacement::MiddleRight,
+            ],
+            [
+                WatermarkPlacement::BottomLeft,
+                WatermarkPlacement::BottomCenter,
+                WatermarkPlacement::BottomRight,
+            ],
+        ];
+        let theme = cx.theme().clone();
+        let current = self.preset.placement;
+        let tiled = self.preset.tiled;
+
+        v_flex()
+            .w(px(300.))
+            .flex_none()
+            .h_full()
+            .min_h_0()
+            .border_l_1()
+            .border_color(theme.border)
+            .p_3()
+            .gap_3()
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("settings.watermark.editor.layout_desc").to_string()),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Label::new(t!("settings.watermark.placement").to_string()).text_sm())
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap(px(3.))
+                                    .p(px(4.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.muted)
+                                    .when(tiled, |this| this.opacity(0.5))
+                                    .children(ROWS.into_iter().map(|row| {
+                                        h_flex().gap(px(3.)).children(row.into_iter().map(|cell| {
+                                            let active = cell == current;
+                                            let label = placement_label(cell);
+                                            Button::new(SharedString::from(format!(
+                                                "wm-editor-place-{}",
+                                                cell.as_str()
+                                            )))
+                                            .ghost()
+                                            .p_0()
+                                            .w(px(34.))
+                                            .h(px(26.))
+                                            .selected(active)
+                                            .disabled(tiled)
+                                            .tooltip(label.clone())
+                                            .accessibility_label(label)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if this.preset.placement == cell {
+                                                    return;
+                                                }
+                                                this.push_undo_snapshot();
+                                                this.preset.placement = cell;
+                                                this.refresh_layout_preview(cx);
+                                            }))
+                                            .child(
+                                                div()
+                                                    .size_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(div().size(px(7.)).rounded_full().bg(
+                                                        if active {
+                                                            theme.primary
+                                                        } else {
+                                                            theme.muted_foreground.opacity(0.45)
+                                                        },
+                                                    )),
+                                            )
+                                        }))
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if tiled {
+                                        theme.muted_foreground
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .child(placement_label(current)),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(Label::new(t!("settings.watermark.margin_x").to_string()).text_sm())
+                    .child(self.compact_number_input(
+                        5,
+                        t!("settings.watermark.margin_x").to_string(),
+                        px(110.),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(Label::new(t!("settings.watermark.margin_y").to_string()).text_sm())
+                    .child(self.compact_number_input(
+                        6,
+                        t!("settings.watermark.margin_y").to_string(),
+                        px(110.),
+                    )),
+            )
+            .child(div().h(px(1.)).w_full().bg(theme.border))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(Label::new(t!("settings.watermark.tiled").to_string()).text_sm())
+                    .child(
+                        Switch::new("watermark-editor-tiled")
+                            .small()
+                            .checked(tiled)
+                            .accessibility_label(t!("settings.watermark.tiled").to_string())
+                            .on_change(cx.listener(|this, next: &bool, window, cx| {
+                                if this.preset.tiled == *next {
+                                    return;
+                                }
+                                this.push_undo_snapshot();
+                                this.preset.tiled = *next;
+                                this.sync_controls(window, cx);
+                                this.refresh_layout_preview(cx);
+                            })),
+                    ),
+            )
+            .when(tiled, |this| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(Label::new(t!("settings.watermark.spacing_x").to_string()).text_sm())
+                        .child(self.compact_number_input(
+                            7,
+                            t!("settings.watermark.spacing_x").to_string(),
+                            px(110.),
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(Label::new(t!("settings.watermark.spacing_y").to_string()).text_sm())
+                        .child(self.compact_number_input(
+                            8,
+                            t!("settings.watermark.spacing_y").to_string(),
+                            px(110.),
+                        )),
+                )
+            })
+            .child(div().h(px(1.)).w_full().bg(theme.border))
+            .child(
+                self.slider_field(
+                    0,
+                    t!("settings.watermark.editor.whole_rotation")
+                        .to_string()
+                        .into(),
+                    self.preset.rotation_degrees,
+                    cx,
+                ),
+            )
+            .child(
+                self.slider_field(
+                    1,
+                    t!("settings.watermark.editor.whole_scale")
+                        .to_string()
+                        .into(),
+                    self.preset.scale,
+                    cx,
+                ),
+            )
+            .children(
+                self.error
+                    .clone()
+                    .map(|error| div().text_sm().text_color(theme.danger).child(error)),
+            )
+            .into_any_element()
+    }
+
     fn render_layers_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.preset.elements.len();
         let selected_ix = self.selected_index();
@@ -1940,7 +2803,6 @@ impl WatermarkEditor {
         let selected_id = self.selected_id.clone();
         let drag_camera = self.gesture.as_ref().map(|g| g.locked_camera());
         let zoom_override = self.zoom_override;
-        let backdrop = self.backdrop;
         let stamp_scale = self.preset.scale;
         let show_stamp_outline =
             self.preset.elements.len() > 1 || self.preset.rotation_degrees.abs() > 0.01;
@@ -2012,54 +2874,31 @@ impl WatermarkEditor {
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |bounds, _, window, cx| match backdrop {
-                        PreviewBackdrop::Checkerboard => {
-                            let (light, dark) =
-                                checkerboard_colors(cx.theme().background, cx.theme().foreground);
-                            let cols =
-                                (bounds.size.width.as_f32() / CHECKER_TILE_PX).ceil() as usize;
-                            let rows =
-                                (bounds.size.height.as_f32() / CHECKER_TILE_PX).ceil() as usize;
-                            for row in 0..rows {
-                                for col in 0..cols {
-                                    let color = if (row + col).is_multiple_of(2) {
-                                        light
-                                    } else {
-                                        dark
-                                    };
-                                    let x = bounds.origin.x + px(col as f32 * CHECKER_TILE_PX);
-                                    let y = bounds.origin.y + px(row as f32 * CHECKER_TILE_PX);
-                                    let w =
-                                        px(CHECKER_TILE_PX
-                                            .min((bounds.right() - x).as_f32().max(0.0)));
-                                    let h = px(CHECKER_TILE_PX
+                    move |bounds, _, window, cx| {
+                        let (light, dark) =
+                            checkerboard_colors(cx.theme().background, cx.theme().foreground);
+                        window.paint_quad(fill(bounds, light));
+                        let cols = (bounds.size.width.as_f32() / CHECKER_TILE_PX).ceil() as usize;
+                        let rows = (bounds.size.height.as_f32() / CHECKER_TILE_PX).ceil() as usize;
+                        for row in 0..rows {
+                            for col in 0..cols {
+                                if (row + col).is_multiple_of(2) {
+                                    continue;
+                                }
+                                let x = bounds.origin.x + px(col as f32 * CHECKER_TILE_PX);
+                                let y = bounds.origin.y + px(row as f32 * CHECKER_TILE_PX);
+                                let w =
+                                    px(CHECKER_TILE_PX.min((bounds.right() - x).as_f32().max(0.0)));
+                                let h =
+                                    px(CHECKER_TILE_PX
                                         .min((bounds.bottom() - y).as_f32().max(0.0)));
-                                    if w > px(0.) && h > px(0.) {
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(w, h)),
-                                            color,
-                                        ));
-                                    }
+                                if w > px(0.) && h > px(0.) {
+                                    window.paint_quad(fill(
+                                        Bounds::new(point(x, y), size(w, h)),
+                                        dark,
+                                    ));
                                 }
                             }
-                        }
-                        PreviewBackdrop::Light => {
-                            let light_bg = Hsla {
-                                h: 0.0,
-                                s: 0.0,
-                                l: 0.96,
-                                a: 1.0,
-                            };
-                            window.paint_quad(fill(bounds, light_bg));
-                        }
-                        PreviewBackdrop::Dark => {
-                            let dark_bg = Hsla {
-                                h: 0.0,
-                                s: 0.0,
-                                l: 0.11,
-                                a: 1.0,
-                            };
-                            window.paint_quad(fill(bounds, dark_bg));
                         }
                     },
                 )
@@ -2292,10 +3131,6 @@ impl WatermarkEditor {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_2()
-                            .child(
-                                Label::new(t!("settings.watermark.preview").to_string()).text_sm(),
-                            )
                             .when_some(stamp_size, |this, size_text| {
                                 this.child(
                                     div()
@@ -2309,63 +3144,6 @@ impl WatermarkEditor {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                Button::new("backdrop-checker")
-                                    .xsmall()
-                                    .ghost()
-                                    .selected(self.backdrop == PreviewBackdrop::Checkerboard)
-                                    .toggled(self.backdrop == PreviewBackdrop::Checkerboard)
-                                    .icon(LucideIcon::Grid2x2)
-                                    .tooltip(
-                                        t!("settings.watermark.editor.backdrop_checker")
-                                            .to_string(),
-                                    )
-                                    .accessibility_label(
-                                        t!("settings.watermark.editor.backdrop_checker")
-                                            .to_string(),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.backdrop = PreviewBackdrop::Checkerboard;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("backdrop-light")
-                                    .xsmall()
-                                    .ghost()
-                                    .selected(self.backdrop == PreviewBackdrop::Light)
-                                    .toggled(self.backdrop == PreviewBackdrop::Light)
-                                    .icon(LucideIcon::Sun)
-                                    .tooltip(
-                                        t!("settings.watermark.editor.backdrop_light").to_string(),
-                                    )
-                                    .accessibility_label(
-                                        t!("settings.watermark.editor.backdrop_light").to_string(),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.backdrop = PreviewBackdrop::Light;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("backdrop-dark")
-                                    .xsmall()
-                                    .ghost()
-                                    .selected(self.backdrop == PreviewBackdrop::Dark)
-                                    .toggled(self.backdrop == PreviewBackdrop::Dark)
-                                    .icon(LucideIcon::Moon)
-                                    .tooltip(
-                                        t!("settings.watermark.editor.backdrop_dark").to_string(),
-                                    )
-                                    .accessibility_label(
-                                        t!("settings.watermark.editor.backdrop_dark").to_string(),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.backdrop = PreviewBackdrop::Dark;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(div().w(px(1.)).h(px(14.)).bg(cx.theme().border).mx_1())
                             .child(
                                 Button::new("watermark-zoom-out")
                                     .xsmall()
@@ -2827,32 +3605,141 @@ impl WatermarkEditor {
 }
 
 impl Render for WatermarkEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_save = self.can_save();
+        let editor = cx.entity();
+
+        let choices = template_choices(&AppSettings::get(cx).watermark);
+        let selected_value = self.template_id.clone().unwrap_or_default();
+        self.template_select.update(cx, |state, cx| {
+            if choices != self.last_template_choices {
+                self.last_template_choices = choices.clone();
+                state.set_items(choices.into(), window, cx);
+            }
+            if state.selected_value() != Some(&selected_value) {
+                state.set_selected_value(&selected_value, window, cx);
+            }
+        });
+        let can_delete = self
+            .template_id
+            .as_deref()
+            .is_some_and(|id| id != WatermarkConfig::DEFAULT_TEMPLATE_ID);
+
+        let template_bar = h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(Label::new(
+                t!("settings.watermark.editor.template").to_string(),
+            ))
+            .child(div().w(px(190.)).child(Select::new(&self.template_select)))
+            .child(div().w(px(170.)).child(Input::new(&self.name_input)))
+            .children(
+                self.name_error
+                    .clone()
+                    .map(|error| div().text_sm().text_color(cx.theme().danger).child(error)),
+            )
+            .child(
+                Button::new("watermark-template-new")
+                    .small()
+                    .label(t!("settings.watermark.template.new").to_string())
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_, window, cx| {
+                            editor.update(cx, |this, cx| {
+                                this.confirm_discard(window, cx, TemplateAction::New);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new("watermark-template-duplicate")
+                    .small()
+                    .label(t!("settings.watermark.template.duplicate").to_string())
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_, window, cx| {
+                            editor.update(cx, |this, cx| {
+                                this.confirm_discard(window, cx, TemplateAction::Duplicate);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new("watermark-template-delete")
+                    .small()
+                    .label(t!("settings.watermark.template.delete").to_string())
+                    .disabled(!can_delete)
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_, window, cx| {
+                            editor.update(cx, |this, cx| this.confirm_delete(window, cx));
+                        }
+                    }),
+            );
+
+        let selected_mode_ix = match self.mode {
+            EditorMode::Design => 0,
+            EditorMode::Layout => 1,
+        };
+        let mode_tabs = TabBar::new("watermark-editor-mode")
+            .segmented()
+            .selected_index(selected_mode_ix)
+            .children([
+                Tab::new().label(t!("settings.watermark.editor.mode.design").to_string()),
+                Tab::new().label(t!("settings.watermark.editor.mode.layout").to_string()),
+            ])
+            .on_click(move |ix, window, cx| {
+                let next = match *ix {
+                    0 => EditorMode::Design,
+                    1 => EditorMode::Layout,
+                    _ => return,
+                };
+                editor.update(cx, |this, cx| this.set_mode(next, window, cx));
+            });
+
         v_flex()
             .size_full()
             .min_h_0()
             .overflow_hidden()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(template_bar)
             .child(
-                div()
+                h_flex()
                     .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
                     .px_3()
                     .py_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(self.render_toolbar(cx)),
+                    .child(mode_tabs)
+                    .child(match self.mode {
+                        EditorMode::Design => self.render_toolbar(cx),
+                        EditorMode::Layout => self.render_layout_toolbar(cx),
+                    }),
             )
-            .child(
-                h_flex()
+            .child(match self.mode {
+                EditorMode::Design => h_flex()
                     .items_stretch()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_layers_pane(cx))
                     .child(self.render_center_pane(cx))
                     .child(self.render_inspector(cx)),
-            )
+                EditorMode::Layout => h_flex()
+                    .items_stretch()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_layout_preview_pane(cx))
+                    .child(self.render_layout_inspector(cx)),
+            })
             .child(
                 h_flex()
                     .w_full()
@@ -2874,7 +3761,7 @@ impl Render for WatermarkEditor {
                             .primary()
                             .disabled(!can_save)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if this.save(cx) {
+                                if this.save(window, cx) {
                                     window.remove_window();
                                 }
                             })),
@@ -2910,18 +3797,11 @@ pub(crate) fn open_window(
         .map(|template| template.preset.clone())
         .unwrap_or(initial_preset);
 
-    let mut suffix = watermark.templates.len() + 1;
-    let fallback_name = loop {
-        let candidate = if suffix == 1 {
-            "Watermark".to_string()
-        } else {
-            format!("Watermark {suffix}")
-        };
-        if !watermark.template_name_exists(&candidate, None) {
-            break candidate;
-        }
-        suffix += 1;
-    };
+    let fallback_name = template_id
+        .as_deref()
+        .and_then(|id| watermark.templates.get(id))
+        .map(|template| template.name.clone())
+        .unwrap_or_else(|| watermark.unique_template_name("Watermark"));
 
     let window_size = size(px(1080.), px(700.));
     let min_size = size(px(860.), px(580.));
@@ -3116,7 +3996,7 @@ fn checkerboard_colors(background: Hsla, _foreground: Hsla) -> (Hsla, Hsla) {
             ..background
         };
         let dark = Hsla {
-            l: (background.l + 0.06).clamp(0.10, 0.24),
+            l: (background.l + 0.02).clamp(0.08, 0.20),
             s: 0.0,
             a: 1.0,
             ..background
@@ -3124,13 +4004,13 @@ fn checkerboard_colors(background: Hsla, _foreground: Hsla) -> (Hsla, Hsla) {
         (light, dark)
     } else {
         let light = Hsla {
-            l: (background.l - 0.24).clamp(0.56, 0.72),
+            l: (background.l - 0.24).clamp(0.56, 0.75),
             s: 0.0,
             a: 1.0,
             ..background
         };
         let dark = Hsla {
-            l: (background.l - 0.34).clamp(0.46, 0.62),
+            l: (background.l - 0.44).clamp(0.38, 0.55),
             s: 0.0,
             a: 1.0,
             ..background
@@ -3344,17 +4224,7 @@ fn format_number(value: f64) -> String {
     }
 }
 
-pub(crate) fn template_choices(
-    watermark: &snapit_store::WatermarkConfig,
-    target: WatermarkTarget,
-) -> Vec<WatermarkChoice> {
-    let mut choices = Vec::with_capacity(watermark.templates.len() + 1);
-    if !watermark.shared {
-        choices.push(WatermarkChoice {
-            value: INHERIT_VALUE.into(),
-            title: t!("settings.watermark.template.inherit").to_string().into(),
-        });
-    }
+pub(crate) fn template_choices(watermark: &WatermarkConfig) -> Vec<WatermarkChoice> {
     let mut templates: Vec<_> = watermark.templates.iter().collect();
     templates.sort_by(|(_, left), (_, right)| {
         left.name
@@ -3362,22 +4232,13 @@ pub(crate) fn template_choices(
             .cmp(&right.name.to_lowercase())
             .then_with(|| left.name.cmp(&right.name))
     });
-    choices.extend(templates.into_iter().map(|(id, template)| WatermarkChoice {
-        value: id.clone(),
-        title: template.name.clone().into(),
-    }));
-    let _ = target;
-    choices
-}
-
-pub(crate) fn selection_value(
-    watermark: &snapit_store::WatermarkConfig,
-    target: WatermarkTarget,
-) -> String {
-    watermark
-        .selected_template_id(target)
-        .unwrap_or(INHERIT_VALUE)
-        .to_string()
+    templates
+        .into_iter()
+        .map(|(id, template)| WatermarkChoice {
+            value: id.clone(),
+            title: template.name.clone().into(),
+        })
+        .collect()
 }
 
 pub(crate) fn placement_label(placement: WatermarkPlacement) -> String {
@@ -3395,12 +4256,23 @@ pub(crate) fn placement_label(placement: WatermarkPlacement) -> String {
     .to_string()
 }
 
+impl NumberField {
+    fn is_layout(self) -> bool {
+        matches!(
+            self,
+            Self::MarginX | Self::MarginY | Self::TileSpacingX | Self::TileSpacingY
+        )
+    }
+}
+
 fn number_range(field: NumberField) -> (f64, f64, f64) {
     match field {
         NumberField::FontSize => (8.0, 256.0, 1.0),
         NumberField::ImageWidth => (8.0, 2048.0, 4.0),
         NumberField::OffsetX | NumberField::OffsetY => (-4096.0, 4096.0, 1.0),
         NumberField::StrokeWidth => (0.0, 12.0, 0.5),
+        NumberField::MarginX | NumberField::MarginY => (0.0, 2048.0, 4.0),
+        NumberField::TileSpacingX | NumberField::TileSpacingY => (8.0, 4096.0, 8.0),
     }
 }
 

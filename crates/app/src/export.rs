@@ -124,7 +124,7 @@ pub enum ExportResult {
 
 pub struct HdrExport {
     image: Arc<HdrImage>,
-    preview: OnceLock<Weak<RgbaImage>>,
+    preview: Mutex<Weak<RgbaImage>>,
     png: OnceLock<std::result::Result<Arc<Vec<u8>>, String>>,
 }
 
@@ -202,13 +202,13 @@ impl ExportComposition {
                 );
                 ExportResult::Hdr(HdrExport {
                     image,
-                    preview: OnceLock::new(),
+                    preview: Mutex::new(Weak::new()),
                     png: OnceLock::new(),
                 })
             }
             Some(hdr) => ExportResult::Hdr(HdrExport {
                 image: hdr.clone(),
-                preview: OnceLock::new(),
+                preview: Mutex::new(Weak::new()),
                 png: OnceLock::new(),
             }),
             None => {
@@ -391,12 +391,15 @@ impl ExportResult {
 
 impl HdrExport {
     fn sdr_preview(&self) -> Arc<RgbaImage> {
-        let cached = self.preview.get_or_init(Weak::new);
+        let mut cached = self
+            .preview
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(preview) = cached.upgrade() {
             return preview;
         }
         let preview = Arc::new(self.image.to_sdr());
-        let _ = self.preview.set(Arc::downgrade(&preview));
+        *cached = Arc::downgrade(&preview);
         preview
     }
 
@@ -552,7 +555,7 @@ mod tests {
         let ExportResult::Hdr(export) = result.as_ref() else {
             panic!("HDR source must stay HDR after composition");
         };
-        assert!(export.preview.get().unwrap().upgrade().is_none());
+        assert!(export.preview.lock().unwrap().upgrade().is_none());
         assert!(
             snapit_capture::decode_hdr_png_preview(&first)
                 .unwrap()
@@ -700,5 +703,18 @@ mod tests {
             .write_jpeg(Path::new("unused.jpg"), 90)
             .unwrap_err();
         assert!(error.contains("save as PNG"));
+    }
+
+    #[test]
+    fn hdr_export_sdr_preview_reuses_cached_arc() {
+        let hdr = snapit_capture::HdrImage::new(2, 2, vec![0; 2 * 2 * 6], 203.0);
+        let export = HdrExport {
+            image: Arc::new(hdr),
+            preview: Mutex::new(Weak::new()),
+            png: OnceLock::new(),
+        };
+        let first = export.sdr_preview();
+        let second = export.sdr_preview();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
