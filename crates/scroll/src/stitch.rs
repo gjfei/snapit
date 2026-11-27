@@ -115,6 +115,8 @@ struct FrameProfile {
     width: u32,
     height: u32,
     grid: [u32; 64],
+    fine_origin_x: usize,
+    fine_step: usize,
     fine_w: usize,
     fine_luma: Vec<u8>,
     row_grad: Vec<f32>,
@@ -228,6 +230,8 @@ impl FrameProfile {
             width,
             height,
             grid,
+            fine_origin_x: interior.start,
+            fine_step,
             fine_w,
             fine_luma,
             row_grad,
@@ -238,6 +242,53 @@ impl FrameProfile {
             coarse_luma,
             coarse_grad,
         }
+    }
+
+    fn fine_x_range(&self, fixed_left: u32, fixed_right: u32) -> std::ops::Range<usize> {
+        if fixed_left == 0 && fixed_right == 0 {
+            return 0..self.fine_w;
+        }
+        let step = self.fine_step.max(1);
+        let start_px = (fixed_left as usize).max(self.fine_origin_x);
+        let max_px = self.fine_origin_x + self.fine_w * step;
+        let end_px = (self.width as usize)
+            .saturating_sub(fixed_right as usize)
+            .min(max_px);
+        let fx0 = start_px.saturating_sub(self.fine_origin_x).div_ceil(step);
+        let fx1 = end_px.saturating_sub(self.fine_origin_x) / step;
+        let fx0 = fx0.min(self.fine_w);
+        let fx1 = fx1.clamp(fx0, self.fine_w);
+        if fx1 - fx0 >= 16 {
+            fx0..fx1
+        } else {
+            0..self.fine_w
+        }
+    }
+
+    fn coarse_x_range(&self, fine_x: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let cx0 = (fine_x.start / COARSE_STRIDE).min(self.coarse_w);
+        let cx1 = fine_x.end.div_ceil(COARSE_STRIDE).clamp(cx0, self.coarse_w);
+        if cx1 - cx0 >= 4 {
+            cx0..cx1
+        } else {
+            0..self.coarse_w
+        }
+    }
+
+    fn row_grad_in(&self, y: usize, fine_x: &std::ops::Range<usize>) -> f32 {
+        if fine_x.start == 0 && fine_x.end == self.fine_w {
+            return self.row_grad[y];
+        }
+        let span = fine_x.len();
+        if span <= 1 {
+            return 0.0;
+        }
+        let row = &self.fine_luma[y * self.fine_w + fine_x.start..y * self.fine_w + fine_x.end];
+        let mut grad_sum = 0u32;
+        for pair in row.windows(2) {
+            grad_sum += u32::from(pair[1].abs_diff(pair[0]));
+        }
+        grad_sum as f32 / (span - 1) as f32
     }
 
     #[allow(dead_code)]
@@ -327,6 +378,12 @@ pub struct Stitcher {
     fixed_bottom: u32,
     cand_top_votes: Option<(u32, u32)>,
     cand_bottom_votes: Option<(u32, u32)>,
+    fixed_left: u32,
+    fixed_right: u32,
+    cand_left_votes: Option<(u32, u32)>,
+    cand_right_votes: Option<(u32, u32)>,
+    left_fill_row: Vec<u8>,
+    right_fill_row: Vec<u8>,
     header_rows: Vec<u8>,
     footer_rows: Vec<u8>,
     rows: PagedRows,
@@ -357,6 +414,12 @@ impl Stitcher {
             fixed_bottom: 0,
             cand_top_votes: None,
             cand_bottom_votes: None,
+            fixed_left: 0,
+            fixed_right: 0,
+            cand_left_votes: None,
+            cand_right_votes: None,
+            left_fill_row: Vec::new(),
+            right_fill_row: Vec::new(),
             header_rows: Vec::new(),
             footer_rows: Vec::new(),
             rows: PagedRows::new(0),
@@ -400,6 +463,10 @@ impl Stitcher {
 
     pub fn fixed_margins(&self) -> (u32, u32) {
         (self.fixed_top, self.fixed_bottom)
+    }
+
+    pub fn fixed_sidebars(&self) -> (u32, u32) {
+        (self.fixed_left, self.fixed_right)
     }
 
     pub(crate) fn active_height(&self) -> u32 {
@@ -634,6 +701,16 @@ impl Stitcher {
         let active_h = active_bottom.saturating_sub(active_top);
         let search_top = eff_top.max(active_top);
         let search_bottom = (self.frame_height - eff_bottom).min(active_bottom);
+        let (eff_left, eff_right) =
+            if let Some(prev_profile) = self.prev.as_ref().map(|p| p.profile.clone()) {
+                match self.update_fixed_sidebars(&prev_profile, &curr, search_top, search_bottom) {
+                    Ok(sidebars) => sidebars,
+                    Err(error) => return FeedOutcome::Failed(format!("{error:#}")),
+                }
+            } else {
+                (self.fixed_left, self.fixed_right)
+            };
+        let fine_x = curr.fine_x_range(eff_left, eff_right);
         let committed_expected_dy = self
             .last_dy
             .zip(self.prev.as_ref())
@@ -656,6 +733,7 @@ impl Stitcher {
                         &curr,
                         search_top,
                         search_bottom,
+                        &fine_x,
                         self.last_dy,
                     ),
                 )
@@ -678,6 +756,7 @@ impl Stitcher {
                                 &curr,
                                 search_top,
                                 search_bottom,
+                                &fine_x,
                                 committed_expected_dy,
                             ),
                         )
@@ -709,6 +788,7 @@ impl Stitcher {
                     &curr,
                     search_top,
                     search_bottom,
+                    &fine_x,
                     committed_expected_dy,
                 );
                 (anchor.y, match_res)
@@ -725,6 +805,7 @@ impl Stitcher {
                                 &curr,
                                 search_top,
                                 search_bottom,
+                                &fine_x,
                                 self.last_dy,
                             ),
                         )
@@ -934,6 +1015,12 @@ impl Stitcher {
         self.fixed_bottom = 0;
         self.cand_top_votes = None;
         self.cand_bottom_votes = None;
+        self.fixed_left = 0;
+        self.fixed_right = 0;
+        self.cand_left_votes = None;
+        self.cand_right_votes = None;
+        self.left_fill_row.clear();
+        self.right_fill_row.clear();
         self.viewport_y = 0;
         self.last_dy = None;
         self.upward_established = false;
@@ -1114,17 +1201,336 @@ impl Stitcher {
     }
 
     fn next_margin_vote(votes: Option<(u32, u32)>, candidate: u32) -> Option<(u32, u32)> {
+        Self::next_margin_vote_tol(votes, candidate, 4)
+    }
+
+    fn next_margin_vote_tol(
+        votes: Option<(u32, u32)>,
+        candidate: u32,
+        tolerance: u32,
+    ) -> Option<(u32, u32)> {
         if let Some((v, n)) = votes {
             let compatible = if v == 0 || candidate == 0 {
                 v == candidate
             } else {
-                v.abs_diff(candidate) <= 4
+                v.abs_diff(candidate) <= tolerance
             };
             if compatible {
                 return Some((v, (n + 1).min(MARGIN_CHANGE_VOTES)));
             }
         }
         Some((candidate, 1))
+    }
+
+    /// Detect fixed vertical sidebars (left navigation / right outline) that stay
+    /// static while the center active band scrolls vertically. Only textured
+    /// static sidebars qualify so uniform page margins are left untouched.
+    fn update_fixed_sidebars(
+        &mut self,
+        prev: &FrameProfile,
+        curr: &FrameProfile,
+        search_top: u32,
+        search_bottom: u32,
+    ) -> Result<(u32, u32)> {
+        let active_h = search_bottom.saturating_sub(search_top) as usize;
+        if self.width < 160 || active_h < 48 || prev.fine_w < 32 {
+            return Ok((self.fixed_left, self.fixed_right));
+        }
+
+        let fine_w = prev.fine_w;
+        let step_y = (active_h / 64).max(1);
+        let mut sampled_rows = 0usize;
+        let mut col_diff_sum = vec![0u32; fine_w];
+        let mut col_vert_sum = vec![0u32; fine_w];
+        let mut col_vert_edges = vec![0usize; fine_w];
+        let mut col_horiz_edges = vec![0usize; fine_w];
+        let mut prev_sample_row: Option<usize> = None;
+
+        for y in (search_top as usize..search_bottom as usize).step_by(step_y) {
+            let p_row = &prev.fine_luma[y * fine_w..(y + 1) * fine_w];
+            let c_row = &curr.fine_luma[y * fine_w..(y + 1) * fine_w];
+            for fx in 0..fine_w {
+                col_diff_sum[fx] += u32::from(p_row[fx].abs_diff(c_row[fx]));
+                if fx > 0 && c_row[fx].abs_diff(c_row[fx - 1]) >= 10 {
+                    col_horiz_edges[fx] += 1;
+                }
+            }
+            if let Some(py) = prev_sample_row {
+                let prev_c_row = &curr.fine_luma[py * fine_w..(py + 1) * fine_w];
+                for fx in 0..fine_w {
+                    let vd = c_row[fx].abs_diff(prev_c_row[fx]);
+                    col_vert_sum[fx] += u32::from(vd);
+                    if vd >= 10 {
+                        col_vert_edges[fx] += 1;
+                    }
+                }
+            }
+            prev_sample_row = Some(y);
+            sampled_rows += 1;
+        }
+        if sampled_rows < 4 {
+            return Ok((self.fixed_left, self.fixed_right));
+        }
+
+        let moving_cols = col_diff_sum
+            .iter()
+            .filter(|&&sum| (sum as f32 / sampled_rows as f32) > 4.0)
+            .count();
+        if moving_cols * 20 < fine_w * 3 {
+            return Ok((self.fixed_left, self.fixed_right));
+        }
+
+        let vert_pairs = (sampled_rows - 1).max(1) as f32;
+        let min_vert_edges = (sampled_rows / 8).max(3);
+        let max_side_fine = (fine_w * 42 / 100).min(fine_w.saturating_sub(24) / 2);
+        let pad_cols = (((16.0 * self.config.scale) / prev.fine_step.max(1) as f32).ceil()
+            as usize)
+            .clamp(3, 16);
+        let col_diff = |fx: usize| col_diff_sum[fx] as f32 / sampled_rows as f32;
+        let col_has_texture = |fx: usize| {
+            (col_vert_sum[fx] as f32 / vert_pairs) >= 1.2 && col_vert_edges[fx] >= min_vert_edges
+        };
+
+        let mut cand_left_fine = 0usize;
+        let mut left_textured_cols = 0usize;
+        let mut left_horiz_cols = 0usize;
+        let mut last_textured = 0usize;
+        let mut consecutive_moving = 0usize;
+        for (fx, &horiz_edges) in col_horiz_edges.iter().enumerate().take(max_side_fine) {
+            let diff = col_diff(fx);
+            if diff > 5.0 {
+                consecutive_moving += 1;
+                if consecutive_moving >= 3 {
+                    break;
+                }
+            } else {
+                consecutive_moving = 0;
+                if diff <= 2.5 {
+                    if col_has_texture(fx) {
+                        left_textured_cols += 1;
+                        if horiz_edges >= 3 {
+                            left_horiz_cols += 1;
+                        }
+                        last_textured = fx + 1;
+                        cand_left_fine = fx + 1;
+                    } else if left_textured_cols > 0
+                        && (fx + 1 - last_textured <= pad_cols
+                            || (fx + 1 - last_textured <= pad_cols * 2 && horiz_edges >= 3))
+                    {
+                        if horiz_edges >= 3 {
+                            left_horiz_cols += 1;
+                        }
+                        cand_left_fine = fx + 1;
+                    }
+                }
+            }
+        }
+        if left_textured_cols < 3 || left_horiz_cols < 2 {
+            cand_left_fine = 0;
+        }
+
+        let mut cand_right_fine = 0usize;
+        let mut right_textured_cols = 0usize;
+        let mut right_horiz_cols = 0usize;
+        last_textured = 0;
+        consecutive_moving = 0;
+        for offset in 0..max_side_fine {
+            let fx = fine_w - 1 - offset;
+            let diff = col_diff(fx);
+            if diff > 5.0 {
+                consecutive_moving += 1;
+                if consecutive_moving >= 3 {
+                    break;
+                }
+            } else {
+                consecutive_moving = 0;
+                if diff <= 2.5 {
+                    if col_has_texture(fx) {
+                        right_textured_cols += 1;
+                        if col_horiz_edges[fx] >= 3 {
+                            right_horiz_cols += 1;
+                        }
+                        last_textured = offset + 1;
+                        cand_right_fine = offset + 1;
+                    } else if right_textured_cols > 0
+                        && (offset + 1 - last_textured <= pad_cols
+                            || (offset + 1 - last_textured <= pad_cols * 2
+                                && col_horiz_edges[fx] >= 3))
+                    {
+                        if col_horiz_edges[fx] >= 3 {
+                            right_horiz_cols += 1;
+                        }
+                        cand_right_fine = offset + 1;
+                    }
+                }
+            }
+        }
+        if right_textured_cols < 3 || right_horiz_cols < 2 {
+            cand_right_fine = 0;
+        }
+
+        let min_sidebar_px = (24.0 * self.config.scale).round() as u32;
+        let cand_left = if cand_left_fine > 0 {
+            let px = (prev.fine_origin_x + cand_left_fine * prev.fine_step).min(self.width as usize)
+                as u32;
+            if px >= min_sidebar_px { px } else { 0 }
+        } else {
+            0
+        };
+        let cand_right = if cand_right_fine > 0 {
+            let boundary_x = prev.fine_origin_x + (fine_w - cand_right_fine) * prev.fine_step;
+            let px = self.width.saturating_sub(boundary_x as u32);
+            if px >= min_sidebar_px { px } else { 0 }
+        } else {
+            0
+        };
+
+        self.cand_left_votes = Self::next_margin_vote_tol(self.cand_left_votes, cand_left, 8);
+        self.cand_right_votes = Self::next_margin_vote_tol(self.cand_right_votes, cand_right, 8);
+
+        let left_needed = if self.fixed_left == 0 {
+            INITIAL_MARGIN_VOTES
+        } else {
+            MARGIN_CHANGE_VOTES
+        };
+        let right_needed = if self.fixed_right == 0 {
+            INITIAL_MARGIN_VOTES
+        } else {
+            MARGIN_CHANGE_VOTES
+        };
+        let next_left = match self.cand_left_votes {
+            Some((v, n)) if n >= left_needed => v,
+            _ => self.fixed_left,
+        };
+        let next_right = match self.cand_right_votes {
+            Some((v, n)) if n >= right_needed => v,
+            _ => self.fixed_right,
+        };
+
+        let min_active_w = (self.width / 3).max(96);
+        if (next_left != self.fixed_left || next_right != self.fixed_right)
+            && next_left + next_right + min_active_w <= self.width
+        {
+            self.flush_pending()?;
+            self.apply_fixed_sidebars(next_left, next_right, curr)?;
+        }
+
+        let eff_left = self.fixed_left.max(cand_left);
+        let eff_right = self.fixed_right.max(cand_right);
+        if eff_left + eff_right + min_active_w <= self.width {
+            Ok((eff_left, eff_right))
+        } else {
+            Ok((self.fixed_left, self.fixed_right))
+        }
+    }
+
+    fn apply_fixed_sidebars(
+        &mut self,
+        new_left: u32,
+        new_right: u32,
+        curr: &FrameProfile,
+    ) -> Result<()> {
+        self.fixed_left = new_left;
+        self.fixed_right = new_right;
+        self.apply_fixed_sidebars_quiet(curr)?;
+        log::info!(
+            "scroll fixed sidebars updated: left={} right={} (active_w={})",
+            self.fixed_left,
+            self.fixed_right,
+            self.width - self.fixed_left - self.fixed_right
+        );
+        self.rebuild_all_preview_tiles()
+    }
+
+    fn apply_fixed_sidebars_quiet(&mut self, curr: &FrameProfile) -> Result<()> {
+        let active_top = self.fixed_top;
+        let active_bottom = self.frame_height - self.fixed_bottom;
+        let active_h = active_bottom.saturating_sub(active_top);
+        self.left_fill_row = if self.fixed_left > 0 {
+            build_sidebar_fill_row(curr, 0, self.fixed_left as usize, active_top, active_bottom)
+        } else {
+            Vec::new()
+        };
+        self.right_fill_row = if self.fixed_right > 0 {
+            build_sidebar_fill_row(
+                curr,
+                (self.width - self.fixed_right) as usize,
+                self.width as usize,
+                active_top,
+                active_bottom,
+            )
+        } else {
+            Vec::new()
+        };
+
+        let total_active = self.above_rows + self.below_rows;
+        if total_active == 0 || (self.fixed_left == 0 && self.fixed_right == 0) {
+            return Ok(());
+        }
+        let stride = self.width as usize * 4;
+        let batch_rows = ((8 * 1024 * 1024 / stride.max(1)).max(1) as u32).min(total_active);
+        let mut buffer = vec![0u8; batch_rows as usize * stride];
+        let top = -(self.above_rows as i32);
+        for start in (0..total_active).step_by(batch_rows as usize) {
+            let rows = batch_rows.min(total_active - start);
+            let len = rows as usize * stride;
+            self.rows
+                .copy_to(top + start as i32, rows, &mut buffer[..len])?;
+            patch_sidebar_rows(
+                self.width,
+                self.fixed_left,
+                self.fixed_right,
+                &self.left_fill_row,
+                &self.right_fill_row,
+                curr,
+                active_top,
+                i64::from(start),
+                active_h,
+                &mut buffer[..len],
+            );
+            self.rows
+                .write_rows(top + start as i32, rows, &buffer[..len])?;
+        }
+        Ok(())
+    }
+
+    fn sync_top_sidebar_band(&mut self, curr: &FrameProfile, count: u32) -> Result<()> {
+        if count == 0 || (self.fixed_left == 0 && self.fixed_right == 0) {
+            return Ok(());
+        }
+        let active_top = self.fixed_top;
+        let active_bottom = self.frame_height - self.fixed_bottom;
+        let active_h = active_bottom.saturating_sub(active_top);
+        let total_active = self.above_rows + self.below_rows;
+        let rows_to_patch = count.min(total_active);
+        if rows_to_patch == 0 {
+            return Ok(());
+        }
+        let stride = self.width as usize * 4;
+        let batch_rows = ((8 * 1024 * 1024 / stride.max(1)).max(1) as u32).min(rows_to_patch);
+        let mut buffer = vec![0u8; batch_rows as usize * stride];
+        let top = -(self.above_rows as i32);
+        for start in (0..rows_to_patch).step_by(batch_rows as usize) {
+            let rows = batch_rows.min(rows_to_patch - start);
+            let len = rows as usize * stride;
+            self.rows
+                .copy_to(top + start as i32, rows, &mut buffer[..len])?;
+            patch_sidebar_rows(
+                self.width,
+                self.fixed_left,
+                self.fixed_right,
+                &self.left_fill_row,
+                &self.right_fill_row,
+                curr,
+                active_top,
+                i64::from(start),
+                active_h,
+                &mut buffer[..len],
+            );
+            self.rows
+                .write_rows(top + start as i32, rows, &buffer[..len])?;
+        }
+        Ok(())
     }
 
     /// Re-slice already-captured canvas rows when sticky margins change.
@@ -1224,6 +1630,9 @@ impl Stitcher {
             self.fixed_bottom,
             self.frame_height - self.fixed_top - self.fixed_bottom
         );
+        if self.fixed_left > 0 || self.fixed_right > 0 {
+            self.apply_fixed_sidebars_quiet(curr)?;
+        }
         if self.preview_follow {
             self.sync_live_preview_range();
         }
@@ -1295,6 +1704,7 @@ impl Stitcher {
             } else {
                 bottom_extent
             };
+            let has_sidebars = self.fixed_left > 0 || self.fixed_right > 0;
 
             // Overwrite existing `below` rows from `seam_y.max(0)`..`bottom_extent`,
             // then append new rows `bottom_extent`..`y_end`.
@@ -1302,16 +1712,55 @@ impl Stitcher {
             if overwrite_start < bottom_extent {
                 let src_start = (overwrite_start - y) as u32 + active_top;
                 let src_end = (bottom_extent - y) as u32 + active_top;
-                self.rows.write_rows(
-                    overwrite_start,
-                    (bottom_extent - overwrite_start) as u32,
-                    frame.raw_rows(src_start, src_end),
-                )?;
+                let raw = frame.raw_rows(src_start, src_end);
+                if has_sidebars {
+                    let mut patched = raw.to_vec();
+                    patch_sidebar_rows(
+                        self.width,
+                        self.fixed_left,
+                        self.fixed_right,
+                        &self.left_fill_row,
+                        &self.right_fill_row,
+                        &frame,
+                        active_top,
+                        i64::from(self.above_rows) + i64::from(overwrite_start),
+                        active_h,
+                        &mut patched,
+                    );
+                    self.rows.write_rows(
+                        overwrite_start,
+                        (bottom_extent - overwrite_start) as u32,
+                        &patched,
+                    )?;
+                } else {
+                    self.rows.write_rows(
+                        overwrite_start,
+                        (bottom_extent - overwrite_start) as u32,
+                        raw,
+                    )?;
+                }
             }
             let src_start = (bottom_extent - y) as u32 + active_top;
             let src_end = (y_end - y) as u32 + active_top;
-            self.rows
-                .append_down(bottom_extent, frame.raw_rows(src_start, src_end))?;
+            let raw = frame.raw_rows(src_start, src_end);
+            if has_sidebars {
+                let mut patched = raw.to_vec();
+                patch_sidebar_rows(
+                    self.width,
+                    self.fixed_left,
+                    self.fixed_right,
+                    &self.left_fill_row,
+                    &self.right_fill_row,
+                    &frame,
+                    active_top,
+                    i64::from(self.above_rows) + i64::from(bottom_extent),
+                    active_h,
+                    &mut patched,
+                );
+                self.rows.append_down(bottom_extent, &patched)?;
+            } else {
+                self.rows.append_down(bottom_extent, raw)?;
+            }
             self.below_rows += (y_end - bottom_extent) as u32;
             self.update_footer(&frame);
             let dirty_start = self.active_to_canvas(overwrite_start.max(0));
@@ -1371,6 +1820,9 @@ impl Stitcher {
                 }
                 self.rows.prepend_up(top_extent, &pixels)?;
                 self.above_rows += allow_new;
+                if self.fixed_left > 0 || self.fixed_right > 0 {
+                    self.sync_top_sidebar_band(&frame, allow_new + active_h)?;
+                }
                 if !self.preview_follow {
                     self.preview_range.0 = self.preview_range.0.saturating_add(allow_new);
                 }
@@ -1416,7 +1868,14 @@ impl Stitcher {
         let mut best_y = (lo + hi) / 2;
         let mut best_diff = u64::MAX;
         let step_x = (self.width as usize / 64).max(1);
-        let interior = interior_columns(self.width as usize, self.config.scale);
+        let mut interior = interior_columns(self.width as usize, self.config.scale);
+        let narrowed_start = interior.start.max(self.fixed_left as usize);
+        let narrowed_end = interior
+            .end
+            .min(self.width.saturating_sub(self.fixed_right) as usize);
+        if narrowed_end > narrowed_start + 16 {
+            interior = narrowed_start..narrowed_end;
+        }
         let mut existing = vec![0u8; self.width as usize * 4];
         if hi - lo > 64 {
             let step_y = ((hi - lo) / 64).max(1);
@@ -1573,6 +2032,154 @@ fn sampled_row_diff(a: &[u8], b: &[u8], step_x: usize, interior: std::ops::Range
     sum
 }
 
+/// Build a single horizontal fill row for a fixed sidebar spanning `[x_start .. x_end]`:
+/// uses the dominant background color in `active_top..active_bottom` while
+/// preserving vertically uniform 1–3 px border/divider columns along both edges.
+fn build_sidebar_fill_row(
+    frame: &FrameProfile,
+    x_start: usize,
+    x_end: usize,
+    active_top: u32,
+    active_bottom: u32,
+) -> Vec<u8> {
+    let x_end = x_end.min(frame.width as usize);
+    let x_start = x_start.min(x_end);
+    let span = x_end - x_start;
+    if span == 0 {
+        return Vec::new();
+    }
+    let active_h = active_bottom.saturating_sub(active_top);
+    if active_h == 0 {
+        return vec![0u8; span * 4];
+    }
+
+    let step_y = (active_h / 64).max(1);
+    let mut hist_count = vec![0u32; 4096];
+    let mut hist_sum = vec![[0u64; 3]; 4096];
+    let inner_start = if span > 6 { x_start + 3 } else { x_start };
+    let inner_end = if span > 6 { x_end - 3 } else { x_end };
+    let mut sampled_ys = Vec::with_capacity(64);
+
+    let mut y = active_top;
+    while y < active_bottom {
+        sampled_ys.push(y);
+        let row = frame.raw_rows(y, y + 1);
+        for x in inner_start..inner_end {
+            let p = x * 4;
+            let r = row[p];
+            let g = row[p + 1];
+            let b = row[p + 2];
+            let key = (usize::from(r >> 4) << 8) | (usize::from(g >> 4) << 4) | usize::from(b >> 4);
+            hist_count[key] += 1;
+            hist_sum[key][0] += u64::from(r);
+            hist_sum[key][1] += u64::from(g);
+            hist_sum[key][2] += u64::from(b);
+        }
+        y = y.saturating_add(step_y);
+    }
+
+    let mut best_key = 0usize;
+    let mut best_count = 0u32;
+    for (key, &count) in hist_count.iter().enumerate() {
+        if count > best_count {
+            best_count = count;
+            best_key = key;
+        }
+    }
+    let bg = if best_count > 0 {
+        let sum = hist_sum[best_key];
+        [
+            (sum[0] / u64::from(best_count)) as u8,
+            (sum[1] / u64::from(best_count)) as u8,
+            (sum[2] / u64::from(best_count)) as u8,
+            255,
+        ]
+    } else {
+        let first = frame.raw_rows(active_top, active_top + 1);
+        let p = x_start * 4;
+        [first[p], first[p + 1], first[p + 2], 255]
+    };
+
+    let mut fill_row = Vec::with_capacity(span * 4);
+    for _ in 0..span {
+        fill_row.extend_from_slice(&bg);
+    }
+
+    if let Some(&first_y) = sampled_ys.first() {
+        let first_row = frame.raw_rows(first_y, first_y + 1);
+        for x in x_start..x_end {
+            let near_edge = x - x_start < 3 || x_end - 1 - x < 3;
+            if !near_edge {
+                continue;
+            }
+            let p = x * 4;
+            let ref_px = [
+                first_row[p],
+                first_row[p + 1],
+                first_row[p + 2],
+                first_row[p + 3],
+            ];
+            let uniform = sampled_ys.iter().all(|&sy| {
+                let row = frame.raw_rows(sy, sy + 1);
+                row[p].abs_diff(ref_px[0]) <= 6
+                    && row[p + 1].abs_diff(ref_px[1]) <= 6
+                    && row[p + 2].abs_diff(ref_px[2]) <= 6
+            });
+            if uniform {
+                let dst = (x - x_start) * 4;
+                fill_row[dst..dst + 4].copy_from_slice(&ref_px);
+            }
+        }
+    }
+
+    fill_row
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_sidebar_rows(
+    width: u32,
+    fixed_left: u32,
+    fixed_right: u32,
+    left_fill: &[u8],
+    right_fill: &[u8],
+    top_frame: &FrameProfile,
+    frame_active_top: u32,
+    start_top_idx: i64,
+    active_h: u32,
+    buf: &mut [u8],
+) {
+    let stride = width as usize * 4;
+    if stride == 0 {
+        return;
+    }
+    let left_bytes = (fixed_left as usize * 4).min(stride);
+    let right_bytes = (fixed_right as usize * 4).min(stride.saturating_sub(left_bytes));
+    let right_off = stride - right_bytes;
+    let row_count = buf.len() / stride;
+
+    for i in 0..row_count {
+        let top_idx = start_top_idx + i as i64;
+        let row = &mut buf[i * stride..(i + 1) * stride];
+        if top_idx >= 0 && top_idx < i64::from(active_h) {
+            let fy = frame_active_top + top_idx as u32;
+            let src = top_frame.raw_rows(fy, fy + 1);
+            if left_bytes > 0 {
+                row[..left_bytes].copy_from_slice(&src[..left_bytes]);
+            }
+            if right_bytes > 0 {
+                row[right_off..].copy_from_slice(&src[right_off..]);
+            }
+        } else {
+            if left_bytes > 0 && left_fill.len() == left_bytes {
+                row[..left_bytes].copy_from_slice(left_fill);
+            }
+            if right_bytes > 0 && right_fill.len() == right_bytes {
+                row[right_off..].copy_from_slice(right_fill);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FineScore {
     mad: f32,
@@ -1616,7 +2223,11 @@ fn coarse_band_scores(
     c_bot: i32,
     c_lo: i32,
     c_hi: i32,
+    fine_x: &std::ops::Range<usize>,
 ) -> Vec<(i32, f32)> {
+    let coarse_x = prev.coarse_x_range(fine_x);
+    let coarse_span = coarse_x.len().max(1);
+    let full_fine_x = fine_x.start == 0 && fine_x.end == prev.fine_w;
     let mut scores = Vec::with_capacity((c_hi - c_lo + 1).max(0) as usize);
     for c_dy in c_lo..=c_hi {
         let ov_start = c_top.max(c_top + c_dy);
@@ -1631,15 +2242,21 @@ fn coarse_band_scores(
         for y in (ov_start..ov_end).step_by(row_step) {
             let py = y as usize;
             let cy = (y - c_dy) as usize;
-            let w = prev.coarse_grad[py].max(0.5);
-            let p_row = &prev.coarse_luma[py * prev.coarse_w..(py + 1) * prev.coarse_w];
-            let c_row = &curr.coarse_luma[cy * curr.coarse_w..(cy + 1) * curr.coarse_w];
+            let w = if full_fine_x {
+                prev.coarse_grad[py].max(0.5)
+            } else {
+                prev.row_grad_in(py * COARSE_STRIDE, fine_x).max(0.5)
+            };
+            let p_row = &prev.coarse_luma
+                [py * prev.coarse_w + coarse_x.start..py * prev.coarse_w + coarse_x.end];
+            let c_row = &curr.coarse_luma
+                [cy * curr.coarse_w + coarse_x.start..cy * curr.coarse_w + coarse_x.end];
             let err: u32 = p_row
                 .iter()
                 .zip(c_row)
                 .map(|(a, b)| u32::from(a.abs_diff(*b)))
                 .sum();
-            weighted_err += (err as f32 / prev.coarse_w as f32) * w;
+            weighted_err += (err as f32 / coarse_span as f32) * w;
             weight_sum += w;
         }
         if weight_sum > 0.0 {
@@ -1669,6 +2286,7 @@ fn refine_coarse_candidates(
     curr: &FrameProfile,
     active_top: i32,
     active_bottom: i32,
+    fine_x: &std::ops::Range<usize>,
     max_shift: i32,
     candidates: &[(i32, f32)],
 ) -> Vec<(i32, FineScore)> {
@@ -1679,7 +2297,7 @@ fn refine_coarse_candidates(
         let hi = (center + COARSE_STRIDE as i32).min(max_shift);
         let mut best_local: Option<(i32, FineScore)> = None;
         for dy in lo..=hi {
-            if let Some(score) = score_fine_shift(prev, curr, active_top, active_bottom, dy)
+            if let Some(score) = score_fine_shift(prev, curr, active_top, active_bottom, fine_x, dy)
                 && best_local.is_none_or(|(_, b)| score.effective_mad() < b.effective_mad())
             {
                 best_local = Some((dy, score));
@@ -1693,7 +2311,7 @@ fn refine_coarse_candidates(
 }
 
 /// Estimate vertical displacement `dy` of `curr` relative to `prev` within
-/// `[active_top .. active_bottom]`.
+/// `[active_top .. active_bottom]` and horizontally across `fine_x`.
 ///
 /// Convention: `dy > 0` means the user scrolled **down** (content moved up on
 /// screen, so `curr` sits `dy` pixels below `prev` on the stitched canvas).
@@ -1702,17 +2320,17 @@ fn estimate_shift(
     curr: &FrameProfile,
     active_top: u32,
     active_bottom: u32,
+    fine_x: &std::ops::Range<usize>,
     last_dy: Option<i32>,
 ) -> Result<i32, ScrollWarning> {
     let active_h = active_bottom.saturating_sub(active_top) as i32;
-    if active_h < 32 || prev.fine_w == 0 || curr.fine_w == 0 {
+    if active_h < 32 || fine_x.len() < 8 {
         return Err(ScrollWarning::LowTexture);
     }
 
     // Check whether the active band actually has enough texture to match.
-    let textured_rows = curr.row_grad[active_top as usize..active_bottom as usize]
-        .iter()
-        .filter(|&&g| g >= 1.5)
+    let textured_rows = (active_top as usize..active_bottom as usize)
+        .filter(|&y| curr.row_grad_in(y, fine_x) >= 1.5)
         .count();
     if textured_rows < 6 {
         return Err(ScrollWarning::LowTexture);
@@ -1742,13 +2360,14 @@ fn estimate_shift(
         let half_win = (c_pred.abs() / 3).clamp(16, 48);
         let win_lo = (c_pred - half_win).max(-c_max);
         let win_hi = (c_pred + half_win).min(c_max);
-        let narrow_coarse = coarse_band_scores(prev, curr, c_top, c_bot, win_lo, win_hi);
+        let narrow_coarse = coarse_band_scores(prev, curr, c_top, c_bot, win_lo, win_hi, fine_x);
         let narrow_cands = coarse_minima(&narrow_coarse, 3);
         let mut narrow_fine = refine_coarse_candidates(
             prev,
             curr,
             active_top as i32,
             active_bottom as i32,
+            fine_x,
             max_shift,
             &narrow_cands,
         );
@@ -1761,8 +2380,15 @@ fn estimate_shift(
             let sharp_peak = [-2, 2].into_iter().any(|delta| {
                 let probe = best_dy + delta;
                 (-max_shift..=max_shift).contains(&probe)
-                    && score_fine_shift(prev, curr, active_top as i32, active_bottom as i32, probe)
-                        .is_some_and(|s| s.mad >= best_score.mad + 1.5)
+                    && score_fine_shift(
+                        prev,
+                        curr,
+                        active_top as i32,
+                        active_bottom as i32,
+                        fine_x,
+                        probe,
+                    )
+                    .is_some_and(|s| s.mad >= best_score.mad + 1.5)
             });
             if best_score.mad <= 3.5
                 && best_score.inlier >= 0.94
@@ -1775,7 +2401,7 @@ fn estimate_shift(
         }
     }
 
-    let coarse_scores = coarse_band_scores(prev, curr, c_top, c_bot, -c_max, c_max);
+    let coarse_scores = coarse_band_scores(prev, curr, c_top, c_bot, -c_max, c_max, fine_x);
     if coarse_scores.is_empty() {
         return Err(ScrollWarning::TooFast);
     }
@@ -1791,6 +2417,7 @@ fn estimate_shift(
         curr,
         active_top as i32,
         active_bottom as i32,
+        fine_x,
         max_shift,
         &candidates,
     );
@@ -1875,12 +2502,16 @@ fn score_fine_shift(
     curr: &FrameProfile,
     active_top: i32,
     active_bottom: i32,
+    fine_x: &std::ops::Range<usize>,
     dy: i32,
 ) -> Option<FineScore> {
     let ov_start = active_top.max(active_top + dy);
     let ov_end = active_bottom.min(active_bottom + dy);
     let ov_len = ov_end - ov_start;
-    if ov_len < 16 {
+    let fx0 = fine_x.start;
+    let fx1 = fine_x.end;
+    let span_w = fx1.saturating_sub(fx0);
+    if ov_len < 16 || span_w < 8 {
         return None;
     }
 
@@ -1893,7 +2524,7 @@ fn score_fine_shift(
     let mut samples = 0usize;
     let mut textured_rows = 0usize;
 
-    let use_bands = prev.fine_w >= 64;
+    let use_bands = span_w >= 64;
     let mut band_weighted_err = [0.0_f32; 8];
     let mut band_weight_sum = [0.0_f32; 8];
     let mut band_inliers = [0usize; 8];
@@ -1906,7 +2537,7 @@ fn score_fine_shift(
         let mut pick_y = r0;
         let mut best_g = -1.0_f32;
         for y in r0..r1 {
-            let g = prev.row_grad[y as usize];
+            let g = prev.row_grad_in(y as usize, fine_x);
             if g > best_g {
                 best_g = g;
                 pick_y = y;
@@ -1914,18 +2545,19 @@ fn score_fine_shift(
         }
         let py = pick_y as usize;
         let cy = (pick_y - dy) as usize;
-        if prev.row_grad[py] >= 1.5 {
+        let row_g = prev.row_grad_in(py, fine_x);
+        if row_g >= 1.5 {
             textured_rows += 1;
         }
         let p_row = &prev.fine_luma[py * prev.fine_w..(py + 1) * prev.fine_w];
         let c_row = &curr.fine_luma[cy * curr.fine_w..(cy + 1) * curr.fine_w];
-        let w = prev.row_grad[py].max(1.0);
+        let w = row_g.max(1.0);
 
         if use_bands {
             let mut row_err = 0u32;
             for band in 0..8 {
-                let bx0 = band * prev.fine_w / 8;
-                let bx1 = (band + 1) * prev.fine_w / 8;
+                let bx0 = fx0 + band * span_w / 8;
+                let bx1 = fx0 + (band + 1) * span_w / 8;
                 let band_len = bx1 - bx0;
                 let mut b_err = 0u32;
                 let mut b_inl = 0usize;
@@ -1937,7 +2569,7 @@ fn score_fine_shift(
                     if d <= INLIER_THRESHOLD {
                         b_inl += 1;
                     }
-                    if x > 0 {
+                    if x > fx0 {
                         b_grad += u64::from(pa.abs_diff(p_row[x - 1]));
                     }
                 }
@@ -1950,11 +2582,11 @@ fn score_fine_shift(
                 band_samples[band] += band_len;
                 band_grad[band] += b_grad;
             }
-            weighted_err += (row_err as f32 / prev.fine_w as f32) * w;
+            weighted_err += (row_err as f32 / span_w as f32) * w;
             weight_sum += w;
         } else {
             let mut row_err = 0u32;
-            for (&pa, &ca) in p_row.iter().zip(c_row) {
+            for (&pa, &ca) in p_row[fx0..fx1].iter().zip(&c_row[fx0..fx1]) {
                 let d = pa.abs_diff(ca);
                 row_err += u32::from(d);
                 if d <= INLIER_THRESHOLD {
@@ -1962,7 +2594,7 @@ fn score_fine_shift(
                 }
                 samples += 1;
             }
-            weighted_err += (row_err as f32 / prev.fine_w as f32) * w;
+            weighted_err += (row_err as f32 / span_w as f32) * w;
             weight_sum += w;
         }
     }
@@ -2918,6 +3550,141 @@ mod tests {
         for scroll_y in [1120u32, 1360, 1620, 1900] {
             let _ = stitcher.feed(viewport_frame(&doc, scroll_y, view_h, 0, 0, false, false));
         }
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(assembled.dimensions(), doc.dimensions());
+        assert_eq!(assembled.as_raw(), doc.as_raw());
+    }
+
+    #[test]
+    fn fixed_sidebars_keep_top_once_and_extend_background_below() {
+        let width = 800u32;
+        let view_h = 480u32;
+        let doc_h = 1600u32;
+        let left_w = 200u32;
+        let right_w = 160u32;
+        let center_doc = make_document(width, doc_h);
+        let left_bg = image::Rgba([242, 244, 248, 255]);
+        let right_bg = image::Rgba([245, 246, 250, 255]);
+        let divider = image::Rgba([210, 214, 222, 255]);
+
+        let make_frame = |scroll_y: u32| -> RgbaImage {
+            let mut img = viewport_frame(&center_doc, scroll_y, view_h, 0, 0, false, false);
+            for y in 0..view_h {
+                // Static left sidebar with menu items & 1 px right divider.
+                for x in 0..left_w {
+                    let mut p = left_bg;
+                    if x == left_w - 1 {
+                        p = divider;
+                    } else if y % 36 >= 10 && y % 36 < 22 && (16..left_w - 16).contains(&x) {
+                        let item = y / 36;
+                        if x % 9 < 6 {
+                            p = image::Rgba([
+                                40 + ((item * 19) % 80) as u8,
+                                55,
+                                95 + ((item * 23) % 90) as u8,
+                                255,
+                            ]);
+                        }
+                    }
+                    img.put_pixel(x, y, p);
+                }
+                // Static right outline sidebar with 1 px left divider.
+                let right_start = width - right_w;
+                for x in right_start..width {
+                    let mut p = right_bg;
+                    if x == right_start {
+                        p = divider;
+                    } else if y % 32 >= 8
+                        && y % 32 < 18
+                        && (right_start + 12..width - 24).contains(&x)
+                    {
+                        let item = y / 32;
+                        if x % 8 < 5 {
+                            p = image::Rgba([70, 80 + ((item * 17) % 80) as u8, 120, 255]);
+                        }
+                    }
+                    img.put_pixel(x, y, p);
+                }
+            }
+            img
+        };
+
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [0u32, 90, 200, 340, 500, 680, 880, 1020, 1120] {
+            let _ = stitcher.feed(make_frame(scroll_y));
+        }
+
+        let (fl, fr) = stitcher.fixed_sidebars();
+        assert!(fl >= left_w - 12 && fl <= left_w + 12, "fl={fl}");
+        assert!(fr >= right_w - 12 && fr <= right_w + 12, "fr={fr}");
+
+        let assembled = stitcher.assemble().unwrap().unwrap();
+        assert_eq!(assembled.dimensions(), (width, doc_h));
+
+        // Top viewport retains the full sidebar menu intact.
+        let top_frame = make_frame(0);
+        for y in 0..view_h {
+            for x in 0..left_w {
+                assert_eq!(assembled.get_pixel(x, y), top_frame.get_pixel(x, y));
+            }
+            for x in width - right_w..width {
+                assert_eq!(assembled.get_pixel(x, y), top_frame.get_pixel(x, y));
+            }
+        }
+
+        // Below the top screen, sidebars extend background + 1px divider cleanly.
+        for y in view_h..doc_h {
+            assert_eq!(*assembled.get_pixel(40, y), left_bg, "y={y}");
+            assert_eq!(*assembled.get_pixel(left_w - 1, y), divider, "y={y}");
+            assert_eq!(*assembled.get_pixel(width - 40, y), right_bg, "y={y}");
+            assert_eq!(*assembled.get_pixel(width - right_w, y), divider, "y={y}");
+            for x in left_w + 16..width - right_w - 24 {
+                assert_eq!(
+                    assembled.get_pixel(x, y),
+                    center_doc.get_pixel(x, y),
+                    "center mismatch at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_white_margins_are_not_treated_as_fixed_sidebars() {
+        let width = 800u32;
+        let doc_h = 1400u32;
+        let mut doc = RgbaImage::from_pixel(width, doc_h, image::Rgba([255, 255, 255, 255]));
+        for y in 0..doc_h {
+            let band = y / 40;
+            // Centered column 240..560 for most of the document, plus a full-width
+            // textured banner at y=900..960 that must stay untouched.
+            let x_range = if (900..960).contains(&y) {
+                20..width - 20
+            } else {
+                240..560
+            };
+            for x in x_range {
+                if y % 40 == 0 {
+                    doc.put_pixel(x, y, image::Rgba([220, 224, 232, 255]));
+                } else if y % 40 >= 10 && y % 40 < 24 && x % 10 < 6 {
+                    let row_shade = ((y % 40 - 10) * 11) as u8;
+                    doc.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            40 + ((band * 31 + u32::from(row_shade)) % 160) as u8,
+                            60 + ((band * 67) % 150) as u8,
+                            110,
+                            255,
+                        ]),
+                    );
+                }
+            }
+        }
+        let mut stitcher = Stitcher::new(StitchConfig::default());
+        for scroll_y in [0u32, 120, 260, 420, 600, 780, 920] {
+            let _ = stitcher.feed(viewport_frame(&doc, scroll_y, 480, 0, 0, false, false));
+        }
+        assert_eq!(stitcher.fixed_sidebars(), (0, 0));
         let assembled = stitcher.assemble().unwrap().unwrap();
         assert_eq!(assembled.dimensions(), doc.dimensions());
         assert_eq!(assembled.as_raw(), doc.as_raw());
