@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/gjfei/snapit/releases/latest"><img src="https://img.shields.io/github/v/release/gjfei/snapit?sort=semver" alt="Release"></a>
+  <a href="https://github.com/jarven97/snapit/releases/latest"><img src="https://img.shields.io/github/v/release/jarven97/snapit?sort=semver" alt="Release"></a>
 </p>
 
 SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-kit](https://github.com/longbridge/gpui-kit)（Zed GPUI）写成，不依赖 Electron 或 WebView。它常驻托盘，没有主窗口或启动器：按下全局快捷键后冻结所有显示器，在选区上完成复制、保存、贴图、文字识别或录制 GIF / APNG / MP4。
@@ -47,7 +47,7 @@ SnapIt 是支持 macOS 和 Windows 的原生截图工具，用 Rust 和 [gpui-ki
 
 ## 下载安装
 
-从 [GitHub Releases](https://github.com/gjfei/snapit/releases/latest) 下载对应平台的文件（`<版本>` 为版本号）：
+从 [GitHub Releases](https://github.com/jarven97/snapit/releases/latest) 下载对应平台的文件（`<版本>` 为版本号）：
 
 | 平台 | 文件 |
 | --- | --- |
@@ -449,8 +449,8 @@ curl -LO https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten
 
 ## 致谢与许可
 
-- UI 基于 [gpui](https://www.gpui.rs/) 和 [gpui-kit](https://github.com/longbridge/gpui-kit)（gpui-kit 固定为 `0.9.1`，对应 GPUI `gpui-pre` 0.3.12），均以 Apache-2.0 许可发布。
-- 截屏使用 [xcap](https://github.com/nashaofu/xcap)，录制部分使用以子模块引入的 [SnapIt 分支](https://github.com/gjfei/xcap)（macOS 改用 ScreenCaptureKit，补充区域录制、帧率上限、时间戳、光标、排除自身窗口与 `OutputSize` 尺寸选项），GIF 编码使用 `gif` 与 `color_quant`（共享色板 + 查表量化 + 只编码变化区域），APNG 复用现有 PNG 依赖编码无损 RGBA8 动画。SnapIt 默认请求 `OutputSize::Native` 物理像素；需要降低编码成本时可显式使用逻辑尺寸或 CPU 整数均值降采样，而不使用通用重采样滤镜。
+- UI 基于 [gpui](https://www.gpui.rs/) 和 [gpui-kit](https://github.com/longbridge/gpui-kit)（gpui-kit 固定为 `0.11.0`，对应 GPUI `gpui-pre` 0.3.14），均以 Apache-2.0 许可发布。
+- 截屏使用 [xcap](https://github.com/nashaofu/xcap)，录制部分使用以子模块引入的 [SnapIt 分支](https://github.com/jarven97/xcap)（macOS 改用 ScreenCaptureKit，补充区域录制、帧率上限、时间戳、光标、排除自身窗口与 `OutputSize` 尺寸选项），GIF 编码使用 `gif` 与 `color_quant`（共享色板 + 查表量化 + 只编码变化区域），APNG 复用现有 PNG 依赖编码无损 RGBA8 动画。SnapIt 默认请求 `OutputSize::Native` 物理像素；需要降低编码成本时可显式使用逻辑尺寸或 CPU 整数均值降采样，而不使用通用重采样滤镜。
 - 纯 Rust OCR 使用 [ocrs](https://github.com/robertknight/ocrs)。
 - 标注烘焙使用 [tiny-skia](https://github.com/RazrFalcon/tiny-skia)，文字位图使用 [fontdue](https://github.com/mooman219/fontdue)。
 - 托盘、全局快捷键、开机启动分别使用 [tray-icon](https://github.com/tauri-apps/tray-icon)、[global-hotkey](https://github.com/tauri-apps/global-hotkey)、[auto-launch](https://github.com/zzzgydi/auto-launch)。

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/gjfei/snapit/releases/latest"><img src="https://img.shields.io/github/v/release/gjfei/snapit?sort=semver" alt="Release"></a>
+  <a href="https://github.com/jarven97/snapit/releases/latest"><img src="https://img.shields.io/github/v/release/jarven97/snapit?sort=semver" alt="Release"></a>
 </p>
 
 SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [gpui-kit](https://github.com/longbridge/gpui-kit) (Zed's GPUI) — no Electron, no WebView. It lives in the tray with no main window or launcher: a global shortcut freezes every display, and the overlay lets you copy, save, pin, recognize text or record a GIF / APNG / MP4 from the selection.
@@ -47,7 +47,7 @@ SnapIt is a native screenshot tool for macOS and Windows, written in Rust with [
 
 ## Download and install
 
-Download the file for your platform from [GitHub Releases](https://github.com/gjfei/snapit/releases/latest) (`<version>` is the version number):
+Download the file for your platform from [GitHub Releases](https://github.com/jarven97/snapit/releases/latest) (`<version>` is the version number):
 
 | Platform | File |
 | --- | --- |
@@ -449,8 +449,8 @@ Model lookup order: the `SNAPIT_OCR_MODELS` environment variable → `models/` n
 
 ## Credits and license
 
-- The UI is built on [gpui](https://www.gpui.rs/) and [gpui-kit](https://github.com/longbridge/gpui-kit) (pinned to `0.9.1`, which tracks GPUI `gpui-pre` 0.3.12), both Apache-2.0.
-- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/gjfei/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor, own-window exclusion and `OutputSize` hints). GIF encoding uses [gif](https://github.com/image-rs/image-gif) with [color_quant](https://crates.io/crates/color_quant) for a shared palette, table-driven quantization and dirty-rectangle frames; APNG reuses the PNG dependency for lossless RGBA8 animation. SnapIt requests `OutputSize::Native` physical pixels by default; callers that need lower encoding cost can explicitly choose logical size or the integer box-mean CPU downscale instead of a general resize filter. MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
+- The UI is built on [gpui](https://www.gpui.rs/) and [gpui-kit](https://github.com/longbridge/gpui-kit) (pinned to `0.11.0`, which tracks GPUI `gpui-pre` 0.3.14), both Apache-2.0.
+- Capture uses [xcap](https://github.com/nashaofu/xcap); recording uses the [SnapIt fork](https://github.com/jarven97/xcap) pulled in as a submodule (ScreenCaptureKit on macOS, plus region capture, frame-rate cap, timestamps, cursor, own-window exclusion and `OutputSize` hints). GIF encoding uses [gif](https://github.com/image-rs/image-gif) with [color_quant](https://crates.io/crates/color_quant) for a shared palette, table-driven quantization and dirty-rectangle frames; APNG reuses the PNG dependency for lossless RGBA8 animation. SnapIt requests `OutputSize::Native` physical pixels by default; callers that need lower encoding cost can explicitly choose logical size or the integer box-mean CPU downscale instead of a general resize filter. MP4 goes through the system hardware encoder on macOS and Windows (AVFoundation / Media Foundation).
 - Pure-Rust OCR uses [ocrs](https://github.com/robertknight/ocrs).
 - Annotation baking uses [tiny-skia](https://github.com/RazrFalcon/tiny-skia); text bitmaps use [fontdue](https://github.com/mooman219/fontdue).
 - The tray, global shortcuts and launch at login use [tray-icon](https://github.com/tauri-apps/tray-icon), [global-hotkey](https://github.com/tauri-apps/global-hotkey) and [auto-launch](https://github.com/zzzgydi/auto-launch).

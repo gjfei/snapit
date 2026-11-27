@@ -17,7 +17,7 @@ version = "0.0.3"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-repository = "https://github.com/gjfei/snapit"
+repository = "https://github.com/jarven97/snapit"
 
 [workspace.dependencies]
 snapit-capture = { path = "crates/capture" }

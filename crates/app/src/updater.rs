@@ -2292,14 +2292,14 @@ mod tests {
     fn detects_placeholder_repository() {
         assert_eq!(parse_repo("https://github.com/OWNER/SnapIt"), None);
         assert_eq!(
-            parse_repo("https://github.com/gjfei/snapit"),
-            Some("gjfei/snapit".into())
+            parse_repo("https://github.com/jarven97/snapit"),
+            Some("jarven97/snapit".into())
         );
         assert_eq!(
             parse_repo("https://github.com/a-b/c.d.git/"),
             Some("a-b/c.d".into())
         );
-        assert_eq!(parse_repo("gjfei/snapit"), Some("gjfei/snapit".into()));
+        assert_eq!(parse_repo("jarven97/snapit"), Some("jarven97/snapit".into()));
         assert_eq!(parse_repo("https://gitlab.com/a/b"), None);
         assert_eq!(parse_repo("https://github.com/a/b/tree/main"), None);
         assert_eq!(parse_repo(""), None);

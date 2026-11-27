@@ -4,7 +4,7 @@ Screenshot app for macOS and Windows. UI is [gpui-kit](https://github.com/longbr
 
 Do not bump `gpui-kit` or the Rust toolchain without an explicit request. Prefer extending existing crates over rewriting the MVP.
 
-`vendor/xcap` is a git submodule (fork `gjfei/xcap`) added to the workspace `exclude` and consumed as a path dependency, so changes made there need their own commit inside the submodule plus an updated gitlink in this repo. Clone with `--recursive`; CI/release checkouts must use `submodules: recursive`.
+`vendor/xcap` is a git submodule (fork `jarven97/xcap`) added to the workspace `exclude` and consumed as a path dependency, so changes made there need their own commit inside the submodule plus an updated gitlink in this repo. Clone with `--recursive`; CI/release checkouts must use `submodules: recursive`.
 
 User docs: `README.md` (Chinese) and `README.en.md` (English) mirror each other — update both together. `CLAUDE.md` only points here.
 
