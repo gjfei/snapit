@@ -49,7 +49,8 @@ gpui_kit::assets::icon_assets!(
         AlignCenterVertical,
         AlignCenterHorizontal,
         AlignHorizontalSpaceBetween,
-        AlignVerticalSpaceBetween
+        AlignVerticalSpaceBetween,
+        Hand
     ]
 );
 

@@ -26,7 +26,7 @@ use crate::{
     appearance, clipboard,
     controller::Controller,
     history_store::{HistoryStore, format_bytes},
-    pin,
+    image_editor, pin,
     settings::AppSettings,
     settings_view::SettingsPage,
 };
@@ -266,6 +266,9 @@ impl HistoryView {
         let id = SharedString::from(entry.id.clone());
         let hover = theme.list_hover;
         let (pin_path, pin_scale) = store.pin_source(entry);
+        let crop_path = file.clone();
+        let crop_scale = entry.scale_factor;
+        let crop_hdr = entry.hdr;
         // Clicking the thumbnail or the details opens the original file in the
         // system's default app. The buttons sit outside those two regions, so
         // they never trigger an open (GPUI dispatches a parent's click before
@@ -339,6 +342,26 @@ impl HistoryView {
                 h_flex()
                     .flex_none()
                     .gap_1()
+                    .when(kind == EntryKind::Png, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("{id}-crop")))
+                                .ghost()
+                                .small()
+                                .icon(LucideIcon::Crop)
+                                .tooltip(t!("history.crop").to_string())
+                                .accessibility_label(t!("history.crop").to_string())
+                                .on_click(move |_, window, cx| {
+                                    let display_id = window.display(cx).map(|d| d.id());
+                                    image_editor::open_file(
+                                        crop_path.clone(),
+                                        crop_scale,
+                                        crop_hdr,
+                                        display_id,
+                                        cx,
+                                    );
+                                }),
+                        )
+                    })
                     .when(kind != EntryKind::Mp4, |this| {
                         this.child(
                             Button::new(SharedString::from(format!("{id}-copy")))

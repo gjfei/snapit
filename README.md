@@ -342,7 +342,7 @@ crates/
 └── app       # snapit：gpui-kit 界面、托盘、全局快捷键、选区浮层、标注、长图编辑器、贴图、控制条
 ```
 
-`crates/app` 的主要模块：`controller.rs`（全局工作流）、`session.rs`（冻结帧与选区）、`overlay.rs`（选区界面与工具栏）、`annotate.rs`（标注模型与烘焙）、`scroll_bar.rs`（滚动控制条与实时预览）、`scroll_editor.rs`（长图裁剪与标注编辑器）、`pin.rs`、`recording_bar.rs`、`tray.rs`、`settings*`、`history*`、`hotkey.rs`、`permissions*`、`appearance.rs`、`autostart.rs`。
+`crates/app` 的主要模块：`controller.rs`（全局工作流）、`session.rs`（冻结帧与选区）、`overlay.rs`（选区界面与工具栏）、`annotate.rs`（标注模型与烘焙）、`scroll_bar.rs`（滚动控制条与实时预览）、`image_editor.rs`（图片裁剪与标注编辑器）、`pin.rs`、`recording_bar.rs`、`tray.rs`、`settings*`、`history*`、`hotkey.rs`、`permissions*`、`appearance.rs`、`autostart.rs`。
 
 ## macOS 应用包
 

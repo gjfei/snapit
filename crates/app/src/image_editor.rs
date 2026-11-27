@@ -6,6 +6,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, hash_map::Entry},
     ops::Range,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -14,11 +15,11 @@ use std::{
 use anyhow::Context as _;
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, IconName, Selectable as _, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     color_picker::{ColorPickerEvent, ColorPickerState},
     h_flex,
-    scroll::ScrollableElement as _,
+    scroll::{ScrollableElement as _, ScrollbarAxis},
     slider::{SliderEvent, SliderState, SliderValue},
     toolbar::Toolbar,
     v_flex,
@@ -26,13 +27,14 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context, CursorStyle, DisplayId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hsla, InteractiveElement as _,
-    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
-    Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
+    IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PinchEvent, Pixels, Point, Render,
+    RenderImage, ScrollEvent, ScrollHandle, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, StyledImage as _, Subscription, Task, UTF16Selection, WeakEntity, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::FluentBuilder as _, px,
+    rgb, size,
 };
-use snapit_capture::{HdrImage, ImageSource, WatermarkSpec};
+use snapit_capture::{DiskImage, HdrImage, ImageSource, WatermarkSpec};
 use snapit_store::{AnnotationTool, WatermarkTarget};
 
 use crate::annotate::{self, Layer, Shape};
@@ -42,16 +44,19 @@ use crate::controller::{Captured, Controller};
 use crate::session;
 use crate::settings::AppSettings;
 
-const CONTEXT: &str = "ScrollEditor";
+const CONTEXT: &str = "ImageEditor";
 const TILE_OVERSCAN: usize = 1;
 const TILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TILE_ROWS: u32 = 2048;
 const MAX_TILE_ATTEMPTS: u8 = 3;
 const MIN_CROP_SIZE_PX: u32 = 16;
+const MIN_ZOOM: f32 = 0.15;
+const MAX_ZOOM: f32 = 4.0;
+const VIEWPORT_PADDING_PX: f32 = 24.0;
 const TOAST_DURATION: Duration = Duration::from_millis(1600);
 
 actions!(
-    scroll_editor,
+    image_editor,
     [
         CopyResult,
         SaveResult,
@@ -76,6 +81,7 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open(
     image: ImageSource,
     hdr: Option<Arc<HdrImage>>,
@@ -83,29 +89,79 @@ pub fn open(
     display_id: Option<DisplayId>,
     shapes: Arc<Vec<Shape>>,
     initial_crop_mode: bool,
+    already_recorded: bool,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let window_size = size(px(920.), px(720.));
-    let min_size = size(px(640.), px(520.));
+    let min_size = size(px(720.), px(520.));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             display_id,
             window_size,
             cx,
         ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(t!("scroll_editor.title").to_string().into()),
-            ..Default::default()
-        }),
         window_min_size: Some(min_size),
         display_id,
-        ..Default::default()
+        ..TitleBar::window_options()
     };
     let handle = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| ScrollEditorView::new(image, hdr, scale, shapes, initial_crop_mode, window, cx))
+        cx.new(|cx| {
+            ImageEditorView::new(
+                image,
+                hdr,
+                scale,
+                shapes,
+                initial_crop_mode,
+                already_recorded,
+                window,
+                cx,
+            )
+        })
     })?
     .0;
     Ok(handle)
+}
+
+pub fn open_file(
+    path: PathBuf,
+    scale: f32,
+    hdr: bool,
+    display_id: Option<DisplayId>,
+    cx: &mut App,
+) {
+    let load = cx.background_spawn(async move {
+        let context = || t!("image_editor.read_failed", path = path.display()).to_string();
+        let is_hdr = if hdr {
+            true
+        } else {
+            crate::pin::png_has_hdr_cicp(&path).with_context(context)?
+        };
+        if is_hdr {
+            let png = Arc::new(std::fs::read(&path).with_context(context)?);
+            match snapit_capture::decode_hdr_png_preview(&png) {
+                Ok(Some(preview)) => Ok(ImageSource::Memory(Arc::new(preview))),
+                Ok(None) => Ok(ImageSource::Disk(Arc::new(
+                    DiskImage::from_png(&path).with_context(context)?,
+                ))),
+                Err(err) => Err(err).with_context(context),
+            }
+        } else {
+            Ok(ImageSource::Disk(Arc::new(
+                DiskImage::from_png(&path).with_context(context)?,
+            )))
+        }
+    });
+    cx.spawn(async move |cx| {
+        let loaded = load.await;
+        cx.update(|cx| match loaded {
+            Ok(image) => Controller::global(cx).update(cx, |controller, cx| {
+                controller.open_image_editor_from_history(image, scale, display_id, cx);
+            }),
+            Err(err) => Controller::global(cx)
+                .update(cx, |controller, cx| controller.fail(format!("{err:#}"), cx)),
+        })
+    })
+    .detach();
 }
 
 #[derive(Clone, Copy)]
@@ -462,7 +518,73 @@ fn crop_and_shift_shapes(
     })
 }
 
-pub struct ScrollEditorView {
+#[derive(Clone, Copy, Debug)]
+struct PanDrag {
+    button: MouseButton,
+    start_pos: Point<Pixels>,
+    start_offset: Point<Pixels>,
+}
+
+fn pinch_zoom(base: f32, delta: f32) -> f32 {
+    (base * (1.0 + delta).max(0.01)).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn wheel_zoom(base: f32, delta_y: f32) -> f32 {
+    (base * (delta_y * 0.004).exp()).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn editor_content_size(logical_w: f32, logical_h: f32, zoom: f32) -> Size<Pixels> {
+    let disp_w = (logical_w * zoom).max(1.0);
+    let disp_h = (logical_h * zoom).max(1.0);
+    size(
+        px(disp_w + VIEWPORT_PADDING_PX * 2.0),
+        px(disp_h + VIEWPORT_PADDING_PX * 2.0),
+    )
+}
+
+fn clamp_scroll_offset(
+    offset: Point<Pixels>,
+    viewport_size: Size<Pixels>,
+    content_size: Size<Pixels>,
+) -> Point<Pixels> {
+    let min_x = -(content_size.width.as_f32() - viewport_size.width.as_f32()).max(0.0);
+    let min_y = -(content_size.height.as_f32() - viewport_size.height.as_f32()).max(0.0);
+    point(
+        px(offset.x.as_f32().clamp(min_x, 0.0)),
+        px(offset.y.as_f32().clamp(min_y, 0.0)),
+    )
+}
+
+fn zoomed_scroll_offset(
+    current_offset: Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    anchor: Point<Pixels>,
+    logical_size: (f32, f32),
+    old_zoom: f32,
+    new_zoom: f32,
+) -> Point<Pixels> {
+    let inner_w = (viewport.size.width.as_f32() - VIEWPORT_PADDING_PX * 2.0).max(0.0);
+    let old_disp_w = (logical_size.0 * old_zoom).max(1.0);
+    let new_disp_w = (logical_size.0 * new_zoom).max(1.0);
+    let old_pad_x = ((inner_w - old_disp_w) * 0.5).max(0.0);
+    let new_pad_x = ((inner_w - new_disp_w) * 0.5).max(0.0);
+
+    let anchor_vx = (anchor.x - viewport.origin.x).as_f32();
+    let anchor_vy = (anchor.y - viewport.origin.y).as_f32();
+    let local_x = anchor_vx - current_offset.x.as_f32() - VIEWPORT_PADDING_PX - old_pad_x;
+    let local_y = anchor_vy - current_offset.y.as_f32() - VIEWPORT_PADDING_PX;
+
+    let ratio = new_zoom / old_zoom.max(0.001);
+    let raw_x = anchor_vx - VIEWPORT_PADDING_PX - new_pad_x - local_x * ratio;
+    let raw_y = anchor_vy - VIEWPORT_PADDING_PX - local_y * ratio;
+    clamp_scroll_offset(
+        point(px(raw_x), px(raw_y)),
+        viewport.size,
+        editor_content_size(logical_size.0, logical_size.1, new_zoom),
+    )
+}
+
+pub struct ImageEditorView {
     image: Arc<ImageSource>,
     hdr: Option<Arc<HdrImage>>,
     scale: f32,
@@ -486,6 +608,9 @@ pub struct ScrollEditorView {
     crop: CropRect,
     crop_mode: bool,
     crop_drag: Option<CropDrag>,
+    pan_mode: bool,
+    space_panning: bool,
+    pan_drag: Option<PanDrag>,
     zoom: f32,
     scroll_handle: ScrollHandle,
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -495,13 +620,15 @@ pub struct ScrollEditorView {
     _subscriptions: Vec<Subscription>,
 }
 
-impl ScrollEditorView {
+impl ImageEditorView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         image: ImageSource,
         hdr: Option<Arc<HdrImage>>,
         scale: f32,
         shapes: Arc<Vec<Shape>>,
         initial_crop_mode: bool,
+        already_recorded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -583,6 +710,19 @@ impl ScrollEditorView {
         focus_handle.focus(window, cx);
 
         let weak = cx.weak_entity();
+        subscriptions.push(window.on_focus_out(&focus_handle, cx, {
+            let weak = weak.clone();
+            move |_, _, cx| {
+                weak.update(cx, |this, cx| {
+                    if this.space_panning || this.pan_drag.is_some() {
+                        this.space_panning = false;
+                        this.pan_drag = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        }));
         window.on_window_should_close(cx, move |_window, cx| {
             weak.update(cx, |this, cx| this.remember_if_unrecorded(cx))
                 .ok();
@@ -616,12 +756,15 @@ impl ScrollEditorView {
             crop: CropRect::full(width, height),
             crop_mode: initial_crop_mode,
             crop_drag: None,
+            pan_mode: false,
+            space_panning: false,
+            pan_drag: None,
             zoom: fit_zoom,
             scroll_handle: ScrollHandle::new(),
             canvas_bounds: Rc::new(Cell::new(None)),
             focus_handle,
             toast: None,
-            recorded_in_history: false,
+            recorded_in_history: already_recorded,
             _subscriptions: subscriptions,
         };
         let initial_range = if view.tiles.is_empty() {
@@ -918,7 +1061,7 @@ impl ScrollEditorView {
                     controller.remember_and_copy(captured, cx);
                 });
                 self.show_toast(
-                    t!("scroll_editor.copied", width = w, height = h).to_string(),
+                    t!("image_editor.copied", width = w, height = h).to_string(),
                     cx,
                 );
             }
@@ -961,13 +1104,117 @@ impl ScrollEditorView {
         }
     }
 
+    fn logical_size(&self) -> (f32, f32) {
+        let (img_w, img_h) = self.image.dimensions();
+        (img_w as f32 / self.scale, img_h as f32 / self.scale)
+    }
+
+    fn apply_zoom_at(
+        &mut self,
+        next_zoom: f32,
+        anchor: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let next_zoom = next_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if !next_zoom.is_finite() || (next_zoom - self.zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let viewport = self.scroll_handle.bounds();
+        if viewport.size.width > px(0.) && viewport.size.height > px(0.) {
+            let anchor = anchor.unwrap_or_else(|| viewport.center());
+            let next_offset = zoomed_scroll_offset(
+                self.scroll_handle.offset(),
+                viewport,
+                anchor,
+                self.logical_size(),
+                self.zoom,
+                next_zoom,
+            );
+            self.scroll_handle.set_offset(next_offset);
+        }
+        self.zoom = next_zoom;
+        self.requested_tile_range.set(None);
+        cx.notify();
+    }
+
+    fn on_viewport_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.crop_drag.is_some()
+            || self.pan_drag.is_some()
+            || !event.delta.is_finite()
+            || event.delta.abs() < 0.0001
+        {
+            return;
+        }
+        let next = pinch_zoom(self.zoom, event.delta);
+        self.apply_zoom_at(next, Some(event.position), cx);
+        cx.stop_propagation();
+    }
+
+    fn on_viewport_scroll_wheel(
+        &mut self,
+        event: &ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.modifiers.platform && !event.modifiers.control {
+            return;
+        }
+        let delta_y = event.delta.pixel_delta(window.line_height()).y.as_f32();
+        if delta_y.abs() < 0.01 {
+            return;
+        }
+        let next = wheel_zoom(self.zoom, delta_y);
+        self.apply_zoom_at(next, Some(event.position), cx);
+        cx.stop_propagation();
+    }
+
+    fn start_pan(
+        &mut self,
+        button: MouseButton,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pan_drag = Some(PanDrag {
+            button,
+            start_pos: pos,
+            start_offset: self.scroll_handle.offset(),
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn on_viewport_left_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        self.start_pan(MouseButton::Left, event.position, cx);
+    }
+
+    fn on_viewport_middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        self.start_pan(MouseButton::Middle, event.position, cx);
+    }
+
     fn begin_crop_handle(
         &mut self,
         handle: CropHandle,
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.space_panning {
+            self.start_pan(event.button, event.position, cx);
+            return;
+        }
         let start_px = self.to_pixel_coords(event.position).unwrap_or([0, 0]);
+        self.pan_mode = false;
         self.crop_mode = true;
         self.style_open = false;
         self.annotations.deselect();
@@ -988,6 +1235,10 @@ impl ScrollEditorView {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
+        if self.pan_mode || self.space_panning {
+            self.start_pan(MouseButton::Left, event.position, cx);
+            return;
+        }
         if self.crop_mode {
             if let Some(px_pt) = self.to_pixel_coords(event.position) {
                 let (img_w, img_h) = self.image.dimensions();
@@ -1006,6 +1257,7 @@ impl ScrollEditorView {
                     start_crop: self.crop,
                     moved: false,
                 });
+                cx.stop_propagation();
                 cx.notify();
             }
             return;
@@ -1016,15 +1268,18 @@ impl ScrollEditorView {
         if self.annotations.select_at(local[0], local[1]) {
             if event.click_count >= 2 && self.annotations.begin_text_edit(local[0], local[1]) {
                 self.style_open = false;
+                cx.stop_propagation();
                 cx.notify();
                 return;
             }
             let _ = self.annotations.begin_edit(local[0], local[1]);
             self.style_open = true;
+            cx.stop_propagation();
             cx.notify();
             return;
         }
         self.annotations.pointer_down(local[0], local[1]);
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -1034,6 +1289,24 @@ impl ScrollEditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.pan_drag {
+            if event.pressed_button != Some(drag.button) {
+                self.pan_drag = None;
+                cx.notify();
+                return;
+            }
+            let delta = event.position - drag.start_pos;
+            let (logical_w, logical_h) = self.logical_size();
+            let content = editor_content_size(logical_w, logical_h, self.zoom);
+            let next = clamp_scroll_offset(
+                drag.start_offset + delta,
+                self.scroll_handle.bounds().size,
+                content,
+            );
+            self.scroll_handle.set_offset(next);
+            cx.notify();
+            return;
+        }
         if let Some(mut drag) = self.crop_drag {
             if event.pressed_button != Some(MouseButton::Left) {
                 if !drag.moved && drag.handle == CropHandle::New {
@@ -1089,6 +1362,10 @@ impl ScrollEditorView {
     }
 
     fn on_canvas_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pan_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
         if let Some(drag) = self.crop_drag.take() {
             if !drag.moved && drag.handle == CropHandle::New {
                 self.crop = drag.start_crop;
@@ -1115,6 +1392,14 @@ impl ScrollEditorView {
             && !stroke.modifiers.alt
             && !stroke.modifiers.shift;
         if !self.annotations.is_typing() {
+            if plain && stroke.key == "space" {
+                if !self.space_panning {
+                    self.space_panning = true;
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
             if plain
                 && matches!(stroke.key.as_str(), "backspace" | "delete")
                 && self.annotations.delete_selected()
@@ -1158,9 +1443,16 @@ impl ScrollEditorView {
             cx.stop_propagation();
         }
     }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "space" && self.space_panning {
+            self.space_panning = false;
+            cx.notify();
+        }
+    }
 }
 
-impl EntityInputHandler for ScrollEditorView {
+impl EntityInputHandler for ImageEditorView {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -1255,7 +1547,7 @@ impl EntityInputHandler for ScrollEditorView {
     }
 }
 
-impl Render for ScrollEditorView {
+impl Render for ImageEditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_style_controls(window, cx);
         let theme = cx.theme().clone();
@@ -1282,9 +1574,18 @@ impl Render for ScrollEditorView {
         let cropped_w = self.crop.width();
         let cropped_h = self.crop.height();
         let size_badge =
-            t!("scroll_editor.size", width = cropped_w, height = cropped_h).to_string();
+            t!("image_editor.size", width = cropped_w, height = cropped_h).to_string();
         let zoom_pct = format!("{}%", (self.zoom * 100.0).round() as u32);
-        let canvas_cursor = if let Some(drag) = self.crop_drag {
+        let viewport_cursor = if self.pan_drag.is_some() {
+            CursorStyle::ClosedHand
+        } else {
+            CursorStyle::OpenHand
+        };
+        let canvas_cursor = if self.pan_drag.is_some() {
+            CursorStyle::ClosedHand
+        } else if self.pan_mode || self.space_panning {
+            CursorStyle::OpenHand
+        } else if let Some(drag) = self.crop_drag {
             drag.handle.cursor()
         } else {
             CursorStyle::Crosshair
@@ -1303,16 +1604,19 @@ impl Render for ScrollEditorView {
         let ime_focus = self.focus_handle.clone();
         let view_entity = cx.entity();
         let tile_view = view_entity.downgrade();
+        let style_delete_view = view_entity.clone();
 
         let fit_w_zoom = {
             let vw = (window.viewport_size().width.as_f32() - 64.0).max(200.0);
             (vw / logical_w).clamp(0.15, 1.0)
         };
+        let style_left = px(if cfg!(target_os = "macos") { 80.0 } else { 12.0 }
+            + if window.is_fullscreen() { 12.0 } else { 0.0 });
 
         let mask_shade = gpui_kit::hsla(0., 0., 0., 0.55);
 
         v_flex()
-            .id("scroll-editor")
+            .id("image-editor")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
@@ -1334,155 +1638,134 @@ impl Render for ScrollEditorView {
                 }
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
-                this.zoom = (this.zoom * 1.25).min(3.0);
-                cx.notify();
+                this.apply_zoom_at((this.zoom * 1.25).min(MAX_ZOOM), None, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
-                this.zoom = (this.zoom / 1.25).max(0.15);
-                cx.notify();
+                this.apply_zoom_at((this.zoom / 1.25).max(MIN_ZOOM), None, cx);
             }))
             .on_action(cx.listener(|this, _: &ActualSize, _, cx| {
-                this.zoom = 1.0;
-                cx.notify();
+                this.apply_zoom_at(1.0, None, cx);
             }))
             .on_action(cx.listener(move |this, _: &FitWidth, _, cx| {
-                this.zoom = fit_w_zoom;
-                cx.notify();
+                this.apply_zoom_at(fit_w_zoom, None, cx);
             }))
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_move(cx.listener(Self::on_canvas_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_canvas_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_canvas_mouse_up))
             .child(
-                h_flex()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.popover)
-                    .child({
-                        let select_view = view_entity.clone();
-                        let undo_view = view_entity.clone();
-                        let clear_view = view_entity.clone();
-                        capture_toolbar::append_annotation_tools(
-                            Toolbar::new("scroll-editor-tools"),
-                            "ed",
-                            if self.crop_mode { None } else { Some(current) },
-                            can_undo,
-                            false,
-                            &theme,
-                            move |tool, _, _, cx| {
-                                select_view.update(cx, |this, cx| {
-                                    let same = !this.crop_mode
-                                        && this.annotations.tool() == tool
-                                        && this.annotations.selected().is_none();
-                                    this.crop_mode = false;
-                                    this.annotations.deselect();
-                                    this.annotations.set_tool(tool);
-                                    this.style_open = if same { !this.style_open } else { true };
-                                    cx.notify();
-                                });
-                            },
-                            move |_, _, cx| {
-                                undo_view.update(cx, |this, cx| {
-                                    this.annotations.undo();
-                                    cx.notify();
-                                });
-                            },
-                            move |_, _, cx| {
-                                clear_view.update(cx, |this, cx| {
-                                    this.annotations.clear();
-                                    cx.notify();
-                                });
-                            },
-                        )
-                        .content(capture_toolbar::toolbar_divider(&theme))
-                        .child(
-                            Button::new("ed-trim")
-                                .ghost()
-                                .small()
-                                .selected(self.crop_mode)
-                                .icon(LucideIcon::Crop)
-                                .tooltip(t!("scroll_editor.trim_hint").to_string())
-                                .accessibility_label(t!("scroll_editor.trim").to_string())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.crop_mode = !this.crop_mode;
-                                    if this.crop_mode {
-                                        this.style_open = false;
-                                        this.annotations.deselect();
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .when(cropped, |this| {
-                            this.child(
-                                Button::new("ed-trim-reset")
-                                    .ghost()
-                                    .small()
-                                    .icon(LucideIcon::RotateCcw)
-                                    .tooltip(t!("scroll_editor.trim_reset").to_string())
-                                    .accessibility_label(t!("scroll_editor.trim_reset").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let (w, h) = this.image.dimensions();
-                                        this.crop = CropRect::full(w, h);
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                    })
+                TitleBar::new()
                     .child(
                         h_flex()
-                            .gap_1()
                             .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .mr_1()
-                                    .child(size_badge),
-                            )
-                            .child(
-                                Button::new("ed-zoom-out")
-                                    .ghost()
-                                    .small()
-                                    .icon(LucideIcon::ZoomOut)
-                                    .tooltip(t!("pin.zoom_out").to_string())
-                                    .accessibility_label(t!("pin.zoom_out").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.zoom = (this.zoom / 1.25).max(0.15);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("ed-zoom-fit")
-                                    .ghost()
-                                    .small()
-                                    .label(zoom_pct)
-                                    .tooltip(t!("scroll_editor.fit_width").to_string())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.zoom = if (this.zoom - fit_w_zoom).abs() < 0.02 {
-                                            1.0
-                                        } else {
-                                            fit_w_zoom
-                                        };
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("ed-zoom-in")
-                                    .ghost()
-                                    .small()
-                                    .icon(LucideIcon::ZoomIn)
-                                    .tooltip(t!("pin.zoom_in").to_string())
-                                    .accessibility_label(t!("pin.zoom_in").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.zoom = (this.zoom * 1.25).min(3.0);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(div().w(px(1.)).h(px(16.)).bg(theme.border).mx_1())
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child({
+                                let select_view = view_entity.clone();
+                                let undo_view = view_entity.clone();
+                                let clear_view = view_entity.clone();
+                                capture_toolbar::append_annotation_tools(
+                                    Toolbar::new("image-editor-tools").min_h_0().p_0(),
+                                    "ed",
+                                    if self.crop_mode || self.pan_mode {
+                                        None
+                                    } else {
+                                        Some(current)
+                                    },
+                                    can_undo,
+                                    false,
+                                    &theme,
+                                    move |tool, _, _, cx| {
+                                        select_view.update(cx, |this, cx| {
+                                            let same = !this.crop_mode
+                                                && !this.pan_mode
+                                                && this.annotations.tool() == tool
+                                                && this.annotations.selected().is_none();
+                                            this.crop_mode = false;
+                                            this.pan_mode = false;
+                                            this.annotations.deselect();
+                                            this.annotations.set_tool(tool);
+                                            this.style_open = if same { !this.style_open } else { true };
+                                            cx.notify();
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        undo_view.update(cx, |this, cx| {
+                                            this.annotations.undo();
+                                            cx.notify();
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        clear_view.update(cx, |this, cx| {
+                                            this.annotations.clear();
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .content(capture_toolbar::toolbar_divider(&theme))
+                                .child(
+                                    Button::new("ed-trim")
+                                        .ghost()
+                                        .small()
+                                        .selected(self.crop_mode)
+                                        .icon(LucideIcon::Crop)
+                                        .tooltip(t!("image_editor.trim_hint").to_string())
+                                        .accessibility_label(t!("image_editor.trim").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.crop_mode = !this.crop_mode;
+                                            if this.crop_mode {
+                                                this.pan_mode = false;
+                                                this.style_open = false;
+                                                this.annotations.deselect();
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("ed-pan")
+                                        .ghost()
+                                        .small()
+                                        .selected(self.pan_mode)
+                                        .icon(LucideIcon::Hand)
+                                        .tooltip(t!("image_editor.pan_hint").to_string())
+                                        .accessibility_label(t!("image_editor.pan").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pan_mode = !this.pan_mode;
+                                            if this.pan_mode {
+                                                this.crop_mode = false;
+                                                this.style_open = false;
+                                                this.annotations.deselect();
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(cropped, |this| {
+                                    this.child(
+                                        Button::new("ed-trim-reset")
+                                            .ghost()
+                                            .small()
+                                            .icon(LucideIcon::RotateCcw)
+                                            .tooltip(t!("image_editor.trim_reset").to_string())
+                                            .accessibility_label(
+                                                t!("image_editor.trim_reset").to_string(),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let (w, h) = this.image.dimensions();
+                                                this.crop = CropRect::full(w, h);
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .pr_2()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new("ed-ocr")
                                     .ghost()
@@ -1519,41 +1802,6 @@ impl Render for ScrollEditorView {
                             ),
                     ),
             )
-            .when(
-                self.style_open || self.annotations.selected().is_some(),
-                |this| {
-                    let active = self.annotations.active_tool();
-                    let style = self.annotations.style();
-                    let picked = self.annotations.selected().is_some();
-                    let delete_view = view_entity.clone();
-                    let on_delete = picked.then(|| -> capture_toolbar::DeleteHandler {
-                        Box::new(move |_, _, cx| {
-                            delete_view.update(cx, |this, cx| {
-                                if this.annotations.delete_selected() {
-                                    this.style_open = false;
-                                    cx.notify();
-                                }
-                            });
-                        })
-                    });
-                    this.child(
-                        capture_toolbar::render_annotation_style_bar(
-                            "ed-style",
-                            active,
-                            style.size,
-                            &self.color_picker,
-                            &self.size_sliders[active.style_index()],
-                            on_delete,
-                            &theme,
-                        )
-                        .flex_none()
-                        .px_3()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .bg(theme.group_box),
-                    )
-                },
-            )
             .child(
                 div()
                     .flex_1()
@@ -1561,18 +1809,35 @@ impl Render for ScrollEditorView {
                     .relative()
                     .child(
                         div()
-                            .id("scroll-editor-viewport")
+                            .id("image-editor-viewport")
                             .size_full()
                             .overflow_scroll()
                             .track_scroll(&self.scroll_handle)
-                            .p_6()
+                            .cursor(viewport_cursor)
+                            .on_pinch(cx.listener(Self::on_viewport_pinch))
+                            .on_scroll(cx.listener(Self::on_viewport_scroll_wheel))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::on_viewport_left_down),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(Self::on_viewport_middle_down),
+                            )
                             .child(
-                                div().w_full().flex().justify_center().child(
-                                    div()
-                                        .id("scroll-editor-canvas")
-                                        .relative()
-                                        .w(px(disp_w))
-                                        .h(px(disp_h))
+                                div()
+                                    .min_w_full()
+                                    .w(px((disp_w + VIEWPORT_PADDING_PX * 2.0).max(1.0)))
+                                    .p_6()
+                                    .flex()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .id("image-editor-canvas")
+                                            .flex_none()
+                                            .relative()
+                                            .w(px(disp_w))
+                                            .h(px(disp_h))
                                         .shadow_md()
                                         .border_1()
                                         .border_color(theme.border)
@@ -2087,7 +2352,136 @@ impl Render for ScrollEditorView {
                                 ),
                             ),
                     )
-                    .vertical_scrollbar(&self.scroll_handle),
+                    .scrollbar(&self.scroll_handle, ScrollbarAxis::Both)
+                    .when(
+                        self.style_open || self.annotations.selected().is_some(),
+                        |this| {
+                            let active = self.annotations.active_tool();
+                            let style = self.annotations.style();
+                            let picked = self.annotations.selected().is_some();
+                            let delete_view = style_delete_view.clone();
+                            let on_delete = picked.then(|| -> capture_toolbar::DeleteHandler {
+                                Box::new(move |_, _, cx| {
+                                    delete_view.update(cx, |this, cx| {
+                                        if this.annotations.delete_selected() {
+                                            this.style_open = false;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                            });
+                            this.child(
+                                div()
+                                    .id("image-editor-style-anchor")
+                                    .absolute()
+                                    .top_2()
+                                    .left(style_left)
+                                    .child(
+                                        capture_toolbar::toolbar_card(&theme)
+                                            .occlude()
+                                            .cursor_default()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .child(capture_toolbar::render_annotation_style_bar(
+                                                "ed-style",
+                                                active,
+                                                style.size,
+                                                &self.color_picker,
+                                                &self.size_sliders[active.style_index()],
+                                                on_delete,
+                                                &theme,
+                                            )),
+                                    ),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .id("image-editor-zoom-hud")
+                            .absolute()
+                            .bottom_4()
+                            .right_4()
+                            .child(
+                                capture_toolbar::toolbar_card(&theme)
+                                    .occlude()
+                                    .cursor_default()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .px_2()
+                                    .py_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .px_1()
+                                            .child(size_badge),
+                                    )
+                                    .child(capture_toolbar::toolbar_divider(&theme))
+                                    .child(
+                                        Button::new("ed-zoom-out")
+                                            .ghost()
+                                            .small()
+                                            .icon(LucideIcon::ZoomOut)
+                                            .tooltip(t!("pin.zoom_out").to_string())
+                                            .accessibility_label(t!("pin.zoom_out").to_string())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.apply_zoom_at(
+                                                    (this.zoom / 1.25).max(MIN_ZOOM),
+                                                    None,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("ed-zoom-fit")
+                                            .ghost()
+                                            .small()
+                                            .label(zoom_pct)
+                                            .tooltip(t!("image_editor.fit_width").to_string())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let next = if (this.zoom - fit_w_zoom).abs() < 0.02
+                                                {
+                                                    1.0
+                                                } else {
+                                                    fit_w_zoom
+                                                };
+                                                this.apply_zoom_at(next, None, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("ed-zoom-in")
+                                            .ghost()
+                                            .small()
+                                            .icon(LucideIcon::ZoomIn)
+                                            .tooltip(t!("pin.zoom_in").to_string())
+                                            .accessibility_label(t!("pin.zoom_in").to_string())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.apply_zoom_at(
+                                                    (this.zoom * 1.25).min(MAX_ZOOM),
+                                                    None,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            ),
+                    ),
             )
             .when_some(self.toast.as_ref(), |this, (msg, _)| {
                 this.child(
@@ -2385,5 +2779,53 @@ mod tests {
                 bottom: 220,
             }
         );
+    }
+
+    #[test]
+    fn pinch_and_wheel_zoom_stay_within_bounds() {
+        assert!((pinch_zoom(1.0, 0.25) - 1.25).abs() < 1e-5);
+        assert_eq!(pinch_zoom(MAX_ZOOM, 1.0), MAX_ZOOM);
+        assert_eq!(pinch_zoom(MIN_ZOOM, -0.9), MIN_ZOOM);
+        assert!(wheel_zoom(1.0, 40.0) > 1.0);
+        assert!(wheel_zoom(1.0, -40.0) < 1.0);
+        assert_eq!(wheel_zoom(MAX_ZOOM, 500.0), MAX_ZOOM);
+        assert_eq!(wheel_zoom(MIN_ZOOM, -500.0), MIN_ZOOM);
+    }
+
+    #[test]
+    fn clamp_scroll_offset_bounds_pan_to_content_overflow() {
+        let clamped = clamp_scroll_offset(
+            point(px(40.0), px(-900.0)),
+            size(px(800.0), px(600.0)),
+            size(px(1200.0), px(900.0)),
+        );
+        assert_eq!(clamped, point(px(0.0), px(-300.0)));
+
+        let fits = clamp_scroll_offset(
+            point(px(-50.0), px(-50.0)),
+            size(px(800.0), px(600.0)),
+            size(px(500.0), px(400.0)),
+        );
+        assert_eq!(fits, point(px(0.0), px(0.0)));
+    }
+
+    #[test]
+    fn zoomed_scroll_offset_keeps_anchor_pixel_stationary() {
+        let viewport = Bounds::new(point(px(0.0), px(44.0)), size(px(800.0), px(600.0)));
+        let anchor = point(px(450.0), px(344.0));
+        let logical = (1000.0, 2000.0);
+        let old_zoom = 1.0;
+        let new_zoom = 2.0;
+        let current = point(px(-100.0), px(-200.0));
+        let next = zoomed_scroll_offset(current, viewport, anchor, logical, old_zoom, new_zoom);
+
+        let local_before_x = anchor.x.as_f32() - current.x.as_f32() - VIEWPORT_PADDING_PX;
+        let local_before_y =
+            (anchor.y - viewport.origin.y).as_f32() - current.y.as_f32() - VIEWPORT_PADDING_PX;
+        let local_after_x = anchor.x.as_f32() - next.x.as_f32() - VIEWPORT_PADDING_PX;
+        let local_after_y =
+            (anchor.y - viewport.origin.y).as_f32() - next.y.as_f32() - VIEWPORT_PADDING_PX;
+        assert!((local_after_x - local_before_x * 2.0).abs() < 0.01);
+        assert!((local_after_y - local_before_y * 2.0).abs() < 0.01);
     }
 }

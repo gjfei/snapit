@@ -26,6 +26,7 @@ mod history_store;
 mod history_view;
 mod hotkey;
 mod i18n;
+mod image_editor;
 mod instance;
 mod logging;
 mod ocr_view;
@@ -35,7 +36,6 @@ mod permissions;
 mod pin;
 mod recording_bar;
 mod scroll_bar;
-mod scroll_editor;
 mod session;
 mod settings;
 mod settings_view;
@@ -152,7 +152,7 @@ fn main() {
         pin::init(cx);
         watermark_editor::init(cx);
         scroll_bar::init(cx);
-        scroll_editor::init(cx);
+        image_editor::init(cx);
 
         cx.bind_keys([
             KeyBinding::new(shortcut!("q"), Quit, None),

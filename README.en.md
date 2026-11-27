@@ -342,7 +342,7 @@ crates/
 └── app       # snapit: gpui-kit UI, tray, global shortcuts, selection overlays, annotations, long-image editor, pins, control bars
 ```
 
-Main modules in `crates/app`: `controller.rs` (the global workflow), `session.rs` (frozen frames and selection), `overlay.rs` (selection UI and toolbar), `annotate.rs` (annotation model and baking), `scroll_bar.rs` (scrolling control bar and live preview), `scroll_editor.rs` (long-image trim and annotation editor), `pin.rs`, `recording_bar.rs`, `tray.rs`, `settings*`, `history*`, `hotkey.rs`, `permissions*`, `appearance.rs` and `autostart.rs`.
+Main modules in `crates/app`: `controller.rs` (the global workflow), `session.rs` (frozen frames and selection), `overlay.rs` (selection UI and toolbar), `annotate.rs` (annotation model and baking), `scroll_bar.rs` (scrolling control bar and live preview), `image_editor.rs` (image crop and annotation editor), `pin.rs`, `recording_bar.rs`, `tray.rs`, `settings*`, `history*`, `hotkey.rs`, `permissions*`, `appearance.rs` and `autostart.rs`.
 
 ## macOS app bundle
 

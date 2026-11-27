@@ -365,7 +365,7 @@ fn load_disk_pin(path: &Path, scale: f32) -> Result<(Captured, Arc<ImageSource>)
 
 /// Inspect only PNG metadata so ordinary history files never need to be read
 /// into memory merely to discover whether they use SnapIt's HDR cICP profile.
-fn png_has_hdr_cicp(path: &Path) -> Result<bool> {
+pub(crate) fn png_has_hdr_cicp(path: &Path) -> Result<bool> {
     let mut file = File::open(path)?;
     let mut signature = [0u8; 8];
     file.read_exact(&mut signature)?;

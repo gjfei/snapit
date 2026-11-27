@@ -274,7 +274,7 @@ pub struct Controller {
     recording_serial: u64,
     scroll: Option<ActiveScroll>,
     scroll_serial: u64,
-    scroll_editors: Vec<AnyWindowHandle>,
+    image_editors: Vec<AnyWindowHandle>,
     watermark_editor: Option<AnyWindowHandle>,
     workflow_serial: u64,
     log_operation: Option<u64>,
@@ -323,7 +323,7 @@ impl Controller {
             recording_serial: 0,
             scroll: None,
             scroll_serial: 0,
-            scroll_editors: Vec::new(),
+            image_editors: Vec::new(),
             watermark_editor: None,
             workflow_serial: 0,
             log_operation: None,
@@ -358,7 +358,7 @@ impl Controller {
                         }
                     }
                     controller
-                        .scroll_editors
+                        .image_editors
                         .retain(|handle| handle.window_id() != window_id);
                     if controller
                         .watermark_editor
@@ -3493,21 +3493,65 @@ impl Controller {
         initial_crop_mode: bool,
         cx: &mut Context<Self>,
     ) {
-        // The editor does not read the controller while it is constructed, so
-        // open it synchronously and handle failure before this update returns.
-        // Deferring used to silently lose the image after teardown.
-        self.pending_restore_app = None;
-        match crate::scroll_editor::open(
+        self.open_image_editor_inner(
             image,
             hdr,
             scale,
             display_id,
             shapes,
             initial_crop_mode,
+            false,
+            cx,
+        );
+    }
+
+    pub(crate) fn open_image_editor_from_history(
+        &mut self,
+        image: ImageSource,
+        scale: f32,
+        display_id: Option<gpui_kit::DisplayId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_image_editor_inner(
+            image,
+            None,
+            scale,
+            display_id,
+            Arc::new(Vec::new()),
+            true,
+            true,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_image_editor_inner(
+        &mut self,
+        image: ImageSource,
+        hdr: Option<Arc<HdrImage>>,
+        scale: f32,
+        display_id: Option<gpui_kit::DisplayId>,
+        shapes: Arc<Vec<Shape>>,
+        initial_crop_mode: bool,
+        already_recorded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // The editor does not read the controller while it is constructed, so
+        // open it synchronously and handle failure before this update returns.
+        // Deferring used to silently lose the image after teardown.
+        self.pending_restore_app = None;
+        match crate::image_editor::open(
+            image,
+            hdr,
+            scale,
+            display_id,
+            shapes,
+            initial_crop_mode,
+            already_recorded,
             cx,
         ) {
             Ok(handle) => {
-                self.scroll_editors.push(handle);
+                self.image_editors.push(handle);
                 self.sync_dock_visible(cx);
                 #[cfg(target_os = "macos")]
                 crate::overlay::activate_app_single_window();
@@ -3577,7 +3621,7 @@ impl Controller {
                     .any(|window| window.window_id() == handle.window_id())
             })
         });
-        let any_editor = self.scroll_editors.iter().any(|handle| {
+        let any_editor = self.image_editors.iter().any(|handle| {
             open.iter()
                 .any(|window| window.window_id() == handle.window_id())
         });
@@ -3599,8 +3643,8 @@ impl Controller {
                 .update(cx, |_, window, _| window.set_window_title(&title))
                 .ok();
         }
-        let editor_title = t!("scroll_editor.title").to_string();
-        for handle in &self.scroll_editors {
+        let editor_title = t!("image_editor.title").to_string();
+        for handle in &self.image_editors {
             handle
                 .update(cx, |_, window, _| window.set_window_title(&editor_title))
                 .ok();
