@@ -1,6 +1,6 @@
-//! Dedicated scrollable editor window for stitched long screenshots:
-//! tile-rendered canvas (supports > 16384 px GPU height), top/bottom trim,
-//! full 7-tool annotations + IME text, zoom, and direct Copy/Save/Pin/OCR.
+//! Dedicated image editor window for stitched long screenshots and captured
+//! selections: tile-rendered canvas (supports > 16384 px GPU height), 2D free
+//! crop, full 7-tool annotations + IME text, zoom, and Copy/Save/Pin/OCR.
 
 use std::{
     cell::Cell,
@@ -32,7 +32,7 @@ use gpui_kit::{
     Task, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds, WindowOptions,
     actions, canvas, div, img, point, prelude::FluentBuilder as _, px, rgb, size,
 };
-use snapit_capture::{ImageSource, WatermarkSpec};
+use snapit_capture::{HdrImage, ImageSource, WatermarkSpec};
 use snapit_store::{AnnotationTool, WatermarkTarget};
 
 use crate::annotate::{self, Layer, Shape};
@@ -47,7 +47,7 @@ const TILE_OVERSCAN: usize = 1;
 const TILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TILE_ROWS: u32 = 2048;
 const MAX_TILE_ATTEMPTS: u8 = 3;
-const MIN_TRIM_HEIGHT_PX: u32 = 16;
+const MIN_CROP_SIZE_PX: u32 = 16;
 const TOAST_DURATION: Duration = Duration::from_millis(1600);
 
 actions!(
@@ -78,9 +78,11 @@ pub fn init(cx: &mut App) {
 
 pub fn open(
     image: ImageSource,
+    hdr: Option<Arc<HdrImage>>,
     scale: f32,
     display_id: Option<DisplayId>,
     shapes: Arc<Vec<Shape>>,
+    initial_crop_mode: bool,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let window_size = size(px(920.), px(720.));
@@ -100,7 +102,7 @@ pub fn open(
         ..Default::default()
     };
     let handle = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| ScrollEditorView::new(image, scale, shapes, window, cx))
+        cx.new(|cx| ScrollEditorView::new(image, hdr, scale, shapes, initial_crop_mode, window, cx))
     })?
     .0;
     Ok(handle)
@@ -167,10 +169,163 @@ impl TileLoadState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TrimEdge {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CropRect {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl CropRect {
+    fn full(width: u32, height: u32) -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        }
+    }
+
+    fn width(self) -> u32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    fn height(self) -> u32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    fn is_cropped(self, img_w: u32, img_h: u32) -> bool {
+        self.left > 0 || self.top > 0 || self.right < img_w || self.bottom < img_h
+    }
+
+    fn contains(self, px_x: u32, px_y: u32) -> bool {
+        px_x >= self.left && px_x <= self.right && px_y >= self.top && px_y <= self.bottom
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropHandle {
     Top,
     Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Move,
+    New,
+}
+
+impl CropHandle {
+    fn cursor(self) -> CursorStyle {
+        match self {
+            Self::Top | Self::Bottom => CursorStyle::ResizeUpDown,
+            Self::Left | Self::Right => CursorStyle::ResizeLeftRight,
+            Self::TopLeft | Self::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+            Self::TopRight | Self::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+            Self::Move => CursorStyle::ClosedHand,
+            Self::New => CursorStyle::Crosshair,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CropDrag {
+    handle: CropHandle,
+    start_px: [i32; 2],
+    start_crop: CropRect,
+    moved: bool,
+}
+
+fn apply_crop_drag(
+    start: CropRect,
+    handle: CropHandle,
+    start_px: [i32; 2],
+    curr_px: [i32; 2],
+    img_w: u32,
+    img_h: u32,
+) -> CropRect {
+    let min_w = MIN_CROP_SIZE_PX.min(img_w) as i32;
+    let min_h = MIN_CROP_SIZE_PX.min(img_h) as i32;
+    let w_max = img_w as i32;
+    let h_max = img_h as i32;
+    let cx = curr_px[0].clamp(0, w_max);
+    let cy = curr_px[1].clamp(0, h_max);
+    let dx = curr_px[0] - start_px[0];
+    let dy = curr_px[1] - start_px[1];
+
+    let (mut l, mut t, mut r, mut b) = (
+        start.left as i32,
+        start.top as i32,
+        start.right as i32,
+        start.bottom as i32,
+    );
+    match handle {
+        CropHandle::Top => t = cy.min(b - min_h).max(0),
+        CropHandle::Bottom => b = cy.max(t + min_h).min(h_max),
+        CropHandle::Left => l = cx.min(r - min_w).max(0),
+        CropHandle::Right => r = cx.max(l + min_w).min(w_max),
+        CropHandle::TopLeft => {
+            l = cx.min(r - min_w).max(0);
+            t = cy.min(b - min_h).max(0);
+        }
+        CropHandle::TopRight => {
+            r = cx.max(l + min_w).min(w_max);
+            t = cy.min(b - min_h).max(0);
+        }
+        CropHandle::BottomLeft => {
+            l = cx.min(r - min_w).max(0);
+            b = cy.max(t + min_h).min(h_max);
+        }
+        CropHandle::BottomRight => {
+            r = cx.max(l + min_w).min(w_max);
+            b = cy.max(t + min_h).min(h_max);
+        }
+        CropHandle::Move => {
+            let cw = r - l;
+            let ch = b - t;
+            l = (l + dx).clamp(0, (w_max - cw).max(0));
+            t = (t + dy).clamp(0, (h_max - ch).max(0));
+            r = l + cw;
+            b = t + ch;
+        }
+        CropHandle::New => {
+            let sx = start_px[0].clamp(0, w_max);
+            let sy = start_px[1].clamp(0, h_max);
+            let (mut nl, mut nr) = if cx >= sx { (sx, cx) } else { (cx, sx) };
+            let (mut nt, mut nb) = if cy >= sy { (sy, cy) } else { (cy, sy) };
+            if nr - nl < min_w {
+                if cx >= sx {
+                    nr = (nl + min_w).min(w_max);
+                    nl = (nr - min_w).max(0);
+                } else {
+                    nl = (nr - min_w).max(0);
+                    nr = (nl + min_w).min(w_max);
+                }
+            }
+            if nb - nt < min_h {
+                if cy >= sy {
+                    nb = (nt + min_h).min(h_max);
+                    nt = (nb - min_h).max(0);
+                } else {
+                    nt = (nb - min_h).max(0);
+                    nb = (nt + min_h).min(h_max);
+                }
+            }
+            l = nl;
+            t = nt;
+            r = nr;
+            b = nb;
+        }
+    }
+    CropRect {
+        left: l.clamp(0, w_max) as u32,
+        top: t.clamp(0, h_max) as u32,
+        right: r.clamp(0, w_max) as u32,
+        bottom: b.clamp(0, h_max) as u32,
+    }
 }
 
 fn tile_rows(width: u32) -> anyhow::Result<u32> {
@@ -249,36 +404,67 @@ fn retain_visible_tiles<T>(cache: &mut HashMap<usize, T>, visible: &Range<usize>
     cache.retain(|tile_id, _| visible.contains(tile_id));
 }
 
-/// Crop `image` vertically to `[trim_top .. trim_bottom]` and shift annotation
+struct CroppedEditorContent {
+    image: ImageSource,
+    hdr: Option<HdrImage>,
+    shapes: Option<Arc<Vec<Shape>>>,
+}
+
+/// Crop `image` (and optional HDR original) to `crop` and shift annotation
 /// shapes into the cropped coordinate space.
 fn crop_and_shift_shapes(
     image: &ImageSource,
+    hdr: Option<&HdrImage>,
     shapes: &[Shape],
     scale: f32,
-    trim_top: u32,
-    trim_bottom: u32,
-) -> anyhow::Result<(ImageSource, Option<Arc<Vec<Shape>>>)> {
+    crop: CropRect,
+) -> anyhow::Result<CroppedEditorContent> {
     let (width, height) = image.dimensions();
-    let top = trim_top.min(height.saturating_sub(1));
-    let bottom = trim_bottom.clamp(top + 1, height);
+    let left = crop.left.min(width.saturating_sub(1));
+    let top = crop.top.min(height.saturating_sub(1));
+    let right = crop.right.clamp(left + 1, width);
+    let bottom = crop.bottom.clamp(top + 1, height);
+    let full = left == 0 && top == 0 && right == width && bottom == height;
     let cropped = match image {
-        ImageSource::Memory(_) if top == 0 && bottom == height => image.clone(),
+        ImageSource::Memory(_) if full => image.clone(),
         ImageSource::Memory(image) => ImageSource::Memory(Arc::new(
-            image::imageops::crop_imm(image.as_ref(), 0, top, width, bottom - top).to_image(),
+            image::imageops::crop_imm(image.as_ref(), left, top, right - left, bottom - top)
+                .to_image(),
         )),
-        ImageSource::Disk(image) => ImageSource::Disk(Arc::new(image.crop_vertical(top, bottom)?)),
+        ImageSource::Disk(_) if full => image.clone(),
+        ImageSource::Disk(image) => {
+            ImageSource::Disk(Arc::new(image.crop(left, top, right, bottom)?))
+        }
+    };
+    let cropped_hdr = if shapes.is_empty() {
+        hdr.and_then(|hdr| {
+            if full {
+                Some(hdr.clone())
+            } else {
+                hdr.crop(left, top, right - left, bottom - top)
+            }
+        })
+    } else {
+        None
     };
     let shifted = if shapes.is_empty() {
         None
     } else {
-        let dy = -(top as f32 / scale.max(0.1));
-        Some(Arc::new(annotate::shift_shapes_vertical(shapes, dy)))
+        let safe_scale = scale.max(0.1);
+        let dx = -(left as f32 / safe_scale);
+        let dy = -(top as f32 / safe_scale);
+        Some(Arc::new(annotate::shift_shapes(shapes, dx, dy)))
     };
-    Ok((cropped, shifted))
+    Ok(CroppedEditorContent {
+        image: cropped,
+        hdr: cropped_hdr,
+        shapes: shifted,
+    })
 }
 
 pub struct ScrollEditorView {
     image: Arc<ImageSource>,
+    hdr: Option<Arc<HdrImage>>,
     scale: f32,
     tiles: Vec<EditorTile>,
     tile_range: Range<usize>,
@@ -297,10 +483,9 @@ pub struct ScrollEditorView {
     size_shown: [f32; 7],
     style_open: bool,
     mosaics: Arc<Mutex<annotate::MosaicCache>>,
-    trim_top: u32,
-    trim_bottom: u32,
-    trim_mode: bool,
-    trim_drag: Option<TrimEdge>,
+    crop: CropRect,
+    crop_mode: bool,
+    crop_drag: Option<CropDrag>,
     zoom: f32,
     scroll_handle: ScrollHandle,
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -313,8 +498,10 @@ pub struct ScrollEditorView {
 impl ScrollEditorView {
     fn new(
         image: ImageSource,
+        hdr: Option<Arc<HdrImage>>,
         scale: f32,
         shapes: Arc<Vec<Shape>>,
+        initial_crop_mode: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -333,7 +520,12 @@ impl ScrollEditorView {
             }
         };
         let logical_w = (width as f32 / scale).max(1.0);
-        let fit_zoom = (700.0 / logical_w).clamp(0.2, 1.0);
+        let logical_h = (height as f32 / scale).max(1.0);
+        let fit_zoom = if logical_h <= logical_w * 2.0 {
+            (840.0 / logical_w).min(560.0 / logical_h).clamp(0.15, 1.0)
+        } else {
+            (700.0 / logical_w).clamp(0.2, 1.0)
+        };
         let defaults = AppSettings::get(cx).annotations.clone();
         let annotations = Layer::from_shapes(defaults.clone(), shapes);
         let style_color = annotations.style().color;
@@ -402,6 +594,7 @@ impl ScrollEditorView {
 
         let mut view = Self {
             image: Arc::new(image),
+            hdr,
             scale,
             tiles,
             tile_range: 0..0,
@@ -420,10 +613,9 @@ impl ScrollEditorView {
             size_shown,
             style_open: false,
             mosaics: Arc::new(Mutex::new(annotate::MosaicCache::default())),
-            trim_top: 0,
-            trim_bottom: height,
-            trim_mode: false,
-            trim_drag: None,
+            crop: CropRect::full(width, height),
+            crop_mode: initial_crop_mode,
+            crop_drag: None,
             zoom: fit_zoom,
             scroll_handle: ScrollHandle::new(),
             canvas_bounds: Rc::new(Cell::new(None)),
@@ -630,8 +822,19 @@ impl ScrollEditorView {
         Some([x.min(max_x), y.min(max_y)])
     }
 
-    fn is_trimmed(&self) -> bool {
-        self.trim_top > 0 || self.trim_bottom < self.image.height()
+    fn to_pixel_coords(&self, window_pos: Point<Pixels>) -> Option<[i32; 2]> {
+        let bounds = self.canvas_bounds.get()?;
+        let (img_w, img_h) = self.image.dimensions();
+        let x =
+            (((window_pos.x - bounds.origin.x).as_f32() / self.zoom) * self.scale).round() as i32;
+        let y =
+            (((window_pos.y - bounds.origin.y).as_f32() / self.zoom) * self.scale).round() as i32;
+        Some([x.clamp(0, img_w as i32), y.clamp(0, img_h as i32)])
+    }
+
+    fn is_cropped(&self) -> bool {
+        let (img_w, img_h) = self.image.dimensions();
+        self.crop.is_cropped(img_w, img_h)
     }
 
     fn export_captured(&mut self, cx: &App) -> anyhow::Result<Captured> {
@@ -647,15 +850,19 @@ impl ScrollEditorView {
         } else {
             WatermarkSpec::default()
         };
-        let (cropped, shapes) = crop_and_shift_shapes(
+        let content = crop_and_shift_shapes(
             &self.image,
+            self.hdr.as_deref(),
             self.annotations.committed(),
             self.scale,
-            self.trim_top,
-            self.trim_bottom,
+            self.crop,
         )?;
         Ok(Captured::from_parts(
-            cropped, None, self.scale, shapes, watermark,
+            content.image,
+            content.hdr,
+            self.scale,
+            content.shapes,
+            watermark,
         ))
     }
 
@@ -665,18 +872,18 @@ impl ScrollEditorView {
             Err(err) => {
                 log::warn!("scroll editor watermark skipped for history save: {err:#}");
                 self.annotations.commit();
-                let (cropped, shapes) = crop_and_shift_shapes(
+                let content = crop_and_shift_shapes(
                     &self.image,
+                    self.hdr.as_deref(),
                     self.annotations.committed(),
                     self.scale,
-                    self.trim_top,
-                    self.trim_bottom,
+                    self.crop,
                 )?;
                 Ok(Captured::from_parts(
-                    cropped,
-                    None,
+                    content.image,
+                    content.hdr,
                     self.scale,
-                    shapes,
+                    content.shapes,
                     WatermarkSpec::default(),
                 ))
             }
@@ -754,6 +961,26 @@ impl ScrollEditorView {
         }
     }
 
+    fn begin_crop_handle(
+        &mut self,
+        handle: CropHandle,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let start_px = self.to_pixel_coords(event.position).unwrap_or([0, 0]);
+        self.crop_mode = true;
+        self.style_open = false;
+        self.annotations.deselect();
+        self.crop_drag = Some(CropDrag {
+            handle,
+            start_px,
+            start_crop: self.crop,
+            moved: false,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn on_canvas_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -761,6 +988,28 @@ impl ScrollEditorView {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
+        if self.crop_mode {
+            if let Some(px_pt) = self.to_pixel_coords(event.position) {
+                let (img_w, img_h) = self.image.dimensions();
+                let handle = if self.crop.is_cropped(img_w, img_h)
+                    && self
+                        .crop
+                        .contains(px_pt[0].max(0) as u32, px_pt[1].max(0) as u32)
+                {
+                    CropHandle::Move
+                } else {
+                    CropHandle::New
+                };
+                self.crop_drag = Some(CropDrag {
+                    handle,
+                    start_px: px_pt,
+                    start_crop: self.crop,
+                    moved: false,
+                });
+                cx.notify();
+            }
+            return;
+        }
         let Some(local) = self.to_logical(event.position) else {
             return;
         };
@@ -785,27 +1034,36 @@ impl ScrollEditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(edge) = self.trim_drag {
+        if let Some(mut drag) = self.crop_drag {
             if event.pressed_button != Some(MouseButton::Left) {
-                self.trim_drag = None;
+                if !drag.moved && drag.handle == CropHandle::New {
+                    self.crop = drag.start_crop;
+                }
+                self.crop_drag = None;
+                cx.notify();
                 return;
             }
-            let Some(bounds) = self.canvas_bounds.get() else {
-                return;
-            };
-            let py = (((event.position.y - bounds.origin.y).as_f32() / self.zoom) * self.scale)
-                .round()
-                .max(0.0) as u32;
-            let max_h = self.image.height();
-            match edge {
-                TrimEdge::Top => {
-                    self.trim_top = py.min(self.trim_bottom.saturating_sub(MIN_TRIM_HEIGHT_PX));
+            if let Some(curr_px) = self.to_pixel_coords(event.position) {
+                let delta = (curr_px[0] - drag.start_px[0])
+                    .abs()
+                    .max((curr_px[1] - drag.start_px[1]).abs());
+                if delta >= 3 {
+                    drag.moved = true;
                 }
-                TrimEdge::Bottom => {
-                    self.trim_bottom = py.clamp(self.trim_top + MIN_TRIM_HEIGHT_PX, max_h);
+                if drag.moved || !matches!(drag.handle, CropHandle::Move | CropHandle::New) {
+                    let (img_w, img_h) = self.image.dimensions();
+                    self.crop = apply_crop_drag(
+                        drag.start_crop,
+                        drag.handle,
+                        drag.start_px,
+                        curr_px,
+                        img_w,
+                        img_h,
+                    );
                 }
+                self.crop_drag = Some(drag);
+                cx.notify();
             }
-            cx.notify();
             return;
         }
         if event.pressed_button != Some(MouseButton::Left) {
@@ -831,7 +1089,10 @@ impl ScrollEditorView {
     }
 
     fn on_canvas_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.trim_drag.take().is_some() {
+        if let Some(drag) = self.crop_drag.take() {
+            if !drag.moved && drag.handle == CropHandle::New {
+                self.crop = drag.start_crop;
+            }
             cx.notify();
             return;
         }
@@ -1000,8 +1261,8 @@ impl Render for ScrollEditorView {
         let theme = cx.theme().clone();
         let current = self.annotations.tool();
         let can_undo = self.annotations.can_undo();
-        let trimmed = self.is_trimmed();
-        let show_trim = self.trim_mode || trimmed;
+        let cropped = self.is_cropped();
+        let show_crop = self.crop_mode || cropped;
 
         let (img_w, img_h) = self.image.dimensions();
         let logical_w = img_w as f32 / self.scale;
@@ -1011,11 +1272,23 @@ impl Render for ScrollEditorView {
         let render_tile_range = self.render_tile_range(img_h);
         self.start_tile_worker(cx);
 
-        let trim_top_disp = (self.trim_top as f32 / self.scale) * self.zoom;
-        let trim_bottom_disp = (self.trim_bottom as f32 / self.scale) * self.zoom;
-        let cropped_h = self.trim_bottom.saturating_sub(self.trim_top);
-        let size_badge = t!("scroll_editor.size", width = img_w, height = cropped_h).to_string();
+        let px_to_disp = |v: u32| (v as f32 / self.scale) * self.zoom;
+        let crop_left_disp = px_to_disp(self.crop.left);
+        let crop_top_disp = px_to_disp(self.crop.top);
+        let crop_right_disp = px_to_disp(self.crop.right);
+        let crop_bottom_disp = px_to_disp(self.crop.bottom);
+        let crop_w_disp = (crop_right_disp - crop_left_disp).max(1.0);
+        let crop_h_disp = (crop_bottom_disp - crop_top_disp).max(1.0);
+        let cropped_w = self.crop.width();
+        let cropped_h = self.crop.height();
+        let size_badge =
+            t!("scroll_editor.size", width = cropped_w, height = cropped_h).to_string();
         let zoom_pct = format!("{}%", (self.zoom * 100.0).round() as u32);
+        let canvas_cursor = if let Some(drag) = self.crop_drag {
+            drag.handle.cursor()
+        } else {
+            CursorStyle::Crosshair
+        };
 
         let image = self.image.clone();
         let layer = self.annotations.clone();
@@ -1096,14 +1369,16 @@ impl Render for ScrollEditorView {
                         capture_toolbar::append_annotation_tools(
                             Toolbar::new("scroll-editor-tools"),
                             "ed",
-                            Some(current),
+                            if self.crop_mode { None } else { Some(current) },
                             can_undo,
                             false,
                             &theme,
                             move |tool, _, _, cx| {
                                 select_view.update(cx, |this, cx| {
-                                    let same = this.annotations.tool() == tool
+                                    let same = !this.crop_mode
+                                        && this.annotations.tool() == tool
                                         && this.annotations.selected().is_none();
+                                    this.crop_mode = false;
                                     this.annotations.deselect();
                                     this.annotations.set_tool(tool);
                                     this.style_open = if same { !this.style_open } else { true };
@@ -1128,16 +1403,20 @@ impl Render for ScrollEditorView {
                             Button::new("ed-trim")
                                 .ghost()
                                 .small()
-                                .selected(self.trim_mode)
-                                .icon(LucideIcon::Scissors)
+                                .selected(self.crop_mode)
+                                .icon(LucideIcon::Crop)
                                 .tooltip(t!("scroll_editor.trim_hint").to_string())
                                 .accessibility_label(t!("scroll_editor.trim").to_string())
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.trim_mode = !this.trim_mode;
+                                    this.crop_mode = !this.crop_mode;
+                                    if this.crop_mode {
+                                        this.style_open = false;
+                                        this.annotations.deselect();
+                                    }
                                     cx.notify();
                                 })),
                         )
-                        .when(trimmed, |this| {
+                        .when(cropped, |this| {
                             this.child(
                                 Button::new("ed-trim-reset")
                                     .ghost()
@@ -1146,8 +1425,8 @@ impl Render for ScrollEditorView {
                                     .tooltip(t!("scroll_editor.trim_reset").to_string())
                                     .accessibility_label(t!("scroll_editor.trim_reset").to_string())
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.trim_top = 0;
-                                        this.trim_bottom = this.image.height();
+                                        let (w, h) = this.image.dimensions();
+                                        this.crop = CropRect::full(w, h);
                                         cx.notify();
                                     })),
                             )
@@ -1284,7 +1563,7 @@ impl Render for ScrollEditorView {
                         div()
                             .id("scroll-editor-viewport")
                             .size_full()
-                            .overflow_y_scroll()
+                            .overflow_scroll()
                             .track_scroll(&self.scroll_handle)
                             .p_6()
                             .child(
@@ -1297,11 +1576,7 @@ impl Render for ScrollEditorView {
                                         .shadow_md()
                                         .border_1()
                                         .border_color(theme.border)
-                                        .cursor(if self.trim_drag.is_some() {
-                                            CursorStyle::ResizeUpDown
-                                        } else {
-                                            CursorStyle::Crosshair
-                                        })
+                                        .cursor(canvas_cursor)
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(Self::on_canvas_mouse_down),
@@ -1489,101 +1764,325 @@ impl Render for ScrollEditorView {
                                                 )
                                             },
                                         )
-                                        .when(show_trim, |this| {
-                                            this.when(trim_top_disp > 0.5, |this| {
+                                        .when(show_crop, |this| {
+                                            let dragging_crop = self.crop_drag.is_some();
+                                            let guide_color = gpui_kit::hsla(0., 0., 1., 0.32);
+                                            let inside_move_cursor = if self
+                                                .crop_drag
+                                                .is_some_and(|d| d.handle == CropHandle::Move)
+                                            {
+                                                CursorStyle::ClosedHand
+                                            } else {
+                                                CursorStyle::OpenHand
+                                            };
+                                            let corner_hit = 14.0_f32;
+                                            let corner_marker = |id: &'static str,
+                                                                 handle: CropHandle,
+                                                                 cx_pos: f32,
+                                                                 cy_pos: f32,
+                                                                 cursor: CursorStyle| {
+                                                div()
+                                                    .id(id)
+                                                    .absolute()
+                                                    .left(px((cx_pos - corner_hit * 0.5)
+                                                        .clamp(0.0, (disp_w - corner_hit).max(0.0))))
+                                                    .top(px((cy_pos - corner_hit * 0.5)
+                                                        .clamp(0.0, (disp_h - corner_hit).max(0.0))))
+                                                    .size(px(corner_hit))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor(cursor)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, ev, _, cx| {
+                                                            this.begin_crop_handle(handle, ev, cx);
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .size(px(8.))
+                                                            .rounded(px(2.))
+                                                            .bg(theme.primary_foreground)
+                                                            .border_2()
+                                                            .border_color(theme.primary),
+                                                    )
+                                            };
+                                            this.when(crop_top_disp > 0.5, |this| {
                                                 this.child(
                                                     div()
                                                         .absolute()
                                                         .top_0()
                                                         .left_0()
-                                                        .right_0()
-                                                        .h(px(trim_top_disp))
+                                                        .w(px(disp_w))
+                                                        .h(px(crop_top_disp))
                                                         .bg(mask_shade),
                                                 )
                                             })
-                                            .when(disp_h - trim_bottom_disp > 0.5, |this| {
+                                            .when(disp_h - crop_bottom_disp > 0.5, |this| {
                                                 this.child(
                                                     div()
                                                         .absolute()
-                                                        .top(px(trim_bottom_disp))
+                                                        .top(px(crop_bottom_disp))
                                                         .left_0()
-                                                        .right_0()
-                                                        .h(px((disp_h - trim_bottom_disp).max(0.0)))
+                                                        .w(px(disp_w))
+                                                        .h(px((disp_h - crop_bottom_disp).max(0.0)))
                                                         .bg(mask_shade),
+                                                )
+                                            })
+                                            .when(crop_left_disp > 0.5, |this| {
+                                                this.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left_0()
+                                                        .top(px(crop_top_disp))
+                                                        .w(px(crop_left_disp))
+                                                        .h(px(crop_h_disp))
+                                                        .bg(mask_shade),
+                                                )
+                                            })
+                                            .when(disp_w - crop_right_disp > 0.5, |this| {
+                                                this.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(crop_right_disp))
+                                                        .top(px(crop_top_disp))
+                                                        .w(px((disp_w - crop_right_disp).max(0.0)))
+                                                        .h(px(crop_h_disp))
+                                                        .bg(mask_shade),
+                                                )
+                                            })
+                                            .when(self.crop_mode && cropped, |this| {
+                                                this.child(
+                                                    div()
+                                                        .id("crop-move-area")
+                                                        .absolute()
+                                                        .left(px(crop_left_disp))
+                                                        .top(px(crop_top_disp))
+                                                        .w(px(crop_w_disp))
+                                                        .h(px(crop_h_disp))
+                                                        .cursor(inside_move_cursor),
                                                 )
                                             })
                                             .child(
                                                 div()
-                                                    .id("trim-handle-top")
                                                     .absolute()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .top(px((trim_top_disp - 8.0).max(0.0)))
-                                                    .h(px(16.))
+                                                    .left(px(crop_left_disp))
+                                                    .top(px(crop_top_disp))
+                                                    .w(px(crop_w_disp))
+                                                    .h(px(crop_h_disp))
+                                                    .border_2()
+                                                    .border_color(theme.primary)
+                                                    .when(dragging_crop, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .absolute()
+                                                                .left(px(crop_w_disp / 3.0))
+                                                                .top_0()
+                                                                .bottom_0()
+                                                                .w(px(1.))
+                                                                .bg(guide_color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .absolute()
+                                                                .left(px(crop_w_disp * 2.0 / 3.0))
+                                                                .top_0()
+                                                                .bottom_0()
+                                                                .w(px(1.))
+                                                                .bg(guide_color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .absolute()
+                                                                .top(px(crop_h_disp / 3.0))
+                                                                .left_0()
+                                                                .right_0()
+                                                                .h(px(1.))
+                                                                .bg(guide_color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .absolute()
+                                                                .top(px(crop_h_disp * 2.0 / 3.0))
+                                                                .left_0()
+                                                                .right_0()
+                                                                .h(px(1.))
+                                                                .bg(guide_color),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("crop-handle-top")
+                                                    .absolute()
+                                                    .left(px(crop_left_disp))
+                                                    .top(px((crop_top_disp - 6.0).max(0.0)))
+                                                    .w(px(crop_w_disp))
+                                                    .h(px(12.))
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
                                                     .cursor(CursorStyle::ResizeUpDown)
                                                     .on_mouse_down(
                                                         MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.trim_drag = Some(TrimEdge::Top);
-                                                            cx.stop_propagation();
+                                                        cx.listener(|this, ev, _, cx| {
+                                                            this.begin_crop_handle(
+                                                                CropHandle::Top,
+                                                                ev,
+                                                                cx,
+                                                            );
                                                         }),
                                                     )
                                                     .child(
-                                                        div().w_full().h(px(2.)).bg(theme.primary),
-                                                    )
-                                                    .child(
                                                         div()
-                                                            .absolute()
-                                                            .px_2()
-                                                            .py_0p5()
+                                                            .w(px((crop_w_disp * 0.28).clamp(16., 36.)))
+                                                            .h(px(4.))
                                                             .rounded_full()
-                                                            .bg(theme.primary)
-                                                            .text_color(theme.primary_foreground)
-                                                            .text_xs()
-                                                            .child(format!("{} px", self.trim_top)),
+                                                            .bg(theme.primary),
                                                     ),
                                             )
                                             .child(
                                                 div()
-                                                    .id("trim-handle-bottom")
+                                                    .id("crop-handle-bottom")
                                                     .absolute()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .top(px((trim_bottom_disp - 8.0)
-                                                        .clamp(0.0, (disp_h - 16.0).max(0.0))))
-                                                    .h(px(16.))
+                                                    .left(px(crop_left_disp))
+                                                    .top(px((crop_bottom_disp - 6.0)
+                                                        .clamp(0.0, (disp_h - 12.0).max(0.0))))
+                                                    .w(px(crop_w_disp))
+                                                    .h(px(12.))
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
                                                     .cursor(CursorStyle::ResizeUpDown)
                                                     .on_mouse_down(
                                                         MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.trim_drag = Some(TrimEdge::Bottom);
-                                                            cx.stop_propagation();
+                                                        cx.listener(|this, ev, _, cx| {
+                                                            this.begin_crop_handle(
+                                                                CropHandle::Bottom,
+                                                                ev,
+                                                                cx,
+                                                            );
                                                         }),
                                                     )
                                                     .child(
-                                                        div().w_full().h(px(2.)).bg(theme.primary),
+                                                        div()
+                                                            .w(px((crop_w_disp * 0.28).clamp(16., 36.)))
+                                                            .h(px(4.))
+                                                            .rounded_full()
+                                                            .bg(theme.primary),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("crop-handle-left")
+                                                    .absolute()
+                                                    .left(px((crop_left_disp - 6.0).max(0.0)))
+                                                    .top(px(crop_top_disp))
+                                                    .w(px(12.))
+                                                    .h(px(crop_h_disp))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor(CursorStyle::ResizeLeftRight)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, ev, _, cx| {
+                                                            this.begin_crop_handle(
+                                                                CropHandle::Left,
+                                                                ev,
+                                                                cx,
+                                                            );
+                                                        }),
                                                     )
                                                     .child(
                                                         div()
-                                                            .absolute()
-                                                            .px_2()
-                                                            .py_0p5()
+                                                            .w(px(4.))
+                                                            .h(px((crop_h_disp * 0.28).clamp(16., 36.)))
                                                             .rounded_full()
-                                                            .bg(theme.primary)
-                                                            .text_color(theme.primary_foreground)
-                                                            .text_xs()
-                                                            .child(format!(
-                                                                "{} px",
-                                                                self.trim_bottom
-                                                            )),
+                                                            .bg(theme.primary),
                                                     ),
                                             )
+                                            .child(
+                                                div()
+                                                    .id("crop-handle-right")
+                                                    .absolute()
+                                                    .left(px((crop_right_disp - 6.0)
+                                                        .clamp(0.0, (disp_w - 12.0).max(0.0))))
+                                                    .top(px(crop_top_disp))
+                                                    .w(px(12.))
+                                                    .h(px(crop_h_disp))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor(CursorStyle::ResizeLeftRight)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, ev, _, cx| {
+                                                            this.begin_crop_handle(
+                                                                CropHandle::Right,
+                                                                ev,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(4.))
+                                                            .h(px((crop_h_disp * 0.28).clamp(16., 36.)))
+                                                            .rounded_full()
+                                                            .bg(theme.primary),
+                                                    ),
+                                            )
+                                            .child(corner_marker(
+                                                "crop-corner-tl",
+                                                CropHandle::TopLeft,
+                                                crop_left_disp,
+                                                crop_top_disp,
+                                                CursorStyle::ResizeUpLeftDownRight,
+                                            ))
+                                            .child(corner_marker(
+                                                "crop-corner-tr",
+                                                CropHandle::TopRight,
+                                                crop_right_disp,
+                                                crop_top_disp,
+                                                CursorStyle::ResizeUpRightDownLeft,
+                                            ))
+                                            .child(corner_marker(
+                                                "crop-corner-bl",
+                                                CropHandle::BottomLeft,
+                                                crop_left_disp,
+                                                crop_bottom_disp,
+                                                CursorStyle::ResizeUpRightDownLeft,
+                                            ))
+                                            .child(corner_marker(
+                                                "crop-corner-br",
+                                                CropHandle::BottomRight,
+                                                crop_right_disp,
+                                                crop_bottom_disp,
+                                                CursorStyle::ResizeUpLeftDownRight,
+                                            ))
+                                            .when(dragging_crop, |this| {
+                                                this.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(
+                                                            (crop_left_disp + 8.0)
+                                                                .clamp(4.0, (disp_w - 110.0).max(4.0)),
+                                                        ))
+                                                        .top(px(
+                                                            (crop_top_disp + 8.0)
+                                                                .clamp(4.0, (disp_h - 28.0).max(4.0)),
+                                                        ))
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_full()
+                                                        .bg(theme.primary)
+                                                        .text_color(theme.primary_foreground)
+                                                        .text_xs()
+                                                        .child(format!("{cropped_w} × {cropped_h}")),
+                                                )
+                                            })
                                         }),
                                 ),
                             ),
@@ -1760,55 +2259,131 @@ mod tests {
     }
 
     #[test]
-    fn cropping_trim_shifts_annotations_vertically() {
-        let image = ImageSource::from(snapit_capture::RgbaImage::new(200, 1000));
+    fn cropping_trim_shifts_annotations_in_two_dimensions() {
+        let image = ImageSource::from(snapit_capture::RgbaImage::new(400, 1000));
         let shapes = vec![Shape::Rect {
-            from: [10.0, 120.0],
-            to: [50.0, 200.0],
+            from: [40.0, 120.0],
+            to: [90.0, 200.0],
             style: Style::default(),
         }];
-        let (cropped, shifted) = crop_and_shift_shapes(&image, &shapes, 2.0, 100, 800).unwrap();
-        assert_eq!(cropped.dimensions(), (200, 700));
-        let shifted = shifted.unwrap();
+        let crop = CropRect {
+            left: 30,
+            top: 100,
+            right: 330,
+            bottom: 800,
+        };
+        let content = crop_and_shift_shapes(&image, None, &shapes, 2.0, crop).unwrap();
+        assert_eq!(content.image.dimensions(), (300, 700));
+        assert!(content.hdr.is_none());
+        let shifted = content.shapes.unwrap();
         match &shifted[0] {
             Shape::Rect { from, to, .. } => {
-                assert_eq!(*from, [10.0, 70.0]);
-                assert_eq!(*to, [50.0, 150.0]);
+                assert_eq!(*from, [25.0, 70.0]);
+                assert_eq!(*to, [75.0, 150.0]);
             }
             _ => panic!("expected Rect"),
         }
     }
 
     #[test]
-    fn cropping_disk_trim_uses_exclusive_bottom_row() {
-        let mut raw = vec![0u8; 4 * 100 * 4];
-        for y in 0..100u32 {
-            for x in 0..4u32 {
-                let at = ((y * 4 + x) * 4) as usize;
-                raw[at..at + 4].copy_from_slice(&[y as u8, 0, 0, 255]);
-            }
-        }
-        let img = snapit_capture::RgbaImage::from_raw(4, 100, raw).unwrap();
+    fn cropping_disk_uses_2d_subregion() {
+        let img = snapit_capture::RgbaImage::from_fn(20, 100, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
         let disk = ImageSource::Disk(Arc::new(
             snapit_capture::DiskImage::from_image(&img).unwrap(),
         ));
-        let (cropped, _) = crop_and_shift_shapes(&disk, &[], 1.0, 30, 80).unwrap();
-        assert_eq!(cropped.dimensions(), (4, 50));
-        if let ImageSource::Disk(cropped_disk) = cropped {
+        let crop = CropRect {
+            left: 4,
+            top: 30,
+            right: 16,
+            bottom: 80,
+        };
+        let content = crop_and_shift_shapes(&disk, None, &[], 1.0, crop).unwrap();
+        assert_eq!(content.image.dimensions(), (12, 50));
+        if let ImageSource::Disk(cropped_disk) = content.image {
             let rows = cropped_disk.read_rows(0, 50).unwrap();
-            assert_eq!(rows.get_pixel(0, 0).0[0], 30);
-            assert_eq!(rows.get_pixel(0, 49).0[0], 79);
+            assert_eq!(rows.get_pixel(0, 0).0, [4, 30, 34, 255]);
+            assert_eq!(rows.get_pixel(11, 49).0, [15, 79, 94, 255]);
         } else {
             panic!("expected disk image");
         }
     }
 
     #[test]
-    fn crop_and_shift_preserves_full_untrimmed_image_and_empty_shapes() {
-        let img = snapit_capture::RgbaImage::from_pixel(12, 40, image::Rgba([10, 20, 30, 255]));
+    fn crop_and_shift_preserves_full_uncropped_image_and_unannotated_hdr() {
+        let img = snapit_capture::RgbaImage::from_pixel(24, 40, image::Rgba([10, 20, 30, 255]));
         let src = ImageSource::from(img);
-        let (cropped, shapes) = crop_and_shift_shapes(&src, &[], 2.0, 0, 40).unwrap();
-        assert_eq!(cropped.dimensions(), (12, 40));
-        assert!(shapes.is_none());
+        let hdr = snapit_capture::HdrImage::new(24, 40, vec![0; 24 * 40 * 6], 203.0);
+
+        let full =
+            crop_and_shift_shapes(&src, Some(&hdr), &[], 2.0, CropRect::full(24, 40)).unwrap();
+        assert_eq!(full.image.dimensions(), (24, 40));
+        let full_hdr = full.hdr.unwrap();
+        assert_eq!((full_hdr.width(), full_hdr.height()), (24, 40));
+        assert!(full.shapes.is_none());
+
+        let crop = CropRect {
+            left: 4,
+            top: 6,
+            right: 22,
+            bottom: 36,
+        };
+        let cropped = crop_and_shift_shapes(&src, Some(&hdr), &[], 2.0, crop).unwrap();
+        assert_eq!(cropped.image.dimensions(), (18, 30));
+        let cropped_hdr = cropped.hdr.unwrap();
+        assert_eq!((cropped_hdr.width(), cropped_hdr.height()), (18, 30));
+
+        let annotated = vec![Shape::Line {
+            from: [2.0, 2.0],
+            to: [8.0, 8.0],
+            style: Style::default(),
+        }];
+        let with_shapes = crop_and_shift_shapes(&src, Some(&hdr), &annotated, 2.0, crop).unwrap();
+        assert!(with_shapes.hdr.is_none());
+        assert!(with_shapes.shapes.is_some());
+    }
+
+    #[test]
+    fn apply_crop_drag_enforces_bounds_and_minimum_size() {
+        let start = CropRect {
+            left: 40,
+            top: 50,
+            right: 200,
+            bottom: 180,
+        };
+        let tl = apply_crop_drag(start, CropHandle::TopLeft, [40, 50], [260, 240], 400, 300);
+        assert_eq!(
+            tl,
+            CropRect {
+                left: 200 - MIN_CROP_SIZE_PX,
+                top: 180 - MIN_CROP_SIZE_PX,
+                right: 200,
+                bottom: 180,
+            }
+        );
+
+        let moved = apply_crop_drag(start, CropHandle::Move, [100, 100], [450, 380], 400, 300);
+        assert_eq!(moved.width(), 160);
+        assert_eq!(moved.height(), 130);
+        assert_eq!((moved.right, moved.bottom), (400, 300));
+
+        let drawn = apply_crop_drag(
+            CropRect::full(400, 300),
+            CropHandle::New,
+            [300, 220],
+            [120, 60],
+            400,
+            300,
+        );
+        assert_eq!(
+            drawn,
+            CropRect {
+                left: 120,
+                top: 60,
+                right: 300,
+                bottom: 220,
+            }
+        );
     }
 }

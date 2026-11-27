@@ -260,6 +260,39 @@ impl DiskImage {
         Ok(cropped)
     }
 
+    pub fn crop(&self, left: u32, top: u32, right: u32, bottom: u32) -> Result<Self> {
+        ensure!(
+            left < right && right <= self.width && top < bottom && bottom <= self.height,
+            "disk image crop is invalid"
+        );
+        if left == 0 && right == self.width {
+            return self.crop_vertical(top, bottom);
+        }
+        let crop_w = right - left;
+        let crop_h = bottom - top;
+        let cropped = Self::create(crop_w, crop_h)?;
+        let rows_per_chunk = self.rows_for_bytes(IO_CHUNK_BYTES);
+        let src_stride = self.width as usize * 4;
+        let dst_stride = crop_w as usize * 4;
+        let x_start = left as usize * 4;
+        let x_end = x_start + dst_stride;
+        let mut out_buf = Vec::with_capacity(rows_per_chunk as usize * dst_stride);
+        let mut source_y = top;
+        while source_y < bottom {
+            let rows = rows_per_chunk.min(bottom - source_y);
+            let chunk = self.read_rows(source_y, rows)?;
+            let raw = chunk.as_raw();
+            out_buf.clear();
+            for row in 0..rows as usize {
+                let off = row * src_stride;
+                out_buf.extend_from_slice(&raw[off + x_start..off + x_end]);
+            }
+            cropped.write_raw_rows_at(source_y - top, rows, &out_buf)?;
+            source_y += rows;
+        }
+        Ok(cropped)
+    }
+
     pub fn read_rows_scaled(&self, start: u32, rows: u32, target_width: u32) -> Result<RgbaImage> {
         ensure!(rows > 0 && target_width > 0, "disk image scale is empty");
         ensure!(
@@ -499,6 +532,22 @@ mod tests {
             cropped.read_rows(0, 3).unwrap(),
             image::imageops::crop_imm(&source, 0, 2, 4, 3).to_image()
         );
+    }
+
+    #[test]
+    fn disk_image_crops_2d_subregion() {
+        let source = RgbaImage::from_fn(8, 6, |x, y| {
+            image::Rgba([x as u8 * 25, y as u8 * 35, (x + y) as u8 * 10, 255])
+        });
+        let disk = DiskImage::from_image(&source).unwrap();
+        let cropped = disk.crop(2, 1, 7, 5).unwrap();
+        assert_eq!(cropped.dimensions(), (5, 4));
+        assert_eq!(
+            cropped.read_rows(0, 4).unwrap(),
+            image::imageops::crop_imm(&source, 2, 1, 5, 4).to_image()
+        );
+        assert!(disk.crop(4, 1, 4, 5).is_err());
+        assert!(disk.crop(1, 1, 9, 5).is_err());
     }
 
     #[test]

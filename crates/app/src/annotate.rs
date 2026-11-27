@@ -1806,12 +1806,12 @@ impl MosaicCache {
     }
 }
 
-pub(crate) fn shift_shapes_vertical(shapes: &[Shape], dy: f32) -> Vec<Shape> {
+pub(crate) fn shift_shapes(shapes: &[Shape], dx: f32, dy: f32) -> Vec<Shape> {
     shapes
         .iter()
         .cloned()
         .map(|mut shape| {
-            shape.shift(0.0, dy);
+            shape.shift(dx, dy);
             shape
         })
         .collect()
