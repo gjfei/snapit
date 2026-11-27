@@ -125,6 +125,16 @@ With no selection, hovering highlights the window under the cursor; with element
 4. Choose **Annotate in the scrolling region** to pause scrolling and draw directly in the real selection with rectangle, arrow, line, pen, mosaic, text and numbered-step tools, including undo, deletion and style controls. **Done** restores the previous auto-scroll direction; a manually paused capture stays paused. Prepending content or resizing fixed bars keeps existing annotation anchors attached to their content. The live preview remains read-only. The control bar provides **Reset**, **auto-scroll direction**, **Live Preview**, and direct **Copy** (`Enter`), **Save** (`⌘S` / `Ctrl+S`), **Pin** and **OCR** actions. Press `E` for the **Long-Image Editor**; `Esc` or Cancel discards the capture.
 5. **Long-image editor**: lazily loads visible GPU tiles under a byte budget, with draggable top/bottom trim handles, all 7 annotation tools, zoom controls (`Fit width` / `100%`), and direct Copy / Save / Pin / OCR actions.
 
+<p align="center">
+  <img src="assets/screenshots/en/scrolling.png" width="820" alt="Live scrolling capture preview and control bar">
+</p>
+<p align="center"><sub>Bidirectional stitching, a live long-image preview and a floating control bar</sub></p>
+
+<p align="center">
+  <img src="assets/screenshots/en/editor.png" width="820" alt="Long-image editor">
+</p>
+<p align="center"><sub>Long-image editor: free 2D cropping, further annotation and zoom</sub></p>
+
 ### Annotations
 
 Once a region is selected, annotation tools appear on the left of the toolbar:
@@ -148,6 +158,16 @@ Everything except mosaic takes a color; rectangle, arrow and pen also take a lin
 ### Watermarks
 
 In **Settings → Watermark**, pick a saved template for Screenshots, Animations and Videos independently; choose **Don't use** to skip an output, which is the default for all three. Click **Manage** at the right edge of the page header to open the dedicated three-pane designer. Its top template bar switches between saved templates and creates, duplicates, renames or deletes them; creating one starts from 5 built-in starters (Blank, Clean signature, Brand + timestamp, Pill badge, Diagonal tile). The toolbar adds multiple multi-line text elements (with `{date}`, `{time}`, `{datetime}` and `{year}` variables, bold, drop shadow, outline stroke and pill background) and multiple PNG / JPEG images (with corner radius cropping), plus undo / redo, duplicate, delete and alignment / distribution actions. The left pane lists layers alongside the **Whole** toggle, the center canvas uses a theme-following transparent checkerboard and supports direct dragging with 5 px sibling snap guides, corner resize handles, top rotation handle (`Shift` snaps 15°), trackpad pinch or scroll zoom, drag-and-drop image import and `⌘V` / `Ctrl+V` clipboard image paste, and the right inspector edits styling and exact coordinates. **Layout & Preview** adjusts the clickable 3×3 placement grid, tiling and spacing, and non-tiled non-centered margins can be dragged directly on that canvas. Editing is draft-only: **Save Template** writes the stamp design, while Cancel leaves the original untouched; switching templates with unsaved changes asks for confirmation first. Template names are unique and searchable, and deleting a template returns its outputs to "Don't use".
+
+<p align="center">
+  <img src="assets/screenshots/en/watermark-settings.png" width="820" alt="Watermark output settings">
+</p>
+<p align="center"><sub>Screenshots, animations and videos each choose a watermark template or "Don't use"</sub></p>
+
+<p align="center">
+  <img src="assets/screenshots/en/watermark-designer.png" width="820" alt="Three-pane watermark designer">
+</p>
+<p align="center"><sub>Three-pane watermark designer: layers, transparent canvas and style inspector</sub></p>
 
 The **Apply To** group has one dropdown each for screenshots, animations (GIF / APNG) and videos (MP4); pick a saved template or leave it at **Don't use**, which is the default for all three.
 
@@ -196,6 +216,11 @@ Choose the language in **Settings → Text Recognition**: automatic (Simplified 
 <p align="center"><sub>Recorded GIF (fictional demo content): changes inside the selection captured frame by frame</sub></p>
 
 The animation format is configured only in **Settings → Recording → Animation format** and defaults to GIF; shortcuts, the tray and the overlay share that choice. The same page holds GIF / APNG frame rate 1–30 fps (default 12), MP4 frame rate 1–30 fps (default 30), MP4 target bitrate in Kbps, 0–600 seconds (default 0, unlimited), cursor capture (on by default), click effects (on by default), click style (22 options in Basic, Motion, Particles and Glow groups, including multicolour fireworks, sparkles, comets and aurora effects) and HDR recording (on by default, MP4 only). Enter 0 for the MP4 target bitrate to use the automatic value; a positive integer overrides it. You can also set `animation_format`, `click_effect`, `mp4_bitrate_kbps`, `captures_cursor` and `click_effects` under `[recording]` in `config.toml`. The bitrate affects MP4 only, for both SDR / H.264 and HDR / HEVC. APNG shares GIF's frame rate but keeps lossless 8-bit RGBA pixels instead of a 256-colour palette; it loops forever and is copied as PNG image data. Click effects are drawn before duplicate-frame detection, so they still animate over a static screen. Output uses the display's physical pixels by default, matching screenshot resolution instead of automatically shrinking to logical size on Retina displays.
+
+<p align="center">
+  <img src="assets/screenshots/en/click-effects-settings.png" width="820" alt="Mouse click effect settings">
+</p>
+<p align="center"><sub>22 click effects grouped into Basic, Motion, Particles and Glow, with one-click previews</sub></p>
 
 Each recording writes exactly one file, and all three formats coexist in history with a first-frame PNG thumbnail. MP4 uses the system's hardware encoder (AVFoundation on macOS, Media Foundation on Windows): HDR sessions use HEVC Main10, and an unavailable encoder or a rejected first frame automatically reopens the file as SDR / H.264, so no codec has to be installed. SDR video is explicitly tagged BT.709 and, unless a manual bitrate is set, targets 0.1 bit/pixel/frame at the physical resolution to leave room for small text and fine edges. GIF is encoded in pure Rust and plays anywhere: it shares one 256-colour palette trained on a sparse sample (with a lazily built lookup table), encodes only the rectangle that changed and leaves static areas to the previous frame. A scene whose colours drift rebuilds the palette and writes one full frame. APNG stores lossless RGBA8 frames through the existing PNG encoder, reuses GIF's dirty rectangles with no disposal or blend operation, loops forever, and patches the final frame count into `acTL` when recording finishes. GIF and APNG stream to disk through a bounded eight-frame queue, so long recordings do not require keeping every frame in memory. Physical pixels cost more CPU, memory and disk space, and GIF still has a 256-colour limit; callers that need smaller output can set `max_width` explicitly. GIF and APNG keep actual pixel dimensions, including odd sizes. H.264 and HEVC need even dimensions for 4:2:0 chroma, so an MP4 can be up to one pixel narrower or shorter than the selection.
 
