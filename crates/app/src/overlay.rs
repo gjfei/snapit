@@ -41,17 +41,22 @@ const CONTEXT: &str = "SnapItOverlay";
 /// Run after the window has presented a frame with its current content.
 pub(crate) fn after_presented_frame(
     window: &mut Window,
+    _cx: &mut App,
     callback: impl FnOnce(&mut Window, &mut App) + 'static,
 ) {
     let pending = Rc::new(RefCell::new(Some(callback)));
-    window.on_next_frame(move |window, _| {
+    window.on_next_frame(move |window, _cx| {
         let pending = pending.clone();
         window.on_next_frame(move |window, cx| {
             if let Some(callback) = pending.borrow_mut().take() {
                 callback(window, cx);
             }
         });
+        #[cfg(target_os = "macos")]
+        macos_window::request_native_display(window, _cx);
     });
+    #[cfg(target_os = "macos")]
+    macos_window::request_native_display(window, _cx);
 }
 
 /// Color magnifier: a 13 × 13 block of physical pixels at 9 px per cell.
@@ -111,8 +116,8 @@ const RECORDING_OUTLINE_WINDOW_LEVEL: isize = 100;
 /// surface，又不闪出窗口底色。Windows 的窗口在首帧之前就已显示，所以它在
 /// 冻结完成后才创建浮层。
 #[cfg(target_os = "macos")]
-pub fn pre_place(window: &mut Window) {
-    macos_window::pre_place(window);
+pub fn pre_place(window: &mut Window, cx: &mut App) {
+    macos_window::pre_place(window, cx);
 }
 
 /// 记录当前最前方的其它应用 PID（当 SnapIt 自身不是最前应用时）。
@@ -504,7 +509,7 @@ impl OverlayView {
             // 预建时窗口是零 alpha、还没有画过冻结帧；这时直接恢复 alpha 会先露出
             // 未渲染图层的黑色，等 GPUI 再画一帧才正常。等首帧合成完再置前。
             let asked = Instant::now();
-            after_presented_frame(window, move |window, _| {
+            after_presented_frame(window, cx, move |window, _| {
                 let showing = Instant::now();
                 macos_window::reveal(window);
                 window.activate_window();
@@ -2943,11 +2948,12 @@ impl Render for OverlayView {
 mod macos_window {
     use std::sync::{Once, OnceLock};
 
+    use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
     use objc2::{ffi, msg_send, sel};
     use objc2_foundation::NSRect;
 
-    use gpui_kit::Window;
+    use gpui_kit::{App, Window};
 
     type ConstrainFn =
         unsafe extern "C-unwind" fn(&AnyObject, Sel, NSRect, *mut AnyObject) -> NSRect;
@@ -3076,11 +3082,33 @@ mod macos_window {
     ///
     /// 未出过帧的 `CAMetalLayer` 默认不透明黑，`reveal` 一恢复 alpha 就会黑一帧。
     /// 这里把图层底色清成透明，置前时最后一层画布就是桌面本身。
-    pub fn pre_place(window: &mut Window) {
+    pub(super) fn request_native_display(window: &Window, cx: &mut App) {
+        let Some((native_view, native_window)) = native_view_and_window(window) else {
+            return;
+        };
+        // GPUI's frame source can remain stopped for a window created hidden.
+        // Run its AppKit display callback after the current update releases App.
+        let _native_window =
+            unsafe { Retained::retain(native_window) }.expect("live overlay window");
+        cx.foreground_executor()
+            .spawn(async move {
+                unsafe {
+                    let _: () = msg_send![
+                        native_view,
+                        displayLayer: std::ptr::null_mut::<AnyObject>()
+                    ];
+                }
+            })
+            .detach();
+    }
+
+    pub fn pre_place(window: &mut Window, cx: &mut App) {
         let Some(native_window) = native_window(window) else {
             return;
         };
         unsafe {
+            let occlusion: usize = msg_send![native_window, occlusionState];
+            log::info!(target: "timing", "overlay pre-place: occlusion={occlusion}");
             let _: () = msg_send![native_window, setLevel: super::OVERLAY_WINDOW_LEVEL];
             let _: () = msg_send![native_window, setAlphaValue: 0.0f64];
             let _: () = msg_send![native_window, setIgnoresMouseEvents: Bool::YES];
@@ -3090,6 +3118,7 @@ mod macos_window {
                 orderFront: std::ptr::null_mut::<AnyObject>()
             ];
         }
+        request_native_display(window, cx);
     }
 
     pub fn set_window_level(window: &mut Window, level: isize) {

@@ -1442,7 +1442,7 @@ impl Controller {
                     #[cfg(target_os = "macos")]
                     if warmed {
                         window
-                            .update(cx, |_, window, _| crate::overlay::pre_place(window))
+                            .update(cx, |_, window, cx| crate::overlay::pre_place(window, cx))
                             .ok();
                     }
                     overlays.push(OverlayWindow { slot, window, view });
@@ -2296,7 +2296,7 @@ impl Controller {
             overlay
                 .view
                 .update(cx, |view, cx| view.enter_recording(selection, window, cx));
-            after_presented_frame(window, move |_, cx| {
+            after_presented_frame(window, cx, move |_, cx| {
                 controller.update(cx, |this, cx| {
                     if this
                         .recording
@@ -2907,7 +2907,7 @@ impl Controller {
         let controller = cx.entity();
         let entered = overlay_handle.update(cx, |_, window, cx| {
             overlay_view.update(cx, |view, cx| view.enter_recording(selection, window, cx));
-            after_presented_frame(window, move |_, cx| {
+            after_presented_frame(window, cx, move |_, cx| {
                 controller.update(cx, |this, cx| {
                     if this
                         .scroll
