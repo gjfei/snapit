@@ -26,13 +26,15 @@ pub use stitch::{
     FeedOutcome, PreviewTile, ScrollDirection, ScrollWarning, StitchConfig, Stitcher,
 };
 
-const CAPTURE_FPS: u32 = 0;
+const CAPTURE_FPS: u32 = 60;
 const POLL_TIMEOUT: Duration = Duration::from_millis(4);
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(120);
-const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
-const FRAME_BUFFER_BUDGET_BYTES: usize = 192 * 1024 * 1024;
-const MIN_FRAME_BUFFER_CAPACITY: usize = 4;
+const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const FRAME_BUFFER_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+const MIN_FRAME_BUFFER_CAPACITY: usize = 3;
 const MAX_FRAME_BUFFER_CAPACITY: usize = 64;
+const XCAP_SCROLL_CHANNEL_CAPACITY: usize = 2;
+const XCAP_BUFFER_POOL_MAX: usize = 2;
 const AUTO_SCROLL_STALL_LIMIT: u32 = 5;
 const AUTO_SCROLL_QUEUE_BACKPRESSURE: usize = 6;
 const AUTO_SCROLL_REWIND_LIMIT: u32 = 6;
@@ -302,8 +304,8 @@ const AUTO_SCROLL_REVERSE_DISTANCE: u32 = 48;
 const AUTO_SCROLL_REVERSE_FRAMES: u32 = 2;
 
 struct QueuedFrame {
-    image: Arc<RgbaImage>,
-    grid: [u32; 64],
+    image: Arc<stitch::PooledImage>,
+    profile: Arc<stitch::FrameProfile>,
     captured_at: Instant,
 }
 
@@ -328,13 +330,18 @@ impl FrameQueue {
         }
     }
 
-    fn push(&mut self, image: Arc<RgbaImage>, grid: [u32; 64], captured_at: Instant) {
+    fn push(
+        &mut self,
+        image: Arc<stitch::PooledImage>,
+        profile: Arc<stitch::FrameProfile>,
+        captured_at: Instant,
+    ) {
         let frame_bytes = image.as_raw().len().max(1);
         self.capacity = (FRAME_BUFFER_BUDGET_BYTES / frame_bytes)
             .clamp(MIN_FRAME_BUFFER_CAPACITY, MAX_FRAME_BUFFER_CAPACITY);
         self.frames.push_back(QueuedFrame {
             image,
-            grid,
+            profile,
             captured_at,
         });
         while self.frames.len() > self.capacity {
@@ -360,8 +367,8 @@ impl FrameQueue {
 #[allow(clippy::large_enum_variant)]
 enum QueuePop {
     Frame {
-        image: Arc<RgbaImage>,
-        grid: [u32; 64],
+        image: Arc<stitch::PooledImage>,
+        profile: Arc<stitch::FrameProfile>,
         queue_empty: bool,
         dropped: u64,
         max_depth: usize,
@@ -375,7 +382,7 @@ fn pop_frame(queue: &(Mutex<FrameQueue>, Condvar), timeout: Duration) -> QueuePo
     if let Some(item) = guard.frames.pop_front() {
         return QueuePop::Frame {
             image: item.image,
-            grid: item.grid,
+            profile: item.profile,
             queue_empty: guard.frames.is_empty(),
             dropped: guard.dropped,
             max_depth: guard.max_depth,
@@ -391,7 +398,7 @@ fn pop_frame(queue: &(Mutex<FrameQueue>, Condvar), timeout: Duration) -> QueuePo
     if let Some(item) = guard.frames.pop_front() {
         QueuePop::Frame {
             image: item.image,
-            grid: item.grid,
+            profile: item.profile,
             queue_empty: guard.frames.is_empty(),
             dropped: guard.dropped,
             max_depth: guard.max_depth,
@@ -403,9 +410,41 @@ fn pop_frame(queue: &(Mutex<FrameQueue>, Condvar), timeout: Duration) -> QueuePo
     }
 }
 
-fn queue_stats(queue: &(Mutex<FrameQueue>, Condvar)) -> (usize, u64, usize) {
+#[derive(Clone, Copy, Debug)]
+struct QueueStats {
+    len: usize,
+    capacity: usize,
+    dropped: u64,
+    max_depth: usize,
+}
+
+fn queue_stats(queue: &(Mutex<FrameQueue>, Condvar)) -> QueueStats {
     let guard = queue.0.lock().unwrap_or_else(|p| p.into_inner());
-    (guard.frames.len(), guard.dropped, guard.max_depth)
+    QueueStats {
+        len: guard.frames.len(),
+        capacity: guard.capacity,
+        dropped: guard.dropped,
+        max_depth: guard.max_depth,
+    }
+}
+
+fn pace_pulse_for_queue(
+    mac_px: i32,
+    win_notches: i32,
+    interval: Duration,
+    queue_len: usize,
+    queue_capacity: usize,
+) -> Option<(i32, i32, Duration)> {
+    let pause_at = (queue_capacity / 2)
+        .clamp(3, AUTO_SCROLL_QUEUE_BACKPRESSURE)
+        .min(queue_capacity.saturating_sub(1).max(1));
+    if queue_len >= pause_at {
+        return None;
+    }
+    if queue_len + 1 == pause_at {
+        return Some((mac_px, win_notches, interval.mul_f32(1.35)));
+    }
+    Some((mac_px, win_notches, interval))
 }
 
 struct GrabGuard {
@@ -432,6 +471,85 @@ impl Drop for GrabGuard {
     }
 }
 
+struct PulseConfig {
+    enabled: bool,
+    direction: ScrollDirection,
+    anchor: (f32, f32),
+    mac_px: i32,
+    win_notches: i32,
+    interval: Duration,
+    pause_until: Instant,
+    grace_until: Instant,
+    stop: bool,
+}
+
+impl PulseConfig {
+    fn new(center: (f32, f32)) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: false,
+            direction: ScrollDirection::Down,
+            anchor: center,
+            mac_px: 8,
+            win_notches: 1,
+            interval: Duration::from_millis(12),
+            pause_until: now,
+            grace_until: now,
+            stop: false,
+        }
+    }
+}
+
+struct PulseGuard {
+    state: Arc<(Mutex<PulseConfig>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PulseGuard {
+    fn stop_and_join(&mut self) {
+        {
+            let mut guard = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+            guard.stop = true;
+            guard.enabled = false;
+            self.state.1.notify_all();
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PulseGuard {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn sync_pulser(
+    pulse_state: &(Mutex<PulseConfig>, Condvar),
+    auto: &AutoScrollState,
+    active_h: u32,
+    scale: f32,
+    speed: ScrollSpeed,
+) {
+    let step = speed.plan_continuous(active_h, scale, auto.gain, auto.rewinding);
+    let direction = if auto.rewinding {
+        auto.direction.opposite()
+    } else {
+        auto.direction
+    };
+    let mut guard = pulse_state.0.lock().unwrap_or_else(|p| p.into_inner());
+    guard.enabled = auto.enabled;
+    guard.direction = direction;
+    guard.anchor = auto.anchor;
+    guard.mac_px = step.mac_px;
+    guard.win_notches = step.win_notches;
+    guard.interval = step.platform_interval();
+    guard.pause_until = auto.pause_pulses_until;
+    guard.grace_until = auto.grace_until;
+    pulse_state.1.notify_all();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutoScrollSettlement {
     Continue,
@@ -443,7 +561,6 @@ struct AutoScrollState {
     enabled: bool,
     direction: ScrollDirection,
     anchor: (f32, f32),
-    next_pulse_at: Instant,
     next_eval_at: Instant,
     pause_pulses_until: Instant,
     grace_until: Instant,
@@ -458,6 +575,7 @@ struct AutoScrollState {
     reverse_distance: u32,
     reverse_frames: u32,
     boundary_grace_steps: u32,
+    window_backpressured: bool,
 }
 
 impl AutoScrollState {
@@ -467,7 +585,6 @@ impl AutoScrollState {
             enabled: false,
             direction: ScrollDirection::Down,
             anchor: center,
-            next_pulse_at: now,
             next_eval_at: now,
             pause_pulses_until: now,
             grace_until: now,
@@ -482,6 +599,7 @@ impl AutoScrollState {
             reverse_distance: 0,
             reverse_frames: 0,
             boundary_grace_steps: 0,
+            window_backpressured: false,
         }
     }
 
@@ -501,6 +619,11 @@ impl AutoScrollState {
         self.window_max_frame_dy = 0;
         self.reverse_distance = 0;
         self.reverse_frames = 0;
+        self.window_backpressured = false;
+    }
+
+    fn note_backpressure(&mut self) {
+        self.window_backpressured = true;
     }
 
     fn observe_motion(&mut self, dy: i32, observed: ScrollDirection) -> bool {
@@ -555,13 +678,24 @@ impl AutoScrollState {
             self.stalls = 0;
             self.warning_retries = 0;
             if active_h > 0 {
-                if self.window_max_frame_dy as f32 > active_h as f32 * 0.50 {
-                    self.gain = (self.gain * 0.65).clamp(0.10, 4.5);
+                if self.window_max_frame_dy as f32 > active_h as f32 * 0.40 {
+                    let prev_gain = self.gain;
+                    self.gain = (self.gain * 0.65).clamp(0.10, 2.5);
+                    log::debug!(
+                        "scroll auto-scroll damped for overshoot (max_dy={}, active_h={active_h}, gain={prev_gain:.2}->{:.2})",
+                        self.window_max_frame_dy,
+                        self.gain
+                    );
+                } else if self.window_backpressured {
+                    log::debug!(
+                        "scroll auto-scroll holding gain under queue backpressure (gain={:.2})",
+                        self.gain
+                    );
                 } else {
                     let actual = self.window_displacement.unsigned_abs() as f32;
                     let ratio = target_px.max(32.0) / actual;
                     self.gain =
-                        (self.gain * (0.55 + 0.45 * ratio.clamp(0.4, 2.0))).clamp(0.10, 4.5);
+                        (self.gain * (0.55 + 0.45 * ratio.clamp(0.5, 1.5))).clamp(0.10, 2.5);
                 }
             }
             return AutoScrollSettlement::Continue;
@@ -622,19 +756,25 @@ fn capture_loop(
     ready_tx: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<Option<(DiskImage, u32)>> {
     let queue = Arc::new((Mutex::new(FrameQueue::new()), Condvar::new()));
+    let paused_flag = Arc::new(AtomicBool::new(false));
     let (grab_ready_tx, grab_ready_rx) = sync_channel::<std::result::Result<(), String>>(1);
     let grab_queue = queue.clone();
+    let grab_paused = paused_flag.clone();
     let grab_fps = options.fps;
+    let grab_scale = options.scale;
     let grab_thread = thread::Builder::new()
         .name("snapit-scroll-grab".into())
         .spawn(move || {
-            let live = match LiveRecorder::start_with(
+            let pool = snapit_capture::FrameBufferPool::new(XCAP_BUFFER_POOL_MAX);
+            let live = match LiveRecorder::start_with_tuning(
                 monitor_id,
                 region,
                 grab_fps,
                 false,
                 OutputSize::Native,
                 DynamicRange::Sdr,
+                Some(XCAP_SCROLL_CHANNEL_CAPACITY),
+                Some(pool.clone()),
             ) {
                 Ok(live) => {
                     let _ = grab_ready_tx.send(Ok(()));
@@ -649,7 +789,7 @@ fn capture_loop(
                 }
             };
             let mut last_grid: Option<[u32; 64]> = None;
-            let mut last_image: Option<Arc<RgbaImage>> = None;
+            let mut last_image: Option<Arc<stitch::PooledImage>> = None;
             loop {
                 if grab_queue.0.lock().unwrap_or_else(|p| p.into_inner()).stop {
                     break;
@@ -663,22 +803,29 @@ fn capture_loop(
                         if w == 0 || h == 0 {
                             continue;
                         }
-                        let grid = stitch::sample_grid(img.as_raw(), w as usize, h as usize);
+                        let pooled = stitch::PooledImage::new(img, Some(pool.clone()));
+                        if grab_paused.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let grid = stitch::sample_grid(pooled.as_raw(), w as usize, h as usize);
                         if last_grid == Some(grid)
                             && last_image
                                 .as_ref()
-                                .is_some_and(|prev| prev.as_raw() == img.as_raw())
+                                .is_some_and(|prev| prev.as_raw() == pooled.as_raw())
                         {
                             continue;
                         }
-                        let shared = Arc::new(img);
+                        let shared = Arc::new(pooled);
+                        let profile = Arc::new(stitch::FrameProfile::from_image_with_grid(
+                            &shared, grab_scale, grid,
+                        ));
                         last_grid = Some(grid);
                         last_image = Some(shared.clone());
                         let mut guard = grab_queue.0.lock().unwrap_or_else(|p| p.into_inner());
                         if guard.stop {
                             break;
                         }
-                        guard.push(shared, grid, Instant::now());
+                        guard.push(shared, profile, Instant::now());
                         grab_queue.1.notify_one();
                     }
                     LiveFrameWait::Timeout => {}
@@ -737,8 +884,8 @@ fn capture_loop(
             return Ok(None);
         }
         match pop_frame(&queue, Duration::from_millis(16)) {
-            QueuePop::Frame { image, .. } => {
-                if let Err(err) = accept_initial_frame(&mut stitcher, image) {
+            QueuePop::Frame { image, profile, .. } => {
+                if let Err(err) = accept_initial_frame(&mut stitcher, image, profile) {
                     grab.stop_and_join();
                     let _ = ready_tx.send(Err(format!("{err:#}")));
                     return Err(err);
@@ -752,7 +899,16 @@ fn capture_loop(
                         .and_then(|capturer| capturer.capture())
                     {
                         Ok(img) => {
-                            if let Err(err) = accept_initial_frame(&mut stitcher, Arc::new(img)) {
+                            let pooled = Arc::new(stitch::PooledImage::unpooled(img));
+                            let (w, h) = pooled.dimensions();
+                            let grid =
+                                stitch::sample_grid(pooled.as_raw(), w as usize, h as usize);
+                            let profile = Arc::new(stitch::FrameProfile::from_image_with_grid(
+                                &pooled,
+                                options.scale,
+                                grid,
+                            ));
+                            if let Err(err) = accept_initial_frame(&mut stitcher, pooled, profile) {
                                 grab.stop_and_join();
                                 let _ = ready_tx.send(Err(format!("{err:#}")));
                                 return Err(err);
@@ -807,12 +963,108 @@ fn capture_loop(
         options.auto_scroll_speed
     );
 
+    let initial_center = center.unwrap_or((0.0, 0.0));
+    let pulse_state = Arc::new((Mutex::new(PulseConfig::new(initial_center)), Condvar::new()));
+    let pulse_failed = Arc::new(AtomicBool::new(false));
+    let pulse_intervened = Arc::new(AtomicBool::new(false));
+    let pulse_backpressured = Arc::new(AtomicBool::new(false));
+    let pulse_thread = {
+        let pulse_state = pulse_state.clone();
+        let pulse_queue = queue.clone();
+        let pulse_failed = pulse_failed.clone();
+        let pulse_intervened = pulse_intervened.clone();
+        let pulse_backpressured = pulse_backpressured.clone();
+        thread::Builder::new()
+            .name("snapit-scroll-pulse".into())
+            .spawn(move || {
+                let mut was_enabled = false;
+                let mut next_pulse_at = Instant::now();
+                let mut last_pause_until = Instant::now();
+                loop {
+                    let snapshot_cfg = {
+                        let mut guard = pulse_state.0.lock().unwrap_or_else(|p| p.into_inner());
+                        loop {
+                            if guard.stop {
+                                return;
+                            }
+                            if !guard.enabled {
+                                was_enabled = false;
+                                guard =
+                                    pulse_state.1.wait(guard).unwrap_or_else(|p| p.into_inner());
+                                continue;
+                            }
+                            let now = Instant::now();
+                            if !was_enabled {
+                                was_enabled = true;
+                                last_pause_until = guard.pause_until;
+                                next_pulse_at = now.max(guard.pause_until);
+                            } else if guard.pause_until > last_pause_until {
+                                last_pause_until = guard.pause_until;
+                                next_pulse_at = next_pulse_at.max(guard.pause_until);
+                            }
+                            let due = next_pulse_at.max(guard.pause_until);
+                            if now >= due {
+                                break (
+                                    guard.direction,
+                                    guard.anchor,
+                                    guard.mac_px,
+                                    guard.win_notches,
+                                    guard.interval,
+                                    guard.grace_until,
+                                );
+                            }
+                            let (next_guard, _) = pulse_state
+                                .1
+                                .wait_timeout(guard, due.saturating_duration_since(now))
+                                .unwrap_or_else(|p| p.into_inner());
+                            guard = next_guard;
+                        }
+                    };
+                    let (direction, anchor, mac_px, win_notches, interval, grace_until) =
+                        snapshot_cfg;
+                    let stats = queue_stats(&pulse_queue);
+                    let Some((eff_mac_px, eff_win_notches, eff_interval)) =
+                        pace_pulse_for_queue(mac_px, win_notches, interval, stats.len, stats.capacity)
+                    else {
+                        pulse_backpressured.store(true, Ordering::Relaxed);
+                        next_pulse_at = Instant::now() + interval.max(Duration::from_millis(20));
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if now >= grace_until && scroller::user_intervened(anchor) {
+                        pulse_intervened.store(true, Ordering::Relaxed);
+                        let mut guard = pulse_state.0.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.enabled = false;
+                        continue;
+                    }
+                    if !scroller::post_scroll_at(
+                        direction,
+                        anchor.0,
+                        anchor.1,
+                        eff_mac_px,
+                        eff_win_notches,
+                    ) {
+                        pulse_failed.store(true, Ordering::Relaxed);
+                        let mut guard = pulse_state.0.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.enabled = false;
+                        continue;
+                    }
+                    next_pulse_at = Instant::now() + eff_interval;
+                }
+            })?
+    };
+    let mut pulser = PulseGuard {
+        state: pulse_state.clone(),
+        thread: Some(pulse_thread),
+    };
+
     macro_rules! capture_step {
         ($result:expr) => {
             match $result {
                 Ok(value) => value,
                 Err(error) => {
                     auto.stop();
+                    pulser.stop_and_join();
                     if let Some(guard) = input_guard.as_mut() {
                         guard.restore();
                     }
@@ -835,8 +1087,9 @@ fn capture_loop(
     let mut discard_requested = false;
     let mut pending_preview_range: Option<(u32, u32, bool)> = None;
     let mut pending_annotation_origin: Option<i64> = None;
-    let mut last_frame: Option<Arc<RgbaImage>> = None;
+    let mut last_frame: Option<(Arc<stitch::PooledImage>, Arc<stitch::FrameProfile>)> = None;
     let mut last_preview_at = Instant::now();
+    let mut consecutive_too_fast: u32 = 0;
 
     loop {
         let mut commands_open = true;
@@ -869,13 +1122,24 @@ fn capture_loop(
                                     false,
                                 )
                                 .eval_window;
-                            auto.next_pulse_at = now + Duration::from_millis(60);
-                            auto.pause_pulses_until = now;
+                            auto.pause_pulses_until = now + Duration::from_millis(60);
                             auto.next_eval_at = now + Duration::from_millis(60) + eval_window;
                             auto.grace_until = now + Duration::from_millis(150);
                             warning = None;
+                            consecutive_too_fast = 0;
                             paused = false;
+                            paused_flag.store(false, Ordering::Relaxed);
                             status = ScrollStatus::AutoScrolling;
+                            pulse_failed.store(false, Ordering::Relaxed);
+                            pulse_intervened.store(false, Ordering::Relaxed);
+                            pulse_backpressured.store(false, Ordering::Relaxed);
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             log::info!(
                                 "scroll auto-scroll enabled direction={:?} at {:?}",
                                 auto.direction,
@@ -883,6 +1147,13 @@ fn capture_loop(
                             );
                         } else {
                             auto.stop();
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             if let Some(guard) = input_guard.as_mut() {
                                 guard.restore();
                             }
@@ -906,8 +1177,16 @@ fn capture_loop(
                     }
                     ScrollCommand::SetPaused(p) => {
                         paused = p;
+                        paused_flag.store(paused, Ordering::Relaxed);
                         if paused {
                             auto.stop();
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             if let Some(guard) = input_guard.as_mut() {
                                 guard.restore();
                             }
@@ -949,16 +1228,26 @@ fn capture_loop(
                         auto.stop();
                         auto.direction = ScrollDirection::Down;
                         auto.reset_step();
+                        pulse_backpressured.store(false, Ordering::Relaxed);
+                        sync_pulser(
+                            &pulse_state,
+                            &auto,
+                            stitcher.active_height(),
+                            options.scale,
+                            options.auto_scroll_speed,
+                        );
                         if let Some(guard) = input_guard.as_mut() {
                             guard.restore();
                         }
                         warning = None;
+                        consecutive_too_fast = 0;
                         paused = false;
+                        paused_flag.store(false, Ordering::Relaxed);
                         pause_frame = None;
                         status = ScrollStatus::Capturing;
                         stitcher = Stitcher::new(stitch_cfg);
-                        if let Some(frame) = last_frame.clone() {
-                            stitcher.feed_shared(frame, true);
+                        if let Some((frame, profile)) = last_frame.clone() {
+                            stitcher.feed_profile(frame, profile, true);
                         }
                         stitcher.set_preview_range_with_follow(
                             0,
@@ -991,17 +1280,19 @@ fn capture_loop(
             && !discard_requested
         {
             stitcher.set_preview_range_with_follow(start, rows, follow);
-            capture_step!(stitcher.refresh_preview());
-            last_preview_at = Instant::now();
-            publish_snapshot(
-                &snapshot_slot,
-                &stitcher,
-                status,
-                warning,
-                &auto,
-                paused,
-                (pause_frame.as_ref(), pause_revision),
-            );
+            if !follow || last_preview_at.elapsed() >= PREVIEW_REFRESH_INTERVAL {
+                capture_step!(stitcher.refresh_preview());
+                last_preview_at = Instant::now();
+                publish_snapshot(
+                    &snapshot_slot,
+                    &stitcher,
+                    status,
+                    warning,
+                    &auto,
+                    paused,
+                    (pause_frame.as_ref(), pause_revision),
+                );
+            }
         }
 
         if let Some(origin) = pending_annotation_origin.take()
@@ -1025,7 +1316,8 @@ fn capture_loop(
         }
 
         if !commands_open {
-            auto.enabled = false;
+            auto.stop();
+            pulser.stop_and_join();
             if let Some(guard) = input_guard.as_mut() {
                 guard.restore();
             }
@@ -1033,17 +1325,30 @@ fn capture_loop(
         }
 
         if discard_requested {
+            auto.stop();
+            pulser.stop_and_join();
             grab.stop_and_join();
             return Ok(None);
         }
         if finish_requested {
+            auto.stop();
+            pulser.stop_and_join();
             break;
         }
 
         if auto.enabled {
             let now = Instant::now();
-            if now >= auto.grace_until && scroller::user_intervened(auto.anchor) {
+            if pulse_intervened.swap(false, Ordering::Relaxed)
+                || (now >= auto.grace_until && scroller::user_intervened(auto.anchor))
+            {
                 auto.stop();
+                sync_pulser(
+                    &pulse_state,
+                    &auto,
+                    stitcher.active_height(),
+                    options.scale,
+                    options.auto_scroll_speed,
+                );
                 if let Some(guard) = input_guard.as_mut() {
                     guard.restore();
                 }
@@ -1058,52 +1363,41 @@ fn capture_loop(
                     paused,
                     (pause_frame.as_ref(), pause_revision),
                 );
+            } else if pulse_failed.swap(false, Ordering::Relaxed) {
+                auto.stop();
+                sync_pulser(
+                    &pulse_state,
+                    &auto,
+                    stitcher.active_height(),
+                    options.scale,
+                    options.auto_scroll_speed,
+                );
+                if let Some(guard) = input_guard.as_mut() {
+                    guard.restore();
+                }
+                status = ScrollStatus::Capturing;
+                publish_snapshot(
+                    &snapshot_slot,
+                    &stitcher,
+                    status,
+                    warning,
+                    &auto,
+                    paused,
+                    (pause_frame.as_ref(), pause_revision),
+                );
             } else {
-                let (queue_len, _, _) = queue_stats(&queue);
-                let queue_empty = queue_len == 0;
+                let stats = queue_stats(&queue);
+                let queue_empty = stats.len == 0;
+                if pulse_backpressured.swap(false, Ordering::Relaxed) {
+                    auto.note_backpressure();
+                }
                 let step = options.auto_scroll_speed.plan_continuous(
                     stitcher.active_height(),
                     options.scale,
                     auto.gain,
                     auto.rewinding,
                 );
-                if now >= auto.pause_pulses_until && now >= auto.next_pulse_at {
-                    if queue_len >= AUTO_SCROLL_QUEUE_BACKPRESSURE {
-                        auto.next_pulse_at = now + Duration::from_millis(16);
-                    } else {
-                        let pulse_dir = if auto.rewinding {
-                            auto.direction.opposite()
-                        } else {
-                            auto.direction
-                        };
-                        if !scroller::post_scroll_at(
-                            pulse_dir,
-                            auto.anchor.0,
-                            auto.anchor.1,
-                            step.mac_px,
-                            step.win_notches,
-                        ) {
-                            auto.stop();
-                            if let Some(guard) = input_guard.as_mut() {
-                                guard.restore();
-                            }
-                            status = ScrollStatus::Capturing;
-                            publish_snapshot(
-                                &snapshot_slot,
-                                &stitcher,
-                                status,
-                                warning,
-                                &auto,
-                                paused,
-                                (pause_frame.as_ref(), pause_revision),
-                            );
-                        } else {
-                            auto.next_pulse_at = now + step.platform_interval();
-                        }
-                    }
-                }
-                if auto.enabled
-                    && now >= auto.next_eval_at
+                if now >= auto.next_eval_at
                     && (queue_empty || now >= auto.next_eval_at + SETTLE_DRAIN_CAP)
                 {
                     if (warning.is_some() || auto.window_displacement.unsigned_abs() < 2)
@@ -1164,15 +1458,6 @@ fn capture_loop(
                             );
                         }
                     }
-                    publish_snapshot(
-                        &snapshot_slot,
-                        &stitcher,
-                        status,
-                        warning,
-                        &auto,
-                        paused,
-                        (pause_frame.as_ref(), pause_revision),
-                    );
                     if auto.enabled {
                         auto.begin_step();
                         let next_step = options.auto_scroll_speed.plan_continuous(
@@ -1183,6 +1468,22 @@ fn capture_loop(
                         );
                         auto.next_eval_at = now + next_step.eval_window;
                     }
+                    sync_pulser(
+                        &pulse_state,
+                        &auto,
+                        stitcher.active_height(),
+                        options.scale,
+                        options.auto_scroll_speed,
+                    );
+                    publish_snapshot(
+                        &snapshot_slot,
+                        &stitcher,
+                        status,
+                        warning,
+                        &auto,
+                        paused,
+                        (pause_frame.as_ref(), pause_revision),
+                    );
                 }
             }
         }
@@ -1190,18 +1491,18 @@ fn capture_loop(
         match pop_frame(&queue, POLL_TIMEOUT) {
             QueuePop::Frame {
                 image,
-                grid,
+                profile,
                 queue_empty,
                 dropped,
                 max_depth,
             } => {
-                last_frame = Some(image.clone());
+                last_frame = Some((image.clone(), profile.clone()));
                 if paused {
                     continue;
                 }
                 let refresh_now =
                     queue_empty && last_preview_at.elapsed() >= PREVIEW_REFRESH_INTERVAL;
-                match stitcher.feed_shared_with_grid(image, grid, refresh_now) {
+                match stitcher.feed_profile(image, profile, refresh_now) {
                     FeedOutcome::Initial | FeedOutcome::Unchanged => {}
                     FeedOutcome::Moved { dy } => {
                         if refresh_now {
@@ -1212,6 +1513,13 @@ fn capture_loop(
                         let took_over = auto.observe_motion(dy, stitcher.direction());
                         if took_over {
                             auto.stop();
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             if let Some(guard) = input_guard.as_mut() {
                                 guard.restore();
                             }
@@ -1220,7 +1528,6 @@ fn capture_loop(
                         } else if was_rewinding && !auto.rewinding {
                             let resume = Instant::now() + Duration::from_millis(120);
                             auto.pause_pulses_until = resume;
-                            auto.next_pulse_at = resume;
                             let eval_window = options
                                 .auto_scroll_speed
                                 .plan_continuous(
@@ -1231,6 +1538,13 @@ fn capture_loop(
                                 )
                                 .eval_window;
                             auto.next_eval_at = resume + eval_window;
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             log::info!(
                                 "scroll auto-scroll recovered from rewind (dy={dy}, gain={:.2})",
                                 auto.gain
@@ -1242,6 +1556,7 @@ fn capture_loop(
                             status = ScrollStatus::Capturing;
                         }
                         warning = None;
+                        consecutive_too_fast = 0;
                         publish_snapshot(
                             &snapshot_slot,
                             &stitcher,
@@ -1261,6 +1576,13 @@ fn capture_loop(
                         let took_over = auto.observe_motion(dy, stitcher.direction());
                         if took_over {
                             auto.stop();
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             if let Some(guard) = input_guard.as_mut() {
                                 guard.restore();
                             }
@@ -1269,7 +1591,6 @@ fn capture_loop(
                         } else if was_rewinding && !auto.rewinding {
                             let resume = Instant::now() + Duration::from_millis(120);
                             auto.pause_pulses_until = resume;
-                            auto.next_pulse_at = resume;
                             let eval_window = options
                                 .auto_scroll_speed
                                 .plan_continuous(
@@ -1280,6 +1601,13 @@ fn capture_loop(
                                 )
                                 .eval_window;
                             auto.next_eval_at = resume + eval_window;
+                            sync_pulser(
+                                &pulse_state,
+                                &auto,
+                                stitcher.active_height(),
+                                options.scale,
+                                options.auto_scroll_speed,
+                            );
                             log::info!(
                                 "scroll auto-scroll recovered from rewind (dy={dy}, gain={:.2})",
                                 auto.gain
@@ -1291,6 +1619,7 @@ fn capture_loop(
                             status = ScrollStatus::Capturing;
                         }
                         warning = None;
+                        consecutive_too_fast = 0;
                         log::debug!("scroll stitched dy={dy} height={total_height}");
                         publish_snapshot(
                             &snapshot_slot,
@@ -1304,10 +1633,22 @@ fn capture_loop(
                     }
                     FeedOutcome::Warning(warn) => {
                         if warn == ScrollWarning::TooFast {
-                            auto.brake_for_too_fast(
-                                Instant::now(),
-                                warning == Some(ScrollWarning::TooFast),
-                            );
+                            consecutive_too_fast = consecutive_too_fast.saturating_add(1);
+                            if consecutive_too_fast >= 2 {
+                                auto.brake_for_too_fast(
+                                    Instant::now(),
+                                    warning == Some(ScrollWarning::TooFast),
+                                );
+                                sync_pulser(
+                                    &pulse_state,
+                                    &auto,
+                                    stitcher.active_height(),
+                                    options.scale,
+                                    options.auto_scroll_speed,
+                                );
+                            }
+                        } else {
+                            consecutive_too_fast = 0;
                         }
                         if warning != Some(warn) {
                             log::info!(
@@ -1335,6 +1676,7 @@ fn capture_loop(
                             actual.1
                         );
                         auto.stop();
+                        pulser.stop_and_join();
                         if let Some(guard) = input_guard.as_mut() {
                             guard.restore();
                         }
@@ -1352,6 +1694,7 @@ fn capture_loop(
                     FeedOutcome::Failed(error) => {
                         let error = anyhow!("scroll canvas I/O failed: {error}");
                         auto.stop();
+                        pulser.stop_and_join();
                         if let Some(guard) = input_guard.as_mut() {
                             guard.restore();
                         }
@@ -1416,7 +1759,9 @@ fn capture_loop(
         }
     }
 
-    let (_, dropped, max_depth) = queue_stats(&queue);
+    let QueueStats {
+        dropped, max_depth, ..
+    } = queue_stats(&queue);
     grab.stop_and_join();
     capture_step!(stitcher.flush_pending());
     let content_shift = stitcher.content_shift();
@@ -1432,8 +1777,12 @@ fn capture_loop(
     Ok(image.map(|image| (image, content_shift)))
 }
 
-fn accept_initial_frame(stitcher: &mut Stitcher, image: Arc<RgbaImage>) -> Result<()> {
-    match stitcher.feed_shared(image, true) {
+fn accept_initial_frame(
+    stitcher: &mut Stitcher,
+    image: Arc<stitch::PooledImage>,
+    profile: Arc<stitch::FrameProfile>,
+) -> Result<()> {
+    match stitcher.feed_profile(image, profile, true) {
         FeedOutcome::Initial => Ok(()),
         FeedOutcome::Failed(error) => Err(anyhow!("scroll canvas I/O failed: {error}")),
         outcome => Err(anyhow!("unexpected initial frame outcome: {outcome:?}")),
@@ -1667,12 +2016,23 @@ mod tests {
     fn frame_queue_thins_interior_frames_with_minimum_gap() {
         let mut q = FrameQueue::new();
         // ~400 KiB per frame -> capacity clamps to MAX_FRAME_BUFFER_CAPACITY (64)
-        let mk_img = |v: u8| Arc::new(RgbaImage::from_pixel(320, 320, image::Rgba([v, 0, 0, 255])));
+        let mk_img = |v: u8| {
+            Arc::new(stitch::PooledImage::unpooled(RgbaImage::from_pixel(
+                320,
+                320,
+                image::Rgba([v, 0, 0, 255]),
+            )))
+        };
+        let dummy_profile = Arc::new(stitch::FrameProfile::from_image_with_grid(
+            &mk_img(0),
+            1.0,
+            [0; 64],
+        ));
         let t0 = Instant::now();
         for i in 0..80u8 {
             q.push(
                 mk_img(i),
-                [0; 64],
+                dummy_profile.clone(),
                 t0 + Duration::from_millis(u64::from(i) * 16),
             );
         }
@@ -1777,5 +2137,60 @@ mod tests {
             AutoScrollSettlement::Continue
         );
         assert!(state.gain > 1.0, "gain={}", state.gain);
+    }
+
+    #[test]
+    fn pace_pulse_for_queue_slows_smoothly_and_pauses_before_overflow() {
+        let base_interval = Duration::from_millis(16);
+        for len in 0..=2 {
+            assert_eq!(
+                pace_pulse_for_queue(20, 2, base_interval, len, 8),
+                Some((20, 2, base_interval))
+            );
+        }
+
+        let (px3, notches3, iv3) = pace_pulse_for_queue(20, 2, base_interval, 3, 8).unwrap();
+        assert_eq!(px3, 20);
+        assert_eq!(notches3, 2);
+        assert!(iv3 > base_interval);
+
+        assert_eq!(pace_pulse_for_queue(20, 2, base_interval, 4, 8), None);
+        assert_eq!(pace_pulse_for_queue(20, 2, base_interval, 6, 8), None);
+
+        for capacity in [4, 5] {
+            let (px2, notches2, iv2) =
+                pace_pulse_for_queue(20, 2, base_interval, 2, capacity).unwrap();
+            assert_eq!(px2, 20);
+            assert_eq!(notches2, 2);
+            assert!(iv2 > base_interval);
+            assert_eq!(pace_pulse_for_queue(20, 2, base_interval, 3, capacity), None);
+        }
+
+        assert_eq!(
+            pace_pulse_for_queue(20, 2, base_interval, 0, 3),
+            Some((20, 2, base_interval))
+        );
+        let (px1, notches1, iv1) = pace_pulse_for_queue(20, 2, base_interval, 1, 3).unwrap();
+        assert_eq!(px1, 20);
+        assert_eq!(notches1, 2);
+        assert!(iv1 > base_interval);
+        assert_eq!(pace_pulse_for_queue(20, 2, base_interval, 2, 3), None);
+    }
+
+    #[test]
+    fn backpressure_prevents_gain_windup_on_undershoot() {
+        let mut state = auto();
+        state.enabled = true;
+        state.note_backpressure();
+        state.observe_motion(40, ScrollDirection::Down);
+        assert_eq!(
+            state.settle(None, 500, 260.0),
+            AutoScrollSettlement::Continue
+        );
+        assert!(
+            (state.gain - 1.0).abs() < 1e-4,
+            "expected gain to hold steady under backpressure, got {}",
+            state.gain
+        );
     }
 }

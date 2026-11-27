@@ -4,8 +4,8 @@ use anyhow::{Context as _, Result, ensure};
 use snapit_capture::DiskImage;
 
 const SEGMENT_ROWS: u32 = 512;
-const HOT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
-const CACHE_BYTES: usize = 32 * 1024 * 1024;
+const HOT_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const CACHE_BYTES: usize = 48 * 1024 * 1024;
 const CACHE_ROWS: u32 = 256;
 
 #[derive(Clone)]
@@ -36,6 +36,7 @@ pub struct PagedRows {
     top: i64,
     rows: u32,
     memory_bytes: usize,
+    hot_memory_bytes: usize,
     cache: VecDeque<CachedRows>,
     cache_bytes: usize,
     next_id: u64,
@@ -43,12 +44,17 @@ pub struct PagedRows {
 
 impl PagedRows {
     pub fn new(width: u32) -> Self {
+        Self::with_hot_memory_bytes(width, HOT_MEMORY_BYTES)
+    }
+
+    pub(crate) fn with_hot_memory_bytes(width: u32, hot_memory_bytes: usize) -> Self {
         Self {
             width,
             segments: Vec::new(),
             top: 0,
             rows: 0,
             memory_bytes: 0,
+            hot_memory_bytes,
             cache: VecDeque::new(),
             cache_bytes: 0,
             next_id: 1,
@@ -231,7 +237,7 @@ impl PagedRows {
     }
 
     fn spill_cold_segments(&mut self, prefer_keep_front: bool) -> Result<()> {
-        while self.memory_bytes > HOT_MEMORY_BYTES {
+        while self.memory_bytes > self.hot_memory_bytes {
             let len = self.segments.len();
             let idx = if prefer_keep_front {
                 (1..len)
@@ -657,8 +663,8 @@ mod tests {
     fn small_downward_appends_coalesce_and_spill_cold_segments_to_disk() {
         let width = 1024u32;
         let stride = width as usize * 4;
-        let mut rows = PagedRows::new(width);
-        // 160 * 30 = 4800 rows * 4096 bytes ~= 19.6 MiB > HOT_MEMORY_BYTES (16 MiB).
+        let mut rows = PagedRows::with_hot_memory_bytes(width, 16 * 1024 * 1024);
+        // 160 * 30 = 4800 rows * 4096 bytes ~= 19.6 MiB > hot_memory_bytes (16 MiB).
         for step in 0..30u32 {
             let mut batch = Vec::with_capacity(160 * stride);
             for local_y in 0..160u32 {
@@ -670,7 +676,7 @@ mod tests {
             rows.append_down((step * 160) as i32, &batch).unwrap();
             assert!(rows.cached_bytes() <= CACHE_BYTES);
         }
-        assert!(rows.memory_bytes <= HOT_MEMORY_BYTES);
+        assert!(rows.memory_bytes <= rows.hot_memory_bytes);
         assert!(
             rows.segments
                 .iter()
@@ -691,7 +697,7 @@ mod tests {
     fn overwrite_and_read_across_spilled_disk_and_hot_memory_segments() {
         let width = 1024u32;
         let stride = width as usize * 4;
-        let mut rows = PagedRows::new(width);
+        let mut rows = PagedRows::with_hot_memory_bytes(width, 16 * 1024 * 1024);
         for step in 0..25u32 {
             let batch = vec![(step % 200) as u8; 200 * stride];
             rows.append_down((step * 200) as i32, &batch).unwrap();

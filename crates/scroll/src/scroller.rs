@@ -46,9 +46,9 @@ impl ScrollSpeed {
 
     pub(crate) fn target_viewports_per_sec(self) -> f32 {
         match self {
-            Self::Slow => 1.5,
-            Self::Medium => 4.0,
-            Self::Fast => 8.5,
+            Self::Slow => 1.0,
+            Self::Medium => 1.8,
+            Self::Fast => 3.0,
         }
     }
 
@@ -125,9 +125,9 @@ impl ScrollSpeed {
             1.0
         };
         let active_pt = (active_h_px as f32 / scale).max(64.0);
-        let gain = gain.clamp(0.10, 4.5);
+        let gain = gain.clamp(0.10, 2.5);
         let vps = if rewind {
-            1.8
+            1.2
         } else {
             self.target_viewports_per_sec()
         };
@@ -145,13 +145,13 @@ impl ScrollSpeed {
             20.0_f32
         } else {
             match self {
-                Self::Slow => 24.0,
-                Self::Medium => 12.0,
-                Self::Fast => 8.0,
+                Self::Slow => 16.0,
+                Self::Medium => 16.0,
+                Self::Fast => 12.0,
             }
         };
         let raw_px = active_pt * vps * gain * (mac_base_ms / 1000.0);
-        let max_px = (active_pt * 0.45).max(8.0);
+        let max_px = (active_pt * 0.25).max(8.0);
         let (mac_px, mac_interval) = if raw_px < 8.0 {
             let ms = (mac_base_ms * (8.0 / raw_px.max(1.0)))
                 .round()
@@ -168,13 +168,13 @@ impl ScrollSpeed {
             36.0_f32
         } else {
             match self {
-                Self::Slow => 56.0,
-                Self::Medium => 28.0,
-                Self::Fast => 16.0,
+                Self::Slow => 64.0,
+                Self::Medium => 36.0,
+                Self::Fast => 24.0,
             }
         };
         let raw_notches = (active_pt * vps / 60.0) * gain * (win_base_ms / 1000.0);
-        let max_notches = ((active_pt * 0.45) / 60.0).ceil().clamp(1.0, 8.0) as i32;
+        let max_notches = ((active_pt * 0.25) / 60.0).ceil().clamp(1.0, 6.0) as i32;
         let (win_notches, win_interval) = if raw_notches < 1.0 {
             let ms = (win_base_ms / raw_notches.max(0.15))
                 .round()

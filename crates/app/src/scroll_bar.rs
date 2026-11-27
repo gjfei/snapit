@@ -599,9 +599,36 @@ struct CachedPreviewTile {
     revision: u64,
     source_start: u32,
     source_rows: u32,
+    total_height: u32,
     image: Arc<RgbaImage>,
     render: Arc<RenderImage>,
     width: u32,
+}
+
+fn preview_display_height(tile: Option<&CachedPreviewTile>, snap_height: u32) -> u32 {
+    tile.map_or(snap_height, |tile| {
+        tile.total_height
+            .max(tile.source_start.saturating_add(tile.source_rows))
+    })
+    .min(snap_height)
+    .max(1)
+}
+
+fn desired_preview_request(
+    follow_live: bool,
+    target_top: f32,
+    viewport_height: f32,
+    logical_per_source: f32,
+    display_height: u32,
+) -> (u32, u32, bool) {
+    if follow_live {
+        let viewport_rows = (viewport_height / logical_per_source).ceil().max(1.0) as u32;
+        (0, viewport_rows.saturating_mul(3).max(1), true)
+    } else {
+        let (start, rows) =
+            preview_tile_range(target_top, viewport_height, logical_per_source, display_height);
+        (start, rows, false)
+    }
 }
 
 fn scroll_top(handle: &ScrollHandle) -> f32 {
@@ -681,6 +708,7 @@ pub struct ScrollPreview {
     tile: Option<CachedPreviewTile>,
     last_revision: u64,
     last_height: u32,
+    display_height: u32,
     last_content_shift: u32,
     last_frames: usize,
     last_viewport_origin_y: i64,
@@ -708,6 +736,7 @@ impl ScrollPreview {
             tile: None,
             last_revision: 0,
             last_height: 0,
+            display_height: 1,
             last_content_shift: 0,
             last_frames: 0,
             last_viewport_origin_y: 0,
@@ -747,6 +776,31 @@ impl ScrollPreview {
         if snap.height == 0 || snap.width == 0 {
             return;
         }
+        let reset = snap.frames < self.last_frames;
+        if reset {
+            self.tile = None;
+            self.last_revision = 0;
+            self.last_height = 0;
+            self.display_height = 1;
+            self.follow_live = true;
+        }
+        if snap.preview_revision != self.last_revision
+            && let Some(preview) = &snap.preview
+        {
+            let (width, _) = preview.image.dimensions();
+            self.tile = Some(CachedPreviewTile {
+                revision: preview.revision,
+                source_start: preview.source_start,
+                source_rows: preview.source_rows,
+                total_height: preview.total_height,
+                image: preview.image.clone(),
+                render: session::render_image(&preview.image),
+                width,
+            });
+            self.last_revision = snap.preview_revision;
+        }
+
+        let display_height = preview_display_height(self.tile.as_ref(), snap.height);
         let content_w = self.content_width();
         let logical_per_source = content_w / snap.width as f32;
         let outer_viewport_h = self
@@ -769,15 +823,13 @@ impl ScrollPreview {
             };
         }
 
-        let reset = snap.frames < self.last_frames;
         let target_top = if reset {
-            self.follow_live = true;
             0.0
         } else if self.follow_live {
             synced_preview_offset(
                 snap.viewport_origin_y,
                 snap.frame_height.max(1),
-                snap.height,
+                display_height,
                 snap.direction,
                 inner_viewport_h,
                 logical_per_source,
@@ -786,7 +838,7 @@ impl ScrollPreview {
             anchored_preview_offset(
                 current_top,
                 self.last_height,
-                snap.height,
+                display_height,
                 i64::from(snap.content_shift) - i64::from(self.last_content_shift),
                 snap.direction,
                 inner_viewport_h,
@@ -798,39 +850,29 @@ impl ScrollPreview {
         }
         self.last_applied_top = target_top;
         self.last_seen_scroll_top.set(target_top);
-        self.last_height = snap.height;
+        self.last_height = display_height;
+        self.display_height = display_height;
         self.last_content_shift = snap.content_shift;
         self.last_frames = snap.frames;
         self.last_viewport_origin_y = snap.viewport_origin_y;
 
-        let (start, rows) = preview_tile_range(
+        let next_request = desired_preview_request(
+            self.follow_live,
             target_top,
             inner_viewport_h,
             logical_per_source,
-            snap.height,
+            display_height,
         );
-        if reset || self.requested_range != (start, rows, self.follow_live) {
-            self.requested_range = (start, rows, self.follow_live);
+        if reset || self.requested_range != next_request {
+            self.requested_range = next_request;
             self.controller.update(cx, |controller, _| {
-                controller.set_scroll_preview_range_with_follow(start, rows, self.follow_live)
+                controller.set_scroll_preview_range_with_follow(
+                    next_request.0,
+                    next_request.1,
+                    next_request.2,
+                )
             });
         }
-        if snap.preview_revision == self.last_revision {
-            return;
-        }
-        let Some(preview) = &snap.preview else {
-            return;
-        };
-        let (width, _) = preview.image.dimensions();
-        self.tile = Some(CachedPreviewTile {
-            revision: preview.revision,
-            source_start: snap.preview_range.0,
-            source_rows: snap.preview_range.1,
-            image: preview.image.clone(),
-            render: session::render_image(&preview.image),
-            width,
-        });
-        self.last_revision = snap.preview_revision;
     }
 }
 
@@ -871,7 +913,11 @@ impl Render for ScrollPreview {
             .map(|(info, _)| info.label.clone())
             .unwrap_or_else(|| t!("scroll.preview_title").to_string());
         let image_width = snap.as_ref().map_or(1, |snapshot| snapshot.width.max(1));
-        let image_height = snap.as_ref().map_or(1, |snapshot| snapshot.height.max(1));
+        let image_height = if self.tile.is_some() {
+            self.display_height
+        } else {
+            snap.as_ref().map_or(1, |snapshot| snapshot.height.max(1))
+        };
         let tile = self.tile.clone();
         let canvas_bounds = self.canvas_bounds.clone();
         let viewport_height = self.viewport_height.clone();
@@ -1261,5 +1307,32 @@ mod tests {
             synced_preview_offset(300, 500, 1500, ScrollDirection::Up, 200.0, 0.5),
             150.0
         );
+    }
+
+    #[test]
+    fn preview_display_height_tracks_rendered_tile_without_bottom_gap() {
+        let tile = CachedPreviewTile {
+            revision: 1,
+            source_start: 400,
+            source_rows: 800,
+            total_height: 1200,
+            image: Arc::new(RgbaImage::new(1, 1)),
+            render: session::render_image(&RgbaImage::new(1, 1)),
+            width: 1,
+        };
+        assert_eq!(preview_display_height(Some(&tile), 1560), 1200);
+        assert_eq!(preview_display_height(Some(&tile), 1100), 1100);
+        assert_eq!(preview_display_height(None, 1560), 1560);
+    }
+
+    #[test]
+    fn follow_live_preview_request_stays_stable_as_height_grows() {
+        let first = desired_preview_request(true, 100.0, 300.0, 0.5, 1200);
+        let second = desired_preview_request(true, 450.0, 300.0, 0.5, 2400);
+        assert_eq!(first, second);
+        assert!(first.2);
+        let manual = desired_preview_request(false, 450.0, 300.0, 0.5, 2400);
+        assert!(!manual.2);
+        assert_ne!(manual.0, 0);
     }
 }

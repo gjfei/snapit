@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result, anyhow};
 pub use image::RgbaImage;
 use image::{ImageEncoder as _, imageops};
 use xcap::Monitor;
-pub use xcap::{DynamicRange, HdrImage, OutputSize};
+pub use xcap::{DynamicRange, FrameBufferPool, HdrImage, OutputSize};
 
 mod atomic;
 mod disk_image;
@@ -555,8 +555,31 @@ impl LiveRecorder {
         output_size: OutputSize,
         dynamic_range: DynamicRange,
     ) -> Result<Self> {
+        Self::start_with_tuning(
+            monitor_id,
+            region,
+            fps,
+            captures_cursor,
+            output_size,
+            dynamic_range,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_tuning(
+        monitor_id: u32,
+        region: Region,
+        fps: u32,
+        captures_cursor: bool,
+        output_size: OutputSize,
+        dynamic_range: DynamicRange,
+        channel_capacity: Option<usize>,
+        buffer_pool: Option<FrameBufferPool>,
+    ) -> Result<Self> {
         let (monitor, region) = resolve_region(monitor_id, region)?;
-        let options = xcap::VideoRecorderOptions::default()
+        let mut options = xcap::VideoRecorderOptions::default()
             .fps(fps)
             .region(xcap::CaptureRegion {
                 x: region.x as u32,
@@ -570,6 +593,12 @@ impl LiveRecorder {
             .excludes_own_windows(true)
             .output_size(output_size)
             .dynamic_range(dynamic_range);
+        if let Some(capacity) = channel_capacity {
+            options = options.channel_capacity(capacity);
+        }
+        if let Some(pool) = buffer_pool {
+            options = options.buffer_pool(pool);
+        }
         let (recorder, frames) = monitor.video_recorder_with_options(options)?;
         recorder.start()?;
         Ok(Self { recorder, frames })
