@@ -30,7 +30,7 @@ sys-locale.workspace = true
 tiny-skia = "0.12"
 fontdue = "0.9"
 global-hotkey = "0.10"
-tray-icon = { version = "0.26", default-features = false }
+tray-icon = { version = "0.27", default-features = false }
 auto-launch = "0.6"
 
 # Embeds `assets/snapit.ico` as resource 1, which gpui-pre-windows loads as the

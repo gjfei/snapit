@@ -50,7 +50,7 @@ Diagnostic logging: `crates/app/src/logging.rs` is the app's single global `log:
 
 ## Hard invariants
 
-- **gpui-kit `=0.9.1`** in the workspace `Cargo.toml`. It pins GPUI (`gpui-pre` 0.3.12). Do not float the version.
+- **gpui-kit `=0.11.0`** in the workspace `Cargo.toml`. It pins GPUI (`gpui-pre` 0.3.14). Do not float the version.
 - **Rust 1.99.1** via `rust-toolchain.toml` (edition 2024).
 - **Log every capture/record decision point.** Real users (and CI on other OSes) have no console, so diagnosis is post-mortem from `logs/snapit.log`. Any new branch that can change what pixels/format get captured or saved — HDR candidate selection, platform capture fallback, highlight decision, export veto, sink selection — must emit a `log::info!` (or `warn!` on failure) with the deciding values. Do not reintroduce temporary `/tmp` probe files; use the persistent logger with its automatic `[cap#N]`/`[rec#N]` tag.
 - **BGRA for `RenderImage`.** Captures are RGBA; `session::render_image` swaps R/B before GPUI. Reuse that helper; do not feed RGBA frames to `img()`.

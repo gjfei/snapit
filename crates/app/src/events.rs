@@ -12,6 +12,8 @@
 //! has no notification mechanism, so `instance.rs` still polls and then posts
 //! onto this same bus.
 
+use std::sync::Arc;
+
 use futures::StreamExt as _;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
@@ -66,9 +68,9 @@ pub(crate) fn install() -> (Events, UnboundedReceiver<AppEvent>) {
     }));
 
     let menus = events.clone();
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+    MenuEvent::set_event_handler(Some(Arc::new(move |event: MenuEvent| {
         menus.send(AppEvent::TrayMenu(event.id.as_ref().to_owned()));
-    }));
+    })));
 
     (events, receiver)
 }

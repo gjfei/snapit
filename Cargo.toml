@@ -27,7 +27,7 @@ snapit-ocr = { path = "crates/ocr" }
 snapit-store = { path = "crates/store" }
 
 # gpui-kit pins the exact GPUI snapshot it was released against; keep this exact.
-gpui-kit = "=0.9.1"
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["component", "assets"] }
 
 anyhow = "1"
 futures = "0.3"
