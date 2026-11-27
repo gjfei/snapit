@@ -177,6 +177,14 @@ impl ExportComposition {
             .unwrap_or_else(|| self.clean_sdr.dimensions())
     }
 
+    pub(crate) fn hdr_source(&self) -> Option<&Arc<HdrImage>> {
+        self.hdr_source.as_ref()
+    }
+
+    pub(crate) fn shapes(&self) -> &Arc<Vec<Shape>> {
+        &self.shapes
+    }
+
     pub fn result(&self) -> std::result::Result<Arc<ExportResult>, String> {
         let _serial = self
             .result_lock

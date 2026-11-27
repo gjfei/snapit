@@ -77,6 +77,7 @@ actions!(
         ScrollCapture,
         RecordAnimation,
         RecordVideo,
+        EditSelection,
         UndoAnnotations,
         ClearAnnotations,
         SelectFullScreen,
@@ -92,6 +93,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", ConfirmSelection, Some(CONTEXT)),
         KeyBinding::new("f", SelectFullScreen, Some(CONTEXT)),
         KeyBinding::new("c", CopyColor, Some(CONTEXT)),
+        KeyBinding::new("e", EditSelection, Some(CONTEXT)),
         KeyBinding::new(crate::shortcut!("c"), CopySelection, Some(CONTEXT)),
         KeyBinding::new(crate::shortcut!("s"), SaveSelection, Some(CONTEXT)),
         KeyBinding::new(crate::shortcut!("z"), UndoAnnotations, Some(CONTEXT)),
@@ -235,9 +237,9 @@ pub struct OverlayView {
 const TOOLBAR_HEIGHT: f32 = 36.;
 const STYLE_ROW_HEIGHT: f32 = 38.;
 /// Estimate of the one-row toolbar (seven annotation tools, scroll capture, two
-/// record buttons and the capture actions), used to right-align it and keep it
-/// inside the viewport.
-const TOOLBAR_WIDTH: f32 = 509.;
+/// record buttons, crop/edit popup and the capture actions), used to
+/// right-align it and keep it inside the viewport.
+const TOOLBAR_WIDTH: f32 = 541.;
 const TOOLBAR_GAP: f32 = 8.;
 
 /// The frozen region's pixels and the block colours sampled from them, kept
@@ -1562,6 +1564,18 @@ impl OverlayView {
                                     },
                                 )),
                             )
+                            .child(
+                                capture_toolbar::toolbar_button(
+                                    "edit-selection",
+                                    LucideIcon::Crop,
+                                    t!("overlay.edit").to_string(),
+                                    false,
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.request(SessionCommand::Edit, cx),
+                                )),
+                            )
                             .content(capture_toolbar::toolbar_divider(&theme))
                             .map(|toolbar| {
                                 let ocr_overlay = overlay.clone();
@@ -2626,6 +2640,12 @@ impl Render for OverlayView {
                     return;
                 }
                 this.request(SessionCommand::Record(RecordFormat::Mp4), cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditSelection, _, cx| {
+                if this.typing(cx) || !this.selection_committed(cx) {
+                    return;
+                }
+                this.request(SessionCommand::Edit, cx)
             }))
             .on_action(cx.listener(|this, _: &UndoAnnotations, _, cx| {
                 this.style_open = false;

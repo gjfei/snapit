@@ -1581,24 +1581,29 @@ impl Controller {
             command,
             SessionCommand::Copy | SessionCommand::Save | SessionCommand::Pin
         );
+        let edit_mode = matches!(command, SessionCommand::Edit);
         // Every durable export (Save, Copy, history via remember, and Pin) plus
-        // OCR (which also indexes into history) must see the same HDR frame so
-        // all outputs stay consistent. Cancel/Record need no still HDR crop.
+        // OCR (which also indexes into history) and Crop & Edit must see the
+        // same HDR frame so all outputs stay consistent. Cancel/Record need no
+        // still HDR crop.
         let want_hdr = matches!(
             command,
             SessionCommand::Copy
                 | SessionCommand::Save
                 | SessionCommand::Pin
                 | SessionCommand::Recognize
+                | SessionCommand::Edit
         );
         let (image, record_target) = active.session.update(cx, |session, _| {
-            if bake {
+            if bake || edit_mode {
                 session.finish_annotations();
             }
             let hdr = if want_hdr { session.export_hdr() } else { None };
             let image = session.crop_selections().map(|(image, _bounds, scale)| {
-                let shapes = (bake && !multi && !session.annotations().committed().is_empty())
-                    .then(|| Arc::new(session.annotations().committed().to_vec()));
+                let shapes = ((bake || edit_mode)
+                    && !multi
+                    && !session.annotations().committed().is_empty())
+                .then(|| Arc::new(session.annotations().committed().to_vec()));
                 Captured::new(image, hdr, scale, shapes, watermark.clone())
             });
             let record_target = session.selected_frame().map(|(frame, bounds)| {
@@ -1634,7 +1639,7 @@ impl Controller {
             ) || image.is_none()
             {
                 self.restore_previous_app();
-            } else if matches!(command, SessionCommand::Recognize) {
+            } else if matches!(command, SessionCommand::Recognize | SessionCommand::Edit) {
                 self.pending_restore_app = None;
             }
             self.close_selection(cx);
@@ -1675,6 +1680,15 @@ impl Controller {
                 self.open_pin_async(captured, placement, cx);
             }
             (SessionCommand::Recognize, Some(captured)) => self.recognize(captured, cx),
+            (SessionCommand::Edit, Some(captured)) => {
+                let display_id = record_target
+                    .filter(|_| !multi)
+                    .and_then(|(_, _, display_id, _, _)| display_id);
+                let image = (*captured.clean_sdr).clone();
+                let hdr = captured.composition.hdr_source().cloned();
+                let shapes = captured.composition.shapes().clone();
+                self.open_image_editor(image, hdr, captured.scale, display_id, shapes, true, cx);
+            }
             (SessionCommand::Scroll, Some(captured)) => {
                 if scroll_now && let Some(target) = record_target {
                     self.start_scroll(target, captured.scale, cx);
@@ -3401,11 +3415,13 @@ impl Controller {
                 match image {
                     Ok(Some((image, shapes))) => {
                         if action == ScrollFinishAction::Edit {
-                            this.open_scroll_editor(
+                            this.open_image_editor(
                                 ImageSource::from(image),
+                                None,
                                 scale,
                                 display_id,
                                 shapes,
+                                false,
                                 cx,
                             );
                         } else {
@@ -3475,19 +3491,30 @@ impl Controller {
         cx.notify();
     }
 
-    fn open_scroll_editor(
+    #[allow(clippy::too_many_arguments)]
+    fn open_image_editor(
         &mut self,
         image: ImageSource,
+        hdr: Option<Arc<HdrImage>>,
         scale: f32,
         display_id: Option<gpui_kit::DisplayId>,
         shapes: Arc<Vec<Shape>>,
+        initial_crop_mode: bool,
         cx: &mut Context<Self>,
     ) {
         // The editor does not read the controller while it is constructed, so
         // open it synchronously and handle failure before this update returns.
-        // Deferring used to silently lose the long image after scroll teardown.
+        // Deferring used to silently lose the image after teardown.
         self.pending_restore_app = None;
-        match crate::scroll_editor::open(image, scale, display_id, shapes, cx) {
+        match crate::scroll_editor::open(
+            image,
+            hdr,
+            scale,
+            display_id,
+            shapes,
+            initial_crop_mode,
+            cx,
+        ) {
             Ok(handle) => {
                 self.scroll_editors.push(handle);
                 self.sync_dock_visible(cx);

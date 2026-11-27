@@ -643,6 +643,7 @@ pub enum SessionCommand {
     Recognize,
     Scroll,
     Record(RecordFormat),
+    Edit,
     Cancel,
 }
 
