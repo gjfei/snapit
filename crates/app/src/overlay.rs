@@ -129,8 +129,8 @@ pub fn frontmost_other_app() -> Option<i32> {
 
 /// 仅激活 SnapIt 自身（macOS 不携带 NSApplicationActivateAllWindows），避免把
 /// 后台已打开的设置/历史/编辑等窗口一并拉到屏幕最前。
+#[cfg(target_os = "macos")]
 pub fn activate_app_single_window() {
-    #[cfg(target_os = "macos")]
     macos_window::activate_app_single_window();
 }
 
