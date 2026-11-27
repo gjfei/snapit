@@ -305,10 +305,7 @@ impl ExportComposition {
     }
 
     pub fn clipboard_uses_file(&self) -> bool {
-        match self.result().ok().as_deref() {
-            Some(ExportResult::Sdr(image)) => matches!(image.as_ref(), ImageSource::Disk(_)),
-            _ => false,
-        }
+        self.frozen_png.is_none() && self.hdr_source.is_none() && self.clean_sdr.is_disk()
     }
 
     pub fn write_clipboard_png(&self, dir: &Path) -> std::result::Result<PathBuf, String> {

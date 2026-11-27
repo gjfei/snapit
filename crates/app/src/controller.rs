@@ -15,8 +15,9 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, ClipboardItem, Context, Entity,
-    Global, Image, ImageFormat, Pixels, SharedString, Subscription, TitlebarOptions, WeakEntity,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
+    Global, Image, ImageFormat, Pixels, SharedString, Subscription, Task, TitlebarOptions,
+    WeakEntity, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px,
+    size,
 };
 use snapit_capture::{HdrImage, ImageSource, RgbaImage, WatermarkSpec};
 use snapit_ocr::{OcrEngine, OcrOptions};
@@ -213,7 +214,10 @@ impl Captured {
 
 enum ClipboardPayload {
     Image(Vec<u8>),
-    File(PathBuf),
+    /// History-owned PNG file: never deleted by clipboard lifecycle cleanup.
+    SharedFile(PathBuf),
+    /// Temp-dir PNG file owned by this copy: removed when superseded/replaced/failed.
+    ManagedFile(PathBuf),
 }
 
 /// The app's singleton windows (settings / history / OCR results / permissions / update).
@@ -1660,10 +1664,7 @@ impl Controller {
             matches!(command, SessionCommand::Copy | SessionCommand::Save) && image.is_some();
         match (command, image) {
             (SessionCommand::Cancel, _) => {}
-            (SessionCommand::Copy, Some(captured)) => {
-                self.remember(&captured, cx);
-                self.copy_image(captured, cx)
-            }
+            (SessionCommand::Copy, Some(captured)) => self.remember_and_copy(captured, cx),
             (SessionCommand::Save, Some(captured)) => {
                 self.remember(&captured, cx);
                 self.save_image(captured, cx)
@@ -1765,8 +1766,23 @@ impl Controller {
     }
 
     pub(crate) fn remember_and_copy(&mut self, captured: Captured, cx: &mut Context<Self>) {
-        self.remember(&captured, cx);
-        self.copy_image(captured, cx);
+        if captured.composition.clipboard_uses_file() {
+            self.last_capture = Some(captured.clone());
+            let history_task = HistoryStore::global(cx).update(cx, |history, cx| {
+                history.can_record(cx).then(|| {
+                    history.add_image_returning_path(
+                        captured.composition.clone(),
+                        captured.scale,
+                        None,
+                        cx,
+                    )
+                })
+            });
+            self.copy_image_inner(captured, history_task, cx);
+        } else {
+            self.remember(&captured, cx);
+            self.copy_image_inner(captured, None, cx);
+        }
     }
 
     pub(crate) fn remember_and_save(&mut self, captured: Captured, cx: &mut Context<Self>) {
@@ -1843,51 +1859,86 @@ impl Controller {
     }
 
     pub(crate) fn copy_image(&mut self, captured: Captured, cx: &mut Context<Self>) {
+        self.copy_image_inner(captured, None, cx);
+    }
+
+    fn copy_image_inner(
+        &mut self,
+        captured: Captured,
+        history_task: Option<Task<Result<Option<PathBuf>>>>,
+        cx: &mut Context<Self>,
+    ) {
         let busy = self.begin_busy(Busy::Encoding);
         let copy_serial = self.next_copy_serial();
         let (width, height) = captured.clean_sdr.dimensions();
         let started = Instant::now();
-        let clipboard_dir = snapit_store::AppDirs::discover()
-            .map(|dirs| dirs.clipboard_dir())
-            .unwrap_or_else(|_| std::env::temp_dir().join("snapit").join("clipboard"));
+        let clipboard_dir = clipboard::temp_clipboard_dir();
         cx.spawn(async move |this, cx| {
             let encoded = Instant::now();
-            let payload = cx
-                .background_spawn(async move {
-                    let started = Instant::now();
-                    let hdr = captured.composition.has_hdr_original();
-                    let payload = if captured.composition.clipboard_uses_file() {
-                        log::info!("copy: clipboard disk-backed SDR PNG file reference");
-                        captured
-                            .composition
-                            .write_clipboard_png(&clipboard_dir)
-                            .map(ClipboardPayload::File)
-                    } else {
-                        if hdr {
-                            log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
-                        } else {
-                            log::info!("copy: clipboard composed SDR PNG");
-                        }
-                        captured.composition.png().map(|png| {
-                            ClipboardPayload::Image(
-                                Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone()),
-                            )
+            let payload = match history_task {
+                Some(task) => match task.await {
+                    Ok(Some(path)) => {
+                        log::info!("copy: clipboard reusing history PNG file reference");
+                        Ok(ClipboardPayload::SharedFile(path))
+                    }
+                    Ok(None) => cx
+                        .background_spawn(async move {
+                            let started = Instant::now();
+                            log::info!(
+                                "copy: clipboard temp SDR PNG file reference (history unavailable)"
+                            );
+                            let payload = captured
+                                .composition
+                                .write_clipboard_png(&clipboard_dir)
+                                .map(ClipboardPayload::ManagedFile);
+                            log::info!(
+                                target: "timing",
+                                "copy: {width}x{height} PNG encode {:.1} ms",
+                                ms(started.elapsed())
+                            );
+                            payload
                         })
-                    };
-                    log::info!(
-                        target: "timing",
-                        "copy: {width}x{height} PNG encode {:.1} ms",
-                        ms(started.elapsed())
-                    );
-                    payload
-                })
-                .await;
+                        .await,
+                    Err(err) => Err(format!("{err:#}")),
+                },
+                None => cx
+                    .background_spawn(async move {
+                        let started = Instant::now();
+                        let hdr = captured.composition.has_hdr_original();
+                        let payload = if captured.composition.clipboard_uses_file() {
+                            log::info!("copy: clipboard temp SDR PNG file reference");
+                            captured
+                                .composition
+                                .write_clipboard_png(&clipboard_dir)
+                                .map(ClipboardPayload::ManagedFile)
+                        } else {
+                            if hdr {
+                                log::info!("copy: clipboard HDR PNG (16-bit BT.2020/PQ)");
+                            } else {
+                                log::info!("copy: clipboard composed SDR PNG");
+                            }
+                            captured.composition.png().map(|png| {
+                                ClipboardPayload::Image(
+                                    Arc::try_unwrap(png).unwrap_or_else(|png| png.as_ref().clone()),
+                                )
+                            })
+                        };
+                        log::info!(
+                            target: "timing",
+                            "copy: {width}x{height} PNG encode {:.1} ms",
+                            ms(started.elapsed())
+                        );
+                        payload
+                    })
+                    .await,
+            };
             let encode = encoded.elapsed();
             this.update(cx, |this, cx| {
                 if !this.copy_is_current(copy_serial) {
                     // A newer copy owns the pasteboard and managed backing file.
-                    // This worker may clean only the path it generated itself.
-                    if let Ok(ClipboardPayload::File(path)) = payload {
+                    // This worker may clean only the temp path it generated itself;
+                    // never delete a SharedFile owned by history.
+                    if let Ok(ClipboardPayload::ManagedFile(path)) = payload {
                         clipboard::remove_clipboard_file(&path);
                     }
                     if this.finish_busy(busy) {
@@ -1907,7 +1958,20 @@ impl Controller {
                         )));
                         Ok("image data")
                     }
-                    Ok(ClipboardPayload::File(path)) => {
+                    Ok(ClipboardPayload::SharedFile(path)) => {
+                        let copied = clipboard::copy_file_reference(&path, cx)
+                            .map_err(|error| format!("{error:#}"));
+                        if copied.is_ok()
+                            && let Some(previous) = this.clear_clipboard_file(copy_serial)
+                        {
+                            clipboard::remove_clipboard_file(&previous);
+                        }
+                        copied.map(|kind| match kind {
+                            clipboard::FileCopy::File => "file reference",
+                            clipboard::FileCopy::PathText => "path text",
+                        })
+                    }
+                    Ok(ClipboardPayload::ManagedFile(path)) => {
                         let copied = clipboard::copy_file_reference(&path, cx)
                             .map_err(|error| format!("{error:#}"));
                         if copied.is_ok() {
@@ -3420,8 +3484,7 @@ impl Controller {
                                 Captured::new(image, None, scale, Some(shapes), watermark);
                             match action {
                                 ScrollFinishAction::Copy => {
-                                    this.remember(&captured, cx);
-                                    this.copy_image(captured, cx);
+                                    this.remember_and_copy(captured, cx);
                                 }
                                 ScrollFinishAction::Save => {
                                     this.remember(&captured, cx);
@@ -4346,6 +4409,35 @@ mod tests {
         clipboard::remove_clipboard_file(&stale_path); // missing is already clean
         assert!(!stale_path.exists());
         assert_eq!(std::fs::read(&current_path).unwrap(), b"current");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shared_history_clipboard_clears_managed_temp_without_tracking_history_file() {
+        let dir = temp_dir("shared-copy-owner");
+        let temp_path = dir.join("snapit-copy-temp.png");
+        let history_path = dir.join("history.png");
+        std::fs::write(&temp_path, b"temp").unwrap();
+        std::fs::write(&history_path, b"history").unwrap();
+        let mut controller = Controller::default();
+
+        let temp_serial = controller.next_copy_serial();
+        assert!(
+            controller
+                .replace_clipboard_file(temp_serial, temp_path.clone())
+                .is_none()
+        );
+        let shared_serial = controller.next_copy_serial();
+        // Shared history files are never stored in `clipboard_file`; they only
+        // clear any prior managed temp file.
+        assert_eq!(
+            controller.clear_clipboard_file(shared_serial),
+            Some(temp_path.clone())
+        );
+        clipboard::remove_clipboard_file(&temp_path);
+        assert!(controller.clipboard_file.is_none());
+        assert!(!temp_path.exists());
+        assert_eq!(std::fs::read(&history_path).unwrap(), b"history");
         let _ = std::fs::remove_dir_all(dir);
     }
 

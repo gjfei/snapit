@@ -156,6 +156,10 @@ impl HistoryStore {
         Self::limits(cx)
     }
 
+    pub fn can_record(&mut self, cx: &App) -> bool {
+        self.current_limits(cx).is_some() && self.history.is_some()
+    }
+
     /// Store the same composed pixels as Copy and Save, including HDR originals.
     pub fn add_image(
         &mut self,
@@ -164,8 +168,21 @@ impl HistoryStore {
         ocr_text: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.current_limits(cx).is_none() || self.history.is_none() {
-            return;
+        self.add_image_returning_path(composition, scale_factor, ocr_text, cx)
+            .detach();
+    }
+
+    /// Store the same composed pixels as Copy and Save, returning the committed
+    /// history file path once inserted (or `None` when history is disabled/stale).
+    pub fn add_image_returning_path(
+        &mut self,
+        composition: Arc<ExportComposition>,
+        scale_factor: f32,
+        ocr_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
+        if !self.can_record(cx) {
+            return Task::ready(Ok(None));
         }
         let generation = self.generation;
         let dir = self.dir.clone();
@@ -189,7 +206,7 @@ impl HistoryStore {
                 )
             }
         });
-        self.insert_when_ready(task, generation, cx).detach();
+        self.insert_returning_path(task, generation, cx)
     }
 
     /// The returned task finishes once `path` has been copied, so the caller
@@ -219,12 +236,24 @@ impl HistoryStore {
         generation: u64,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        let task = self.insert_returning_path(task, generation, cx);
+        cx.spawn(async move |_, _| {
+            let _ = task.await;
+        })
+    }
+
+    fn insert_returning_path(
+        &mut self,
+        task: Task<Result<NewEntry>>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
         cx.spawn(async move |this, cx| {
             let entry = task.await;
             this.update(cx, |this, cx| {
                 this.sync_history_enabled(cx);
                 let limits = Self::limits(cx);
-                match entry {
+                let out = match entry {
                     Ok(entry)
                         if insertion_is_current(
                             generation,
@@ -234,12 +263,20 @@ impl HistoryStore {
                         ) =>
                     {
                         let limits = limits.expect("limits checked above");
-                        if let Some(history) = this.history.as_mut()
-                            && let Err(err) = history.insert(entry, limits)
-                        {
-                            log::error!("failed to add history entry: {err:#}");
-                        }
+                        let file_path = this.safe_entry_path(entry.entry(), false);
+                        let inserted = if let Some(history) = this.history.as_mut() {
+                            history.insert(entry, limits).map(|_| ())
+                        } else {
+                            Ok(())
+                        };
                         this.generation = this.generation.wrapping_add(1);
+                        match inserted {
+                            Ok(()) => Ok(Some(file_path)),
+                            Err(err) => {
+                                log::error!("failed to add history entry: {err:#}");
+                                Ok(None)
+                            }
+                        }
                     }
                     Ok(entry) => {
                         log::info!(
@@ -250,12 +287,17 @@ impl HistoryStore {
                         if let Some(history) = this.history.as_ref() {
                             history.delete_files(entry.entry());
                         }
+                        Ok(None)
                     }
-                    Err(err) => log::error!("failed to prepare history entry: {err:#}"),
-                }
+                    Err(err) => {
+                        log::error!("failed to prepare history entry: {err:#}");
+                        Err(err)
+                    }
+                };
                 cx.notify();
+                out
             })
-            .ok();
+            .unwrap_or(Ok(None))
         })
     }
 

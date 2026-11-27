@@ -9,6 +9,12 @@ pub(crate) fn read_image_file(path: &Path, format: ImageFormat) -> anyhow::Resul
     Ok(Image::from_bytes(format, std::fs::read(path)?))
 }
 
+/// Fallback temp directory for disk-backed clipboard PNGs when history is
+/// disabled or a copy does not record a history entry (e.g. from a pin).
+pub(crate) fn temp_clipboard_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("snapit").join("clipboard")
+}
+
 pub(crate) fn write_image(image: Image, cx: &App) {
     cx.write_to_clipboard(ClipboardItem::new_image(&image));
 }

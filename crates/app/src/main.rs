@@ -128,7 +128,12 @@ fn main() {
     // The single-instance lock is held, so no peer can be writing these files.
     // Cleanup retains the newest file because the pasteboard may still contain
     // its persistent file URL from the previous launch.
-    clipboard::cleanup_clipboard_files(&dirs.clipboard_dir());
+    clipboard::cleanup_clipboard_files(&clipboard::temp_clipboard_dir());
+    let legacy_clipboard_dir = dirs.data_dir().join("clipboard");
+    if legacy_clipboard_dir.exists() {
+        clipboard::cleanup_clipboard_files(&legacy_clipboard_dir);
+        let _ = std::fs::remove_dir(&legacy_clipboard_dir);
+    }
     snapit_capture::cleanup_stale_disk_images();
 
     // Register the OS callbacks before the event loop can produce any hotkey or
