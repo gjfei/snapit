@@ -8,9 +8,8 @@ mod paths;
 pub use config::{
     AnnotationConfig, AnnotationStyle, AnnotationTool, CaptureConfig, Config, ConfigStore,
     GeneralConfig, HistoryConfig, Hotkeys, ImageFormat, ImageWatermarkConfig, OcrConfig,
-    RecordingConfig, ScrollConfig, ScrollSpeed, TextWatermarkConfig, ThemePreference,
-    WatermarkConfig, WatermarkElement, WatermarkKind, WatermarkPlacement, WatermarkPreset,
-    WatermarkTarget, WatermarkTemplate,
+    RecordingConfig, TextWatermarkConfig, ThemePreference, WatermarkConfig, WatermarkElement,
+    WatermarkKind, WatermarkPlacement, WatermarkPreset, WatermarkTarget, WatermarkTemplate,
 };
 pub use history::{EntryKind, History, HistoryEntry, Limits, NewEntry};
 pub use paths::AppDirs;

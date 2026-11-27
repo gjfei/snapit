@@ -430,15 +430,6 @@ update.error.relaunch: "更新已安装，但 SnapIt 无法重新启动"
 update.error.releases: "找不到可用的发布版本"
 update.error.no_asset: "此版本没有适用于当前平台的安装包"
 
-settings.group.scroll: "滚动截图"
-settings.scroll.auto_speed: "自动滚动速度"
-settings.scroll.auto_speed.desc: "开启自动滚动时的滚动步长与节奏"
-settings.scroll.speed.slow: "慢速"
-settings.scroll.speed.medium: "中速"
-settings.scroll.speed.fast: "快速"
-settings.scroll.show_preview: "显示实时预览"
-settings.scroll.show_preview.desc: "滚动过程中在选区旁实时展示已拼接的长图"
-
 overlay.scroll: "滚动截图"
 session.hint.scroll: "拖动，或单击窗口/滚动区域开始滚动截图 · Esc 取消"
 

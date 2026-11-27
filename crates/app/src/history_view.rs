@@ -24,10 +24,11 @@ use snapit_store::{EntryKind, HistoryEntry};
 
 use crate::{
     appearance, clipboard,
-    controller::{Controller, Panel},
+    controller::Controller,
     history_store::{HistoryStore, format_bytes},
     pin,
     settings::AppSettings,
+    settings_view::SettingsPage,
 };
 
 /// Which entries the list shows. Screenshots are PNGs; recordings are GIF / APNG / MP4.
@@ -165,9 +166,10 @@ impl HistoryView {
                             .small()
                             .icon(IconName::Settings)
                             .tooltip(t!("history.settings").to_string())
+                            .accessibility_label(t!("history.settings").to_string())
                             .on_click(|_, _, cx| {
                                 Controller::global(cx).update(cx, |controller, cx| {
-                                    controller.open_panel(Panel::Settings, cx)
+                                    controller.open_settings_page(SettingsPage::History, cx)
                                 })
                             }),
                     )

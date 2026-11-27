@@ -430,15 +430,6 @@ update.error.relaunch: "The update was installed but SnapIt could not restart"
 update.error.releases: "No usable release found"
 update.error.no_asset: "This release has no package for this platform"
 
-settings.group.scroll: "Scrolling Capture"
-settings.scroll.auto_speed: "Auto-scroll speed"
-settings.scroll.auto_speed.desc: "Step size and cadence when automatic scrolling is enabled"
-settings.scroll.speed.slow: "Slow"
-settings.scroll.speed.medium: "Medium"
-settings.scroll.speed.fast: "Fast"
-settings.scroll.show_preview: "Show live preview"
-settings.scroll.show_preview.desc: "Display a live stitched preview strip beside the region while scrolling"
-
 overlay.scroll: "Scrolling capture"
 session.hint.scroll: "Drag or click a window or scrollable area to start · Esc cancels"
 

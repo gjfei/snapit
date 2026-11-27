@@ -155,50 +155,6 @@ impl Default for CaptureConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScrollSpeed {
-    Slow,
-    #[default]
-    Medium,
-    Fast,
-}
-
-impl ScrollSpeed {
-    pub const ALL: [Self; 3] = [Self::Slow, Self::Medium, Self::Fast];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Slow => "slow",
-            Self::Medium => "medium",
-            Self::Fast => "fast",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|speed| speed.as_str() == value.trim().to_ascii_lowercase())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-#[non_exhaustive]
-pub struct ScrollConfig {
-    pub auto_scroll_speed: ScrollSpeed,
-    pub show_preview: bool,
-}
-
-impl Default for ScrollConfig {
-    fn default() -> Self {
-        Self {
-            auto_scroll_speed: ScrollSpeed::Medium,
-            show_preview: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -1200,7 +1156,6 @@ pub struct Config {
     pub general: GeneralConfig,
     pub hotkeys: Hotkeys,
     pub capture: CaptureConfig,
-    pub scroll: ScrollConfig,
     pub recording: RecordingConfig,
     pub ocr: OcrConfig,
     pub history: HistoryConfig,
@@ -2205,21 +2160,18 @@ mod tests {
     }
 
     #[test]
-    fn scroll_config_and_hotkey_defaults_sanitize_and_round_trip() {
-        let legacy = Config::from_toml("[hotkeys]\ngif = \"Alt+Shift+G\"\n").unwrap();
+    fn hotkey_defaults_ignore_legacy_scroll_config_and_round_trip() {
+        let legacy = Config::from_toml(
+            "[hotkeys]\ngif = \"Alt+Shift+G\"\n[scroll]\nauto_scroll_speed = \"fast\"\nshow_preview = false\n",
+        )
+        .unwrap();
         assert_eq!(legacy.hotkeys.scroll, Hotkeys::default().scroll);
-        assert_eq!(legacy.scroll, ScrollConfig::default());
 
-        let mut custom =
-            Config::from_toml("[scroll]\nauto_scroll_speed = \"fast\"\nshow_preview = false\n")
-                .unwrap();
-        assert_eq!(custom.scroll.auto_scroll_speed, ScrollSpeed::Fast);
-        assert!(!custom.scroll.show_preview);
+        let mut config = Config::from_toml("[hotkeys]\nscroll = \"Ctrl+Alt+S\"\n").unwrap();
+        config.sanitize();
 
-        custom.sanitize();
-
-        let reloaded = Config::from_toml(&custom.to_toml().unwrap()).unwrap();
-        assert_eq!(reloaded.scroll, custom.scroll);
+        let reloaded = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(reloaded.hotkeys.scroll, "Ctrl+Alt+S");
     }
 
     #[test]

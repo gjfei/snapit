@@ -22,8 +22,8 @@ use gpui_kit::component::{
     searchable_list::SearchableVec,
     select::{Select, SelectEvent, SelectState},
     setting::{
-        NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
-        Settings,
+        NumberFieldOptions, RenderOptions, SelectIndex, SettingField, SettingGroup, SettingItem,
+        SettingPage, Settings,
     },
     switch::Switch,
     v_flex,
@@ -40,8 +40,8 @@ use gpui_kit::{
 use snapit_capture::RgbaImage;
 use snapit_recorder::{CLICK_DURATION, ClickEffect, ClickEffectGroup};
 use snapit_store::{
-    Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ScrollSpeed, ThemePreference,
-    WatermarkConfig, WatermarkPlacement, WatermarkPreset, WatermarkTarget,
+    Config, HistoryConfig, Hotkeys, ImageFormat, RecordingConfig, ThemePreference, WatermarkConfig,
+    WatermarkPlacement, WatermarkPreset, WatermarkTarget,
 };
 
 use crate::{
@@ -159,6 +159,26 @@ struct WatermarkTemplateSelect {
     _subscription: Subscription,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SettingsPage {
+    #[default]
+    General = 0,
+    Hotkeys = 1,
+    Capture = 2,
+    Watermark = 3,
+    Recording = 4,
+    Ocr = 5,
+    History = 6,
+    About = 7,
+}
+
+impl SettingsPage {
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 pub struct SettingsView {
     hotkey_focus: [FocusHandle; HotkeyAction::COUNT],
     /// The action whose field is waiting for keys.
@@ -168,11 +188,17 @@ pub struct SettingsView {
     hotkey_errors: [Option<SharedString>; HotkeyAction::COUNT],
     click_effect_group: ClickEffectGroup,
     click_preview_trigger: Option<(ClickEffect, u64, Point<Pixels>)>,
+    initial_page: SettingsPage,
+    selection_epoch: u64,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new_with_page(
+        initial_page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let hotkey_focus = HotkeyAction::ALL.map(|_| cx.focus_handle());
         let mut subscriptions = vec![
             cx.observe_global::<AppSettings>(|_, cx| cx.notify()),
@@ -230,8 +256,16 @@ impl SettingsView {
             hotkey_errors: Default::default(),
             click_effect_group: click_effect.group(),
             click_preview_trigger: None,
+            initial_page,
+            selection_epoch: 0,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn select_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.initial_page = page;
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        cx.notify();
     }
 
     fn toggle_recording(
@@ -614,60 +648,6 @@ impl SettingsView {
                             .default_value(defaults.capture.selection_shadow),
                         )
                         .description(t!("settings.selection_shadow.desc").to_string()),
-                    ]),
-            )
-            .group(
-                SettingGroup::new()
-                    .title(t!("settings.group.scroll").to_string())
-                    .items([
-                        SettingItem::new(
-                            t!("settings.scroll.auto_speed").to_string(),
-                            SettingField::dropdown(
-                                vec![
-                                    (
-                                        "slow".into(),
-                                        t!("settings.scroll.speed.slow").to_string().into(),
-                                    ),
-                                    (
-                                        "medium".into(),
-                                        t!("settings.scroll.speed.medium").to_string().into(),
-                                    ),
-                                    (
-                                        "fast".into(),
-                                        t!("settings.scroll.speed.fast").to_string().into(),
-                                    ),
-                                ],
-                                |cx: &App| {
-                                    AppSettings::get(cx)
-                                        .scroll
-                                        .auto_scroll_speed
-                                        .as_str()
-                                        .into()
-                                },
-                                |value: SharedString, cx: &mut App| {
-                                    if let Some(speed) = ScrollSpeed::parse(&value) {
-                                        AppSettings::update(cx, |config| {
-                                            config.scroll.auto_scroll_speed = speed
-                                        });
-                                    }
-                                },
-                            )
-                            .default_value(defaults.scroll.auto_scroll_speed.as_str()),
-                        )
-                        .description(t!("settings.scroll.auto_speed.desc").to_string()),
-                        SettingItem::new(
-                            t!("settings.scroll.show_preview").to_string(),
-                            SettingField::switch(
-                                |cx: &App| AppSettings::get(cx).scroll.show_preview,
-                                |value: bool, cx: &mut App| {
-                                    AppSettings::update(cx, |config| {
-                                        config.scroll.show_preview = value
-                                    })
-                                },
-                            )
-                            .default_value(defaults.scroll.show_preview),
-                        )
-                        .description(t!("settings.scroll.show_preview.desc").to_string()),
                     ]),
             )
     }
@@ -1922,7 +1902,11 @@ impl Render for SettingsView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                Settings::new("snapit-settings")
+                Settings::new(("snapit-settings", self.selection_epoch))
+                    .default_selected_index(SelectIndex {
+                        page_ix: self.initial_page.index(),
+                        group_ix: None,
+                    })
                     .sidebar_width(px(180.))
                     .pages([
                         self.general_page(),
@@ -2172,5 +2156,17 @@ mod tests {
             preview_local_position(point(px(99.), px(210.)), Some(bounds)),
             None
         );
+    }
+
+    #[test]
+    fn settings_page_indices_match_render_order() {
+        assert_eq!(SettingsPage::General.index(), 0);
+        assert_eq!(SettingsPage::Hotkeys.index(), 1);
+        assert_eq!(SettingsPage::Capture.index(), 2);
+        assert_eq!(SettingsPage::Watermark.index(), 3);
+        assert_eq!(SettingsPage::Recording.index(), 4);
+        assert_eq!(SettingsPage::Ocr.index(), 5);
+        assert_eq!(SettingsPage::History.index(), 6);
+        assert_eq!(SettingsPage::About.index(), 7);
     }
 }

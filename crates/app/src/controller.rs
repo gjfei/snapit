@@ -22,12 +22,10 @@ use snapit_capture::{HdrImage, ImageSource, RgbaImage, WatermarkSpec};
 use snapit_ocr::{OcrEngine, OcrOptions};
 use snapit_recorder::{ClickEffect, RecordFormat, RecordOptions, Recorder, RecorderStart};
 use snapit_scroll::{
-    AutoScrollError, ScrollDirection, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollSpeed,
-    ScrollStart, ScrollStatus,
+    AutoScrollError, ScrollDirection, ScrollOptions, ScrollSession, ScrollSnapshot, ScrollStart,
+    ScrollStatus,
 };
-use snapit_store::{
-    EntryKind, ImageFormat as SaveFormat, ScrollSpeed as ConfigScrollSpeed, WatermarkTarget,
-};
+use snapit_store::{EntryKind, ImageFormat as SaveFormat, WatermarkTarget};
 
 use crate::annotate::{Layer, Shape};
 use crate::appearance;
@@ -45,7 +43,7 @@ use crate::recording_bar::{BAR_SIZE, RecordingBar};
 use crate::scroll_bar::{ScrollBar, ScrollPreview, scroll_bar_bounds, scroll_preview_bounds};
 use crate::session::{self, CaptureIntent, CaptureSession, SessionCommand, SessionSlot};
 use crate::settings::AppSettings;
-use crate::settings_view::{self, SettingsView};
+use crate::settings_view::{self, SettingsPage, SettingsView};
 use crate::update_view::UpdateView;
 
 const RECORDING_TICK: Duration = Duration::from_millis(250);
@@ -264,6 +262,8 @@ pub struct Controller {
     busy_serial: u64,
     busy_owner: Option<u64>,
     panels: [PanelSlot; Panel::COUNT],
+    settings_view: Option<WeakEntity<SettingsView>>,
+    pending_settings_page: Option<SettingsPage>,
     selection: Option<ActiveSelection>,
     /// macOS: overlays already hidden with `orderOut` but whose GPUI teardown
     /// (~37 ms on the main thread) is deferred until the command's clipboard or
@@ -315,6 +315,8 @@ impl Controller {
             busy_serial: 0,
             busy_owner: None,
             panels: Default::default(),
+            settings_view: None,
+            pending_settings_page: None,
             selection: None,
             pending_close: Vec::new(),
             recording: None,
@@ -2793,15 +2795,7 @@ impl Controller {
         log::info!("scroll start: display={monitor_id} region={region:?} scale={scale}");
         self.busy = Some(Busy::Capturing);
         self.last_display_id = display_id;
-        let scroll_cfg = AppSettings::get(cx).scroll.clone();
-        let speed = match scroll_cfg.auto_scroll_speed {
-            ConfigScrollSpeed::Slow => ScrollSpeed::Slow,
-            ConfigScrollSpeed::Medium => ScrollSpeed::Medium,
-            ConfigScrollSpeed::Fast => ScrollSpeed::Fast,
-        };
-        let options = ScrollOptions::default()
-            .with_auto_scroll_speed(speed)
-            .with_scale(scale);
+        let options = ScrollOptions::default().with_scale(scale);
         let Some(overlay) = self.take_recording_overlay(display_id, cx) else {
             self.busy = None;
             self.fail(
@@ -2818,7 +2812,6 @@ impl Controller {
         self.workflow_serial = self.workflow_serial.wrapping_add(1);
         self.scroll_serial = self.scroll_serial.wrapping_add(1);
         let scroll_id = self.scroll_serial;
-        let show_preview = scroll_cfg.show_preview;
         let overlay_handle = overlay.window;
         let overlay_view = overlay.view.clone();
         self.scroll = Some(ActiveScroll {
@@ -2840,15 +2833,13 @@ impl Controller {
             annotation_auto_resume: false,
             auto_scroll_intent: None,
             annotation_mode: None,
-            preview_visible: show_preview,
+            preview_visible: true,
             finishing: false,
             pending_finish: None,
             last_warning: false,
         });
         self.open_scroll_bar(scroll_id, display_id, display_bounds, selection, None, cx);
-        if show_preview {
-            self.open_scroll_preview(scroll_id, display_id, display_bounds, selection, cx);
-        }
+        self.open_scroll_preview(scroll_id, display_id, display_bounds, selection, cx);
         let controller = cx.entity();
         let entered = overlay_handle.update(cx, |_, window, cx| {
             overlay_view.update(cx, |view, cx| view.enter_recording(selection, window, cx));
@@ -3622,6 +3613,42 @@ impl Controller {
         }
     }
 
+    /// Focus Settings directly on `page`, opening it if needed.
+    pub fn open_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        let live: Vec<_> = cx
+            .windows()
+            .iter()
+            .map(|window| window.window_id())
+            .collect();
+        let slot = &mut self.panels[Panel::Settings as usize];
+        if slot
+            .handle
+            .is_some_and(|handle| !live.contains(&handle.window_id()))
+        {
+            slot.handle = None;
+            self.settings_view = None;
+        }
+        if let Some(handle) = slot.handle.take()
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            slot.handle = Some(handle);
+            self.pending_restore_app = None;
+            if let Some(view) = self.settings_view.as_ref().and_then(WeakEntity::upgrade) {
+                view.update(cx, |view, cx| view.select_page(page, cx));
+            }
+            #[cfg(target_os = "macos")]
+            crate::overlay::activate_app_single_window();
+            #[cfg(not(target_os = "macos"))]
+            cx.activate(true);
+            cx.notify();
+            return;
+        }
+        self.pending_settings_page = Some(page);
+        self.open_panel(Panel::Settings, cx);
+    }
+
     /// Focus `panel`'s window, opening it if needed.
     pub fn open_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
         // Trust the live window list, not the slot: a window that was closed a
@@ -3638,6 +3665,9 @@ impl Controller {
             .is_some_and(|handle| !live.contains(&handle.window_id()))
         {
             slot.handle = None;
+            if panel == Panel::Settings {
+                self.settings_view = None;
+            }
         }
         if let Some(handle) = slot.handle.take()
             && handle
@@ -3662,17 +3692,29 @@ impl Controller {
         slot.pending = true;
         let controller = cx.entity();
         let display_id = self.last_display_id;
+        let initial_settings_page = (panel == Panel::Settings)
+            .then(|| self.pending_settings_page.take())
+            .flatten()
+            .unwrap_or_default();
         // `open_window` renders immediately and the views read the controller,
         // so it must run after this update has released the controller.
         cx.defer(move |cx| {
-            let handle = open_panel_window(panel, controller.clone(), display_id, cx)
-                .inspect_err(|err| log::error!("failed to open {panel:?} window: {err:#}"))
-                .ok();
+            let opened =
+                open_panel_window(panel, controller.clone(), display_id, initial_settings_page, cx)
+                    .inspect_err(|err| log::error!("failed to open {panel:?} window: {err:#}"))
+                    .ok();
             controller.update(cx, |this, cx| {
                 this.pending_restore_app = None;
                 let slot = &mut this.panels[panel as usize];
                 slot.pending = false;
-                slot.handle = handle;
+                if let Some((handle, settings_view)) = opened {
+                    slot.handle = Some(handle);
+                    if panel == Panel::Settings {
+                        this.settings_view = settings_view;
+                    }
+                } else {
+                    slot.handle = None;
+                }
                 this.sync_dock_visible(cx);
             });
             #[cfg(target_os = "macos")]
@@ -3721,8 +3763,9 @@ fn open_panel_window(
     panel: Panel,
     controller: Entity<Controller>,
     display_id: Option<gpui_kit::DisplayId>,
+    initial_settings_page: SettingsPage,
     cx: &mut App,
-) -> Result<AnyWindowHandle> {
+) -> Result<(AnyWindowHandle, Option<WeakEntity<SettingsView>>)> {
     let (window_size, min_size) = match panel {
         Panel::Ocr => (size(px(480.), px(420.)), size(px(360.), px(280.))),
         Panel::Settings => (size(px(860.), px(640.)), size(px(620.), px(440.))),
@@ -3748,39 +3791,43 @@ fn open_panel_window(
         display_id,
         ..Default::default()
     };
-    let handle = match panel {
+    let opened = match panel {
         Panel::Ocr => {
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let handle = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| OcrView::new(controller, window, cx))
             })?
-            .0
+            .0;
+            (handle, None)
         }
         Panel::Settings => {
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| SettingsView::new(window, cx))
-            })?
-            .0
+            let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| SettingsView::new_with_page(initial_settings_page, window, cx))
+            })?;
+            (handle, Some(view.downgrade()))
         }
         Panel::History => {
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let handle = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| HistoryView::new(window, cx))
             })?
-            .0
+            .0;
+            (handle, None)
         }
         Panel::Permissions => {
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let handle = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| PermissionView::new(controller, window, cx))
             })?
-            .0
+            .0;
+            (handle, None)
         }
         Panel::Update => {
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let handle = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| UpdateView::new(window, cx))
             })?
-            .0
+            .0;
+            (handle, None)
         }
     };
-    Ok(handle)
+    Ok(opened)
 }
 
 fn discard_stale_recorder(recorder: Result<Recorder>, path: PathBuf) {
